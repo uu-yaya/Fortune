@@ -411,6 +411,85 @@ def _set_reply_style_state(session_id: str, state: dict):
 
 
 QUALITY_METRICS_TTL_DAYS = 14
+V2_FLAG_REDIS_KEY = "jiyi:feature_flags:v2"
+V2_FLAG_NAMES = ("intent_v2", "clarify_v2", "window_v2", "render_v2", "quality_gate_v2")
+V2_FLAG_DEFAULTS = {
+    "intent_v2": True,
+    "clarify_v2": True,
+    "window_v2": True,
+    "render_v2": True,
+    "quality_gate_v2": True,
+}
+V2_FLAG_ENV_KEYS = {
+    "intent_v2": "INTENT_V2",
+    "clarify_v2": "CLARIFY_V2",
+    "window_v2": "WINDOW_V2",
+    "render_v2": "RENDER_V2",
+    "quality_gate_v2": "QUALITY_GATE_V2",
+}
+
+
+def _to_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def get_v2_flags() -> dict[str, bool]:
+    flags = dict(V2_FLAG_DEFAULTS)
+    # 环境变量兜底（用于本地/容器静态配置）
+    for name, env_key in V2_FLAG_ENV_KEYS.items():
+        if env_key in os.environ:
+            flags[name] = _to_bool(os.getenv(env_key), flags[name])
+    # Redis 动态覆盖（用于灰度/回滚）
+    try:
+        raw = _REDIS_CLIENT.hgetall(V2_FLAG_REDIS_KEY) or {}
+        for name in V2_FLAG_NAMES:
+            if name in raw:
+                flags[name] = _to_bool(raw.get(name), flags[name])
+    except Exception:
+        pass
+    return flags
+
+
+def apply_v2_flag_policy(flags: dict[str, bool]) -> tuple[dict[str, bool], str]:
+    effective = {k: bool(flags.get(k, False)) for k in V2_FLAG_NAMES}
+    reason_code = "none"
+    # 非法组合：window 依赖 intent，缺失时强制降级旧链路
+    if effective.get("window_v2") and not effective.get("intent_v2"):
+        effective["clarify_v2"] = False
+        effective["window_v2"] = False
+        effective["render_v2"] = False
+        reason_code = "window_without_intent"
+    # 非法组合：quality gate + render off，标记结构判定模式
+    if effective.get("quality_gate_v2") and not effective.get("render_v2") and reason_code == "none":
+        reason_code = "quality_gate_structured_only"
+    return effective, reason_code
+
+
+def _log_route_observability(
+    route_path: str,
+    reason_code: str,
+    flag_snapshot: dict[str, bool],
+    domain_intent: str,
+    question_type: str,
+):
+    event = {
+        "route_path": str(route_path or "unknown"),
+        "reason_code": str(reason_code or "none"),
+        "flag_snapshot": {k: bool(flag_snapshot.get(k, False)) for k in V2_FLAG_NAMES},
+        "domain_intent": str(domain_intent or "unknown"),
+        "question_type": str(question_type or "default"),
+    }
+    _metric_incr("observability_total")
+    if event["route_path"] and event["reason_code"] and event["domain_intent"] and event["question_type"]:
+        _metric_incr("observability_hit")
+    logger.info(f"route_observability={json.dumps(event, ensure_ascii=False)}")
 
 
 def _quality_metrics_key(day: datetime | None = None) -> str:
@@ -472,10 +551,52 @@ def _normalize_for_repeat(text: str) -> str:
     return out[:300]
 
 
-def track_output_quality(session_id: str, output: str, profile: dict | None = None):
+def _has_explicit_window(text: str) -> bool:
+    out = str(text or "")
+    if not out:
+        return False
+    if DATE_FULL_PATTERN.search(out) or DATE_SHORT_PATTERN.search(out):
+        return True
+    if re.search(r"(至|到|—|-)", out) and re.search(r"(周|星期|月|日)", out):
+        return True
+    return False
+
+
+def _is_clarify_reply(text: str) -> bool:
+    out = str(text or "")
+    return bool(re.search(r"(你是什么星座|告诉我你的星座|先告诉我.*星座|你是哪个星座)", out))
+
+
+def _is_direct_answer_hit(query: str, output: str) -> bool:
+    q = str(query or "")
+    first = _first_sentence(output)
+    if not first:
+        return False
+    if "开源" in q and "守财" in q:
+        return bool(re.search(r"(开源|守财|守中带开|先守|先开)", first))
+    if "扩收入" in q and "控支出" in q:
+        return bool(re.search(r"(扩收入|控支出|先控|先扩|守中带开)", first))
+    if "还是" in q:
+        return bool(re.search(r"(先|优先|结论|建议)", first))
+    return bool(re.search(r"(结论|优先|先)", first))
+
+
+def track_output_quality(
+    session_id: str,
+    output: str,
+    profile: dict | None = None,
+    query: str = "",
+    question_type: str = "default",
+):
     text = str(output or "")
     if not text:
         return
+
+    _metric_incr("template_signature_total")
+    signature_fields = ["先给你结论", "命理信号", "命理依据", "五行分布", "行动建议", "参考置信度"]
+    signature_hit = sum(1 for item in signature_fields if item in text)
+    if signature_hit >= 3:
+        _metric_incr("template_signature_hit")
 
     _metric_incr("template_repeat_total")
     normalized = _normalize_for_repeat(text)
@@ -484,8 +605,10 @@ def track_output_quality(session_id: str, output: str, profile: dict | None = No
             key = _last_reply_hash_key(session_id)
             current_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
             last_hash = str(_REDIS_CLIENT.get(key) or "")
+            _metric_incr("session_repeat_total")
             if last_hash and last_hash == current_hash:
                 _metric_incr("template_repeat_hit")
+                _metric_incr("session_repeat_hit")
             _REDIS_CLIENT.setex(key, SESSION_TTL_SECONDS, current_hash)
         except Exception:
             pass
@@ -493,6 +616,24 @@ def track_output_quality(session_id: str, output: str, profile: dict | None = No
     _metric_incr("profile_echo_total")
     if _has_profile_echo(text, profile):
         _metric_incr("profile_echo_violation")
+
+    qtype = str(question_type or "default")
+    if qtype in {"decision", "comparison"}:
+        _metric_incr("direct_answer_total")
+        if _is_direct_answer_hit(query, text):
+            _metric_incr("direct_answer_hit")
+    elif qtype == "clarify":
+        _metric_incr("clarify_total")
+        if _is_clarify_reply(text):
+            _metric_incr("clarify_hit")
+    elif qtype == "trend":
+        _metric_incr("trend_window_total")
+        if _has_explicit_window(text):
+            _metric_incr("trend_window_hit")
+    elif qtype == "colloquial":
+        _metric_incr("colloquial_window_total")
+        if _has_explicit_window(text):
+            _metric_incr("colloquial_window_hit")
 
 
 def _safe_int(value) -> int:
@@ -543,6 +684,36 @@ def get_quality_metrics(days: int = 1) -> dict:
         ),
         "template_repeat_rate": _calc_rate(
             totals.get("template_repeat_hit", 0), totals.get("template_repeat_total", 0)
+        ),
+        "template_signature_rate": _calc_rate(
+            totals.get("template_signature_hit", 0), totals.get("template_signature_total", 0)
+        ),
+        "session_repeat_rate": _calc_rate(
+            totals.get("session_repeat_hit", 0), totals.get("session_repeat_total", 0)
+        ),
+        "direct_answer_hit_rate": _calc_rate(
+            totals.get("direct_answer_hit", 0), totals.get("direct_answer_total", 0)
+        ),
+        "clarify_hit_rate": _calc_rate(
+            totals.get("clarify_hit", 0), totals.get("clarify_total", 0)
+        ),
+        "trend_window_hit_rate": _calc_rate(
+            totals.get("trend_window_hit", 0), totals.get("trend_window_total", 0)
+        ),
+        "colloquial_window_hit_rate": _calc_rate(
+            totals.get("colloquial_window_hit", 0), totals.get("colloquial_window_total", 0)
+        ),
+        "temporal_consistency_hit_rate": _calc_rate(
+            totals.get("temporal_consistency_hit", 0), totals.get("temporal_consistency_total", 0)
+        ),
+        "observability_coverage": _calc_rate(
+            totals.get("observability_hit", 0), totals.get("observability_total", 0)
+        ),
+        "time_validation_fail_rate": _calc_rate(
+            totals.get("time_validation_fail_total", 0), totals.get("time_anchor_applied_total", 0)
+        ),
+        "time_validation_autofix_rate": _calc_rate(
+            totals.get("time_validation_autofix_total", 0), totals.get("time_validation_fail_total", 0)
         ),
     }
     return {"days": span, "totals": totals, "rates": rates, "series": series}
@@ -715,7 +886,261 @@ class Master:
         return result
 
 
-def get_fast_reply(query: str) -> str | None:
+def _weekday_cn_from_date(year: int, month: int, day: int) -> str:
+    try:
+        w = datetime(year, month, day).weekday()
+    except Exception:
+        return ""
+    return ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][w]
+
+
+def _format_utc_offset(now_dt: datetime) -> str:
+    offset = now_dt.utcoffset() or timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def build_time_anchor(window_days: int = 3) -> dict:
+    tz_name = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = datetime.now().astimezone().tzinfo
+        tz_name = str(tz)
+    now = datetime.now(tz)
+    days = max(1, min(int(window_days or 3), 7))
+    near_days: list[dict[str, str]] = []
+    for i in range(days):
+        d = now + timedelta(days=i)
+        near_days.append(
+            {
+                "date": d.strftime("%Y-%m-%d"),
+                "date_cn": f"{d.month}月{d.day}日",
+                "weekday_cn": _weekday_cn_from_date(d.year, d.month, d.day),
+            }
+        )
+    return {
+        "tz_name": str(tz_name),
+        "utc_offset": _format_utc_offset(now),
+        "now_dt": now,
+        "now_ts": now.isoformat(timespec="seconds"),
+        "today_date": now.strftime("%Y-%m-%d"),
+        "today_cn": f"{now.year}年{now.month}月{now.day}日",
+        "weekday_cn": _weekday_cn_from_date(now.year, now.month, now.day),
+        "time_str": now.strftime("%H:%M:%S"),
+        "near_days": near_days,
+    }
+
+
+RELATIVE_WINDOW_PATTERN = re.compile(r"(本周|这周|下周|最近一周|这一周|近几天|这几天|哪几天|哪天|最近两天|这两天|本月|这个月)")
+
+
+def _cn_day(dt: datetime) -> str:
+    return f"{dt.month}月{dt.day}日（{_weekday_cn_from_date(dt.year, dt.month, dt.day)}）"
+
+
+def _enumerate_days(start: datetime, end: datetime, limit: int = 14) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    cur = start
+    while cur.date() <= end.date() and len(out) < max(1, limit):
+        out.append(
+            {
+                "date": cur.strftime("%Y-%m-%d"),
+                "date_cn": f"{cur.month}月{cur.day}日",
+                "weekday_cn": _weekday_cn_from_date(cur.year, cur.month, cur.day),
+            }
+        )
+        cur = cur + timedelta(days=1)
+    return out
+
+
+def date_window_resolver(query: str, time_anchor: dict) -> dict:
+    q = str(query or "")
+    now = time_anchor.get("now_dt")
+    if not isinstance(now, datetime):
+        now = datetime.now()
+
+    label = "near_days"
+    if re.search(r"(下周)", q):
+        start = (now - timedelta(days=now.weekday())) + timedelta(days=7)
+        end = start + timedelta(days=6)
+        label = "next_week"
+    elif re.search(r"(本周|这周|最近一周|这一周|上半段|下半段)", q):
+        start = now - timedelta(days=now.weekday())
+        end = start + timedelta(days=6)
+        label = "this_week"
+    elif re.search(r"(本月|这个月)", q):
+        start = now.replace(day=1)
+        next_month = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        end = next_month - timedelta(days=1)
+        label = "this_month"
+    elif re.search(r"(最近两天|这两天)", q):
+        start = now
+        end = now + timedelta(days=1)
+        label = "two_days"
+    else:
+        near_days = time_anchor.get("near_days") or []
+        if near_days:
+            try:
+                start = datetime.strptime(str(near_days[0].get("date")), "%Y-%m-%d").replace(
+                    hour=now.hour, minute=now.minute, second=now.second
+                )
+                last = near_days[min(len(near_days), 7) - 1]
+                end = datetime.strptime(str(last.get("date")), "%Y-%m-%d").replace(
+                    hour=now.hour, minute=now.minute, second=now.second
+                )
+            except Exception:
+                start = now
+                end = now + timedelta(days=2)
+        else:
+            start = now
+            end = now + timedelta(days=2)
+        label = "near_days"
+
+    if start > end:
+        start, end = end, start
+
+    days = _enumerate_days(start, end, limit=14)
+    window_text = f"{_cn_day(start)}至{_cn_day(end)}"
+    return {
+        "label": label,
+        "now_ts": now.isoformat(timespec="seconds"),
+        "tz": str(time_anchor.get("tz_name") or "Asia/Shanghai"),
+        "window_start": start.strftime("%Y-%m-%d"),
+        "window_end": end.strftime("%Y-%m-%d"),
+        "window_text": window_text,
+        "days": days,
+    }
+
+
+TIME_SENSITIVE_QUERY_PATTERN = re.compile(
+    r"(今天|现在|当前|日期|几号|星期|周几|近几天|这几天|本周|这周|下周|本月|这个月|时间窗口|哪天|哪几天|刚才|你说错|纠正|纠错|气场)"
+)
+NEAR_DAYS_QUERY_PATTERN = re.compile(r"(近几天|这几天|哪几天|哪天|最近三天|最近几天)")
+DATE_WEEKDAY_PATTERN = re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日[，,\s]*((?:星期|周)[一二三四五六日天])")
+DATE_FULL_PATTERN = re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日")
+DATE_SHORT_PATTERN = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日")
+YEAR_PATTERN = re.compile(r"(20\d{2})年")
+
+
+def is_time_sensitive_query(query: str) -> bool:
+    return bool(TIME_SENSITIVE_QUERY_PATTERN.search(str(query or "")))
+
+
+def _normalize_weekday_label(text: str) -> str:
+    raw = str(text or "").strip().replace("周天", "周日")
+    mapping = {
+        "周一": "星期一",
+        "周二": "星期二",
+        "周三": "星期三",
+        "周四": "星期四",
+        "周五": "星期五",
+        "周六": "星期六",
+        "周日": "星期日",
+        "星期天": "星期日",
+    }
+    return mapping.get(raw, raw)
+
+
+def _build_time_safe_fallback(query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
+    now_cn = str(time_anchor.get("today_cn") or "")
+    weekday_cn = str(time_anchor.get("weekday_cn") or "")
+    tz_name = str(time_anchor.get("tz_name") or "")
+    utc_offset = str(time_anchor.get("utc_offset") or "")
+    near_days = time_anchor.get("near_days") or []
+    q = str(query or "")
+    if window_meta and RELATIVE_WINDOW_PATTERN.search(q):
+        window_text = str(window_meta.get("window_text") or "").strip()
+        if window_text:
+            return (
+                f"呀哈～我先把时间对齐：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。\n"
+                f"你问的时间窗口按这个范围计算：{window_text}。"
+            )
+    if NEAR_DAYS_QUERY_PATTERN.search(q) and near_days:
+        window_text = "、".join(
+            [f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")]
+        )
+        return (
+            f"呀哈～我先把时间对齐：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。\n"
+            f"你问的“近几天”按这个窗口计算：{window_text}。"
+        )
+    return f"呀哈～先把时间对齐：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。"
+
+
+def validate_time_consistency(text: str, query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return out
+    q = str(query or "")
+    if not is_time_sensitive_query(q) and not is_bazi_fortune_query(q):
+        return out
+    _metric_incr("temporal_consistency_total")
+
+    allowed_dates = set()
+    for d in (time_anchor.get("near_days") or []):
+        date_str = str(d.get("date") or "").strip()
+        if date_str:
+            allowed_dates.add(date_str)
+    if str(time_anchor.get("today_date") or "").strip():
+        allowed_dates.add(str(time_anchor.get("today_date")))
+    if isinstance(window_meta, dict):
+        for d in (window_meta.get("days") or []):
+            date_str = str((d or {}).get("date") or "").strip()
+            if date_str:
+                allowed_dates.add(date_str)
+
+    # 校验“日期-星期”匹配
+    for m in DATE_WEEKDAY_PATTERN.finditer(out):
+        year = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+        weekday_text = _normalize_weekday_label(m.group(4))
+        expected = _weekday_cn_from_date(year, month, day)
+        if expected and weekday_text and weekday_text != expected:
+            _metric_incr("time_validation_fail_total")
+            _metric_incr("time_validation_autofix_total")
+            _metric_incr("temporal_consistency_fail")
+            _metric_incr("weekday_mismatch_count")
+            return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
+
+    # 对“相对时间窗口”问题，输出日期必须落在允许窗口内
+    if RELATIVE_WINDOW_PATTERN.search(q):
+        explicit_dates: set[str] = set()
+        for m in DATE_FULL_PATTERN.finditer(out):
+            year = int(m.group(1))
+            month = int(m.group(2))
+            day = int(m.group(3))
+            explicit_dates.add(f"{year:04d}-{month:02d}-{day:02d}")
+        anchor_year = int(str(time_anchor.get("today_date") or "2000-01-01").split("-")[0])
+        for m in DATE_SHORT_PATTERN.finditer(out):
+            month = int(m.group(1))
+            day = int(m.group(2))
+            explicit_dates.add(f"{anchor_year:04d}-{month:02d}-{day:02d}")
+
+        for date_str in explicit_dates:
+            if date_str not in allowed_dates:
+                _metric_incr("time_validation_fail_total")
+                _metric_incr("time_validation_autofix_total")
+                _metric_incr("temporal_consistency_fail")
+                return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
+
+        # 近几天场景若出现明显越界年份，直接矫正
+        years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(out)}
+        if years and any(str(y) not in {x[:4] for x in allowed_dates} for y in years):
+            _metric_incr("time_validation_fail_total")
+            _metric_incr("time_validation_autofix_total")
+            _metric_incr("temporal_consistency_fail")
+            return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
+
+    _metric_incr("temporal_consistency_hit")
+    return out
+
+
+def get_fast_reply(query: str, time_anchor: dict | None = None) -> str | None:
     raw_text = (query or "").strip()
     text = raw_text.lower()
     if not raw_text:
@@ -727,20 +1152,11 @@ def get_fast_reply(query: str) -> str | None:
         r"几月几号|几号了|星期几|周几|today|date|time|what day)"
     )
     if time_keywords.search(text):
-        tz_name = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
-        try:
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            tz = datetime.now().astimezone().tzinfo
-            tz_name = str(tz)
-
-        now = datetime.now(tz)
-        weekday_map = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-        weekday_cn = weekday_map[now.weekday()]
+        anchor = time_anchor or build_time_anchor()
         return (
             "呀哈～本鼠鼠帮你看了北京时间："
-            f"{now.year}年{now.month}月{now.day}日，{weekday_cn}，"
-            f"{now.strftime('%H:%M:%S')}（UTC+8）。"
+            f"{anchor.get('today_cn')}，{anchor.get('weekday_cn')}，"
+            f"{anchor.get('time_str')}（{anchor.get('utc_offset')}）。"
         )
 
     greetings = {
@@ -944,13 +1360,17 @@ def build_ellipsis_context_note(query: str, chat_message_history) -> str:
 
 
 BAZI_FORTUNE_QUERY_PATTERN = re.compile(
-    r"(算命|八字|流年|运势|桃花|姻缘|感情运|财运|事业运|学业运|贵人运|命盘|命理|紫微|测算|提运)"
+    r"(算命|八字|流年|运势|桃花|姻缘|感情运|财运|事业运|学业运|贵人运|命盘|命理|紫微|测算|提运|气场|顺不顺|更顺)"
 )
 DIVINATION_QUERY_PATTERN = re.compile(r"(占卜|摇卦|抽签|起卦|卦象|卦)")
 FORTUNE_SCENE_PATTERN = re.compile(r"(今天|本周|这周|本月|最近|这段时间|现在|未来)")
 FORTUNE_DECISION_PATTERN = re.compile(
-    r"(最旺.*方向|行动方向|避免.*决策|换岗.*积累|适合.*换岗|先积累|该不该换岗|更容易提运|提运.*领域)"
+    r"(开源|守财|扩收入|控支出|先.*还是|二选一|更适合|哪个更|优先|先守后开|守中带开|"
+    r"最旺.*方向|行动方向|避免.*决策|换岗.*积累|适合.*换岗|先积累|该不该换岗|更容易提运|提运.*领域)"
 )
+FORTUNE_COLLOQUIAL_PATTERN = re.compile(r"(气场|更顺|顺不顺|哪几天|哪天|近几天|这几天)")
+FORTUNE_TREND_PATTERN = re.compile(r"(本周|这周|最近一周|这一周|走势|趋势|节奏|上半段|下半段)")
+FORTUNE_ACTION_PATTERN = re.compile(r"(先做什么|第一步|怎么安排|如何安排|怎么排更稳|怎么做|怎么行动)")
 ZODIAC_SIGN_ALIASES = {
     "白羊座": ["白羊座", "白羊"],
     "金牛座": ["金牛座", "金牛"],
@@ -1001,6 +1421,13 @@ def is_zodiac_query(query: str) -> bool:
     return bool(ZODIAC_KEYWORD_PATTERN.search(q))
 
 
+def is_zodiac_intent_query(query: str) -> bool:
+    q = str(query or "")
+    if is_zodiac_query(q):
+        return True
+    return ("星座" in q) and bool(ZODIAC_KEYWORD_PATTERN.search(q))
+
+
 def _zodiac_default_reply(sign: str, year: int, topic: str) -> str:
     topic_cn = _topic_cn(topic)
     return (
@@ -1022,14 +1449,21 @@ def _zodiac_default_reply(sign: str, year: int, topic: str) -> str:
     )
 
 
-def route_zodiac_pipeline(query: str) -> tuple[str | None, dict | None]:
+def route_zodiac_pipeline(query: str, allow_clarify: bool = True) -> tuple[str | None, dict | None]:
     q = str(query or "").strip()
     if not q:
         return None, None
-    if not is_zodiac_query(q):
+    if not is_zodiac_intent_query(q):
         return None, None
 
     sign = _extract_zodiac_sign(q)
+    if not sign:
+        if not allow_clarify:
+            return None, None
+        return (
+            "呀哈～你想看星座运势我收到了。先告诉我你的星座（例如白羊座/天蝎座），我再给你本周重点和行动建议。",
+            {"topic": "zodiac", "source": "zodiac_clarify", "question_type": "clarify"},
+        )
     year = _extract_query_year(q)
     topic = detect_fortune_topic(q)
     topic_cn = _topic_cn(topic)
@@ -1075,7 +1509,7 @@ def route_zodiac_pipeline(query: str) -> tuple[str | None, dict | None]:
 
 def is_bazi_fortune_query(query: str) -> bool:
     q = str(query or "")
-    if is_zodiac_query(q):
+    if is_zodiac_intent_query(q):
         # 星座问法走独立占星链路，避免混入八字术语。
         return False
     if BAZI_FORTUNE_QUERY_PATTERN.search(q):
@@ -1083,11 +1517,46 @@ def is_bazi_fortune_query(query: str) -> bool:
     # 覆盖“弱命理意图”问法：未显式写“运势/八字”，但明显在问提运/时运决策。
     if FORTUNE_DECISION_PATTERN.search(q) and FORTUNE_SCENE_PATTERN.search(q):
         return True
+    # 覆盖“口语化问运势”表达（如：近哪几天气场更顺）。
+    if FORTUNE_COLLOQUIAL_PATTERN.search(q) and FORTUNE_SCENE_PATTERN.search(q):
+        return True
     return False
 
 
 def is_divination_query(query: str) -> bool:
     return bool(DIVINATION_QUERY_PATTERN.search(str(query or "")))
+
+
+def detect_domain_intent(query: str) -> str:
+    q = str(query or "")
+    if is_divination_query(q):
+        return "divination"
+    if is_zodiac_intent_query(q):
+        return "zodiac"
+    if is_bazi_fortune_query(q):
+        return "fortune"
+    if is_time_sensitive_query(q):
+        return "time"
+    return "general"
+
+
+def detect_question_type(query: str) -> str:
+    q = str(query or "")
+    if not q:
+        return "default"
+    if is_time_sensitive_query(q) and not (is_zodiac_intent_query(q) or is_bazi_fortune_query(q)):
+        return "time"
+    if is_zodiac_intent_query(q) and not _extract_zodiac_sign(q):
+        return "clarify"
+    if FORTUNE_DECISION_PATTERN.search(q):
+        return "decision"
+    if FORTUNE_COLLOQUIAL_PATTERN.search(q):
+        return "colloquial"
+    if FORTUNE_TREND_PATTERN.search(q):
+        return "trend"
+    if FORTUNE_ACTION_PATTERN.search(q):
+        return "action"
+    return "default"
 
 
 def detect_fortune_topic(query: str) -> str:
@@ -1258,6 +1727,108 @@ def _signal_for_topic(payload: dict, topic: str) -> str:
     return text[:120]
 
 
+def _first_sentence(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    head = re.split(r"[。！？!\n]", raw, maxsplit=1)[0]
+    return head.strip()
+
+
+def _decision_conclusion_from_query(query: str, strength: str) -> str:
+    q = str(query or "")
+    if ("开源" in q and "守财" in q) or ("先开源" in q and "先守" in q):
+        if strength == "strong":
+            return "先开源，再守财，走“稳开”路线"
+        if strength == "weak":
+            return "先守财，再小步开源"
+        return "守中带开：先守住现金流，再扩开源"
+    if "扩收入" in q and "控支出" in q:
+        if strength == "strong":
+            return "先扩收入，同时保留基础控支出"
+        if strength == "weak":
+            return "先控支出，等节奏稳住后再扩收入"
+        return "先控支出打底，再小步扩收入"
+    m = re.search(r"(.{1,10})还是(.{1,10})", q)
+    if m:
+        a = re.sub(r"[？?，,。.\s]", "", m.group(1))[-8:]
+        b = re.sub(r"[？?，,。.\s]", "", m.group(2))[:8]
+        if strength == "strong":
+            return f"优先选“{a}”"
+        if strength == "weak":
+            return f"优先选“{b}”"
+        return f"先“{b}”，再“{a}”"
+    if strength == "strong":
+        return "优先主动推进，但要设风险边界"
+    if strength == "weak":
+        return "优先稳住基本盘，暂缓高风险动作"
+    return "先稳后进，避免一次性重仓决策"
+
+
+def render_user_fortune_reply_v2(
+    payload: dict,
+    topic: str,
+    query: str,
+    question_type: str,
+    window_meta: dict | None = None,
+) -> str:
+    topic_cn = _topic_cn(topic)
+    error = payload.get("error")
+    if isinstance(error, dict) and str(error.get("code") or ""):
+        code = str(error.get("code") or "")
+        msg = str(error.get("message") or "命理链路暂时不可用")
+        return (
+            f"呀哈～这次{topic_cn}盘面暂时没取全（{code}）。{msg}。"
+            f"先给你一个稳妥方向：{_default_fortune_advice(topic, 'balanced')[0]}"
+        )
+
+    strength = str(payload.get("strength") or "balanced")
+    strength_text = {
+        "strong": "势能偏强，适合主动推进",
+        "weak": "势能偏谨慎，先稳节奏更顺",
+        "balanced": "节奏偏平衡，适合稳中求进",
+    }.get(strength, "节奏偏平衡，适合稳中求进")
+
+    lines: list[str] = []
+    if question_type in {"decision", "comparison"}:
+        conclusion = _decision_conclusion_from_query(query, strength)
+        lines.append(f"结论：{conclusion}。")
+    else:
+        lines.append(f"结论：这次{topic_cn}{strength_text}。")
+
+    if question_type in {"trend", "colloquial"} and isinstance(window_meta, dict):
+        window_text = str(window_meta.get("window_text") or "").strip()
+        if window_text:
+            lines.append(f"时间窗口：{window_text}。")
+
+    signal_line = _signal_for_topic(payload, topic)
+    if signal_line:
+        lines.append(f"命理信号：{signal_line}")
+
+    basis_parts = []
+    bazi = str(payload.get("bazi") or "").strip()
+    day_master = str(payload.get("day_master") or "").strip()
+    xiyongshen = str(payload.get("xiyongshen") or "").strip()
+    jishen = str(payload.get("jishen") or "").strip()
+    if bazi:
+        basis_parts.append(f"八字 {bazi}")
+    if day_master:
+        basis_parts.append(f"日主 {day_master}")
+    if xiyongshen:
+        basis_parts.append(f"喜用 {xiyongshen}")
+    if jishen:
+        basis_parts.append(f"忌神 {jishen}")
+    lines.append(f"依据：{'；'.join(basis_parts) if basis_parts else '以当前盘面趋势判断'}。")
+
+    advice = payload.get("advice") or _default_fortune_advice(topic, strength)
+    advice = [str(x).strip() for x in advice if str(x).strip()][:3]
+    if advice:
+        lines.append("建议：")
+        for idx, tip in enumerate(advice, start=1):
+            lines.append(f"{idx}. {tip}")
+    return "\n".join(lines)
+
+
 def render_structured_fortune_reply(payload: dict, topic: str) -> str:
     topic_cn = _topic_cn(topic)
     error = payload.get("error")
@@ -1327,10 +1898,19 @@ def _format_divination_reply(raw) -> str:
     return f"呀哈～本鼠鼠给你摇到一卦：{text}"
 
 
-def route_fortune_pipeline(query: str, profile: dict[str, str]) -> tuple[str | None, dict | None]:
+def route_fortune_pipeline(
+    query: str,
+    profile: dict[str, str],
+    time_anchor: dict | None = None,
+    flags: dict[str, bool] | None = None,
+    question_type: str = "default",
+) -> tuple[str | None, dict | None]:
     q = str(query or "").strip()
     if not q:
         return None, None
+    anchor = time_anchor or build_time_anchor()
+    active_flags = flags or dict(V2_FLAG_DEFAULTS)
+    window_meta = date_window_resolver(q, anchor) if active_flags.get("window_v2") else None
 
     if is_divination_query(q) and not is_bazi_fortune_query(q):
         try:
@@ -1343,22 +1923,31 @@ def route_fortune_pipeline(query: str, profile: dict[str, str]) -> tuple[str | N
         _metric_incr("fortune_tool_total")
         if str(raw or "").strip():
             _metric_incr("fortune_tool_success_total")
-        return _format_divination_reply(raw), {"topic": "divination", "error": None}
+        return _format_divination_reply(raw), {"topic": "divination", "error": None, "question_type": question_type}
 
     if not is_bazi_fortune_query(q):
         return None, None
 
     missing = _missing_profile_fields_for_fortune(profile)
     if missing:
-        return build_fortune_missing_reply(missing), {"topic": detect_fortune_topic(q), "error": {"code": "PROFILE_MISSING"}}
+        return (
+            build_fortune_missing_reply(missing),
+            {"topic": detect_fortune_topic(q), "error": {"code": "PROFILE_MISSING"}, "question_type": question_type},
+        )
 
     topic = detect_fortune_topic(q)
     name = str(profile.get("name") or "").strip()
     birthdate = str(profile.get("birthdate") or "").strip()
     birthtime = str(profile.get("birthtime") or "").strip()
+    near_days = anchor.get("near_days") or []
+    window_text = "、".join([f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")]) or "今天起未来3天"
+    if isinstance(window_meta, dict) and str(window_meta.get("window_text") or "").strip():
+        window_text = str(window_meta.get("window_text")).strip()
     tool_query = (
         f"请按结构化JSON返回{topic}命理结果。"
-        f"姓名：{name}；出生日期：{birthdate}；出生时间：{birthtime or '未知'}；用户问题：{q}"
+        f"姓名：{name}；出生日期：{birthdate}；出生时间：{birthtime or '未知'}；用户问题：{q}。"
+        f"当前时间锚点：{anchor.get('today_cn')}（{anchor.get('weekday_cn')}，{anchor.get('tz_name')}，{anchor.get('utc_offset')}）。"
+        f"若用户问“近几天/哪几天”，仅允许在此窗口判断：{window_text}。"
     )
     raw = ""
     try:
@@ -1380,11 +1969,20 @@ def route_fortune_pipeline(query: str, profile: dict[str, str]) -> tuple[str | N
     _metric_incr("fortune_field_total")
     if _is_fortune_field_complete(payload):
         _metric_incr("fortune_field_complete_total")
+    payload["question_type"] = str(question_type or "default")
+    payload["now_ts"] = str(anchor.get("now_ts") or "")
+    payload["tz"] = str(anchor.get("tz_name") or "")
+    if isinstance(window_meta, dict):
+        payload["window_start"] = str(window_meta.get("window_start") or "")
+        payload["window_end"] = str(window_meta.get("window_end") or "")
+        payload["window_text"] = str(window_meta.get("window_text") or "")
     logger.info(
         "fortune_pipeline session_payload: "
         f"topic={payload.get('topic')} error={((payload.get('error') or {}).get('code') if isinstance(payload.get('error'), dict) else '')} "
-        f"confidence={payload.get('confidence')}"
+        f"confidence={payload.get('confidence')} question_type={question_type}"
     )
+    if active_flags.get("render_v2"):
+        return render_user_fortune_reply_v2(payload, topic, query=q, question_type=question_type, window_meta=window_meta), payload
     return render_structured_fortune_reply(payload, topic), payload
 
 
@@ -1846,11 +2444,32 @@ async def chat(request: Request, payload: ChatRequest):
     response_data = {"session_id": str(uuid.uuid4().hex), "output": "天机暂时紊乱，请稍后再试。"}
     profile: dict[str, str] = {"name": "", "birthdate": "", "birthtime": ""}
     session_id = ""
+    time_anchor = build_time_anchor()
+    flag_snapshot = dict(V2_FLAG_DEFAULTS)
+    flag_reason_code = "none"
+    domain_intent = "general"
+    question_type = "default"
+    window_meta: dict | None = None
     try:
         query = payload.query
         if not query:
             response_data["output"] = "呀哈～先告诉吉伊大师你想问什么吧。"
             return response_data
+        _metric_incr("time_anchor_applied_total")
+        raw_flags = get_v2_flags()
+        flags, flag_reason_code = apply_v2_flag_policy(raw_flags)
+        flag_snapshot = dict(flags)
+        if flags.get("intent_v2"):
+            domain_intent = detect_domain_intent(query)
+            question_type = detect_question_type(query)
+        else:
+            domain_intent = "fortune" if (is_bazi_fortune_query(query) or is_divination_query(query) or is_zodiac_intent_query(query)) else "general"
+            question_type = "default"
+        if flags.get("window_v2") and (
+            question_type in {"trend", "colloquial"} or RELATIVE_WINDOW_PATTERN.search(str(query or ""))
+        ):
+            window_meta = date_window_resolver(query, time_anchor)
+
         phone = str(auth.get("phone", ""))
         user = _get_user_by_phone(phone) or {}
         if not user:
@@ -1864,39 +2483,118 @@ async def chat(request: Request, payload: ChatRequest):
         extracted = extract_profile_from_query(query)
         profile = merge_session_profile(session_id, extracted)
         emotion_level = detect_emotion_level(query)
-        is_fortune_intent = is_bazi_fortune_query(query) or is_divination_query(query) or is_zodiac_query(query)
+        is_fortune_intent = domain_intent in {"fortune", "zodiac", "divination"}
         if is_fortune_intent:
             _metric_incr("fortune_intent_total")
-        fast_reply = get_fast_reply(query)
+        fast_reply = get_fast_reply(query, time_anchor=time_anchor)
         if fast_reply:
+            safe_fast_reply = validate_time_consistency(fast_reply, query, time_anchor, window_meta=window_meta)
             if profile.get("name") or profile.get("birthdate"):
-                response_data = {"session_id": session_id, "output": fast_reply}
+                response_data = {"session_id": session_id, "output": safe_fast_reply}
             else:
-                response_data["output"] = fast_reply
-            track_output_quality(session_id, response_data.get("output", ""), profile=profile)
+                response_data["output"] = safe_fast_reply
+            track_output_quality(
+                session_id,
+                response_data.get("output", ""),
+                profile=profile,
+                query=query,
+                question_type=question_type,
+            )
+            _log_route_observability(
+                route_path="fast_reply",
+                reason_code=flag_reason_code,
+                flag_snapshot=flag_snapshot,
+                domain_intent=domain_intent,
+                question_type=question_type,
+            )
             return response_data
-        zodiac_reply, _ = route_zodiac_pipeline(query)
+        zodiac_reply, zodiac_meta = route_zodiac_pipeline(query, allow_clarify=bool(flags.get("clarify_v2")))
         if zodiac_reply is not None:
             if is_fortune_intent:
                 _metric_incr("fortune_route_hit_total")
             out = sanitize_output(zodiac_reply, user_query=query, profile=profile)
-            track_output_quality(session_id, out, profile=profile)
+            z_qtype = str(((zodiac_meta or {}).get("question_type") if isinstance(zodiac_meta, dict) else "") or question_type)
+            out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            track_output_quality(
+                session_id,
+                out,
+                profile=profile,
+                query=query,
+                question_type=z_qtype,
+            )
+            z_reason = flag_reason_code
+            z_route = "zodiac_pipeline"
+            if isinstance(zodiac_meta, dict) and str(zodiac_meta.get("source") or "") == "zodiac_clarify":
+                z_reason = "zodiac_sign_missing"
+                z_route = "zodiac_clarify"
+            _log_route_observability(
+                route_path=z_route,
+                reason_code=z_reason,
+                flag_snapshot=flag_snapshot,
+                domain_intent="zodiac",
+                question_type=z_qtype,
+            )
             return {
                 "session_id": session_id,
                 "output": out,
             }
         # P0: 命理强路由，命中后直接返回，不回落通用Agent重写。
-        fortune_reply, _ = route_fortune_pipeline(query, profile)
+        fortune_qtype = question_type if flags.get("intent_v2") else "default"
+        fortune_reply, fortune_payload = route_fortune_pipeline(
+            query,
+            profile,
+            time_anchor=time_anchor,
+            flags=flags,
+            question_type=fortune_qtype,
+        )
         if fortune_reply is not None:
             if is_fortune_intent:
                 _metric_incr("fortune_route_hit_total")
             out = sanitize_output(fortune_reply, user_query=query, profile=profile)
-            track_output_quality(session_id, out, profile=profile)
+            if not window_meta and isinstance(fortune_payload, dict):
+                if str(fortune_payload.get("window_start") or "").strip() and str(fortune_payload.get("window_end") or "").strip():
+                    window_meta = {
+                        "window_start": str(fortune_payload.get("window_start")),
+                        "window_end": str(fortune_payload.get("window_end")),
+                        "window_text": str(fortune_payload.get("window_text") or ""),
+                    }
+            out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            qtype_for_metrics = str((fortune_payload or {}).get("question_type") or fortune_qtype)
+            track_output_quality(
+                session_id,
+                out,
+                profile=profile,
+                query=query,
+                question_type=qtype_for_metrics,
+            )
+            _log_route_observability(
+                route_path="fortune_pipeline",
+                reason_code=flag_reason_code,
+                flag_snapshot=flag_snapshot,
+                domain_intent="fortune",
+                question_type=qtype_for_metrics,
+            )
             return {
                 "session_id": session_id,
                 "output": out,
             }
-        context_note = build_ellipsis_context_note(query, chat_message_history)
+        time_sensitive = is_time_sensitive_query(query)
+        if time_sensitive:
+            _metric_incr("time_sensitive_history_isolation_total")
+            isolated_id = f"{session_id}:ts:{uuid.uuid4().hex[:8]}"
+            agent_history = RedisChatMessageHistory(url=REDIS_URL, session_id=isolated_id, ttl=120)
+            near_days = time_anchor.get("near_days") or []
+            window_text = "、".join(
+                [f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")]
+            )
+            context_note = (
+                f"时间敏感问题请以当前时间锚点为准："
+                f"{time_anchor.get('today_cn')}，{time_anchor.get('weekday_cn')}（{time_anchor.get('tz_name')}，{time_anchor.get('utc_offset')}）。"
+                f"若涉及“近几天”，默认窗口：{window_text}。不要沿用历史轮次中的旧日期。"
+            )
+        else:
+            agent_history = chat_message_history
+            context_note = build_ellipsis_context_note(query, chat_message_history)
         style_instruction = build_style_instruction(query, emotion_level, session_id)
         profile_context = build_profile_context(profile)
         #给每个用户赋予一个单独的会话id，为了区分每个用户
@@ -1904,7 +2602,7 @@ async def chat(request: Request, payload: ChatRequest):
         logger.info(f"用户session_id: {session_id}")
         #ttl 当前会话数据的过期时间，600秒表示10分钟过期
         #用户的会话存入Redis
-        master = Master(chat_message_history)
+        master = Master(agent_history)
         #主要的方法
         result = master.run(
             query,
@@ -1924,7 +2622,21 @@ async def chat(request: Request, payload: ChatRequest):
         else:
             logger.info(f"/chat接口最终输出(非dict): {str(result)}")
             response_data["output"] = sanitize_output(str(result), user_query=query, profile=profile)
-        track_output_quality(session_id, response_data.get("output", ""), profile=profile)
+        response_data["output"] = validate_time_consistency(response_data["output"], query, time_anchor, window_meta=window_meta)
+        track_output_quality(
+            session_id,
+            response_data.get("output", ""),
+            profile=profile,
+            query=query,
+            question_type=question_type,
+        )
+        _log_route_observability(
+            route_path="agent_fallback",
+            reason_code=flag_reason_code,
+            flag_snapshot=flag_snapshot,
+            domain_intent=domain_intent,
+            question_type=question_type,
+        )
     except Exception as e:
         error_id = uuid.uuid4().hex[:8]
         logger.error(f"服务处理异常 error_id={error_id}: {e}\n{traceback.format_exc()}")
@@ -1945,7 +2657,20 @@ async def chat(request: Request, payload: ChatRequest):
                 f"呜啦…天机有点乱糟糟。吉伊大师先缓一缓，等会儿再来试试呀。（错误编号：{error_id}）"
             )
         if session_id:
-            track_output_quality(session_id, response_data.get("output", ""), profile=profile)
+            track_output_quality(
+                session_id,
+                response_data.get("output", ""),
+                profile=profile,
+                query=str(getattr(payload, "query", "") or ""),
+                question_type=question_type,
+            )
+        _log_route_observability(
+            route_path="error",
+            reason_code="exception",
+            flag_snapshot=flag_snapshot,
+            domain_intent=domain_intent,
+            question_type=question_type,
+        )
     return response_data
 
 @app.post("/add_urls", summary="新增URL知识到向量库", tags=["Knowledge"])
