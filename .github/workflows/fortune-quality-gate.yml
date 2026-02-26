@@ -1,0 +1,182 @@
+name: Fortune Quality Gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root_dev_only_change_me
+          MYSQL_DATABASE: fortune_telling
+          MYSQL_USER: fortune_app
+          MYSQL_PASSWORD: fortune_app_dev
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot_dev_only_change_me --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 20s
+    env:
+      PYTHONUNBUFFERED: "1"
+      REDIS_URL: redis://127.0.0.1:6379/
+      SESSION_TTL_SECONDS: "600"
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: "3306"
+      MYSQL_DB: fortune_telling
+      MYSQL_USER: fortune_app
+      MYSQL_PASSWORD: fortune_app_dev
+      VECTOR_DB_PATH: ./local_qdrand
+      VECTOR_COLLECTION_NAME: local_documents
+      SMS_DEBUG_CODE_ENABLED: "true"
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      YUANFENJU_API_KEY: ${{ secrets.YUANFENJU_API_KEY }}
+      SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
+            echo "Missing required secret: DASHSCOPE_API_KEY"
+            exit 1
+          fi
+          if [ -z "${YUANFENJU_API_KEY:-}" ]; then
+            echo "Missing required secret: YUANFENJU_API_KEY"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          iconv -f UTF-16LE -t UTF-8 requirements.txt \
+            | sed '1s/^\xEF\xBB\xBF//;/^pywin32==/d;/^win32_setctime==/d' \
+            > /tmp/requirements.ci.txt
+          python -m pip install -r /tmp/requirements.ci.txt
+
+      - name: Initialize MySQL schema
+        run: |
+          python - <<'PY'
+          import time
+          from pathlib import Path
+          import pymysql
+
+          max_retries = 30
+          conn = None
+          for i in range(max_retries):
+            try:
+              conn = pymysql.connect(
+                host="127.0.0.1",
+                port=3306,
+                user="fortune_app",
+                password="fortune_app_dev",
+                database="fortune_telling",
+                charset="utf8mb4",
+                autocommit=False,
+              )
+              break
+            except Exception as e:
+              if i == max_retries - 1:
+                raise RuntimeError(f"MySQL not ready: {e}")
+              time.sleep(2)
+
+          sql = Path("sql/001_init_auth_schema.sql").read_text(encoding="utf-8")
+          with conn.cursor() as cur:
+            for stmt in sql.split(";"):
+              stmt = stmt.strip()
+              if stmt:
+                cur.execute(stmt)
+          conn.commit()
+          conn.close()
+          print("MySQL schema initialized")
+          PY
+
+      - name: Start API
+        run: |
+          set -euo pipefail
+          nohup uvicorn server:app --host 127.0.0.1 --port 8001 > /tmp/server.log 2>&1 &
+          echo $! > /tmp/server.pid
+
+      - name: Wait for API ready
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8001/docs >/dev/null; then
+              echo "API is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API failed to start"
+          tail -n 200 /tmp/server.log || true
+          exit 1
+
+      - name: Run fortune regression (24 cases)
+        run: |
+          set -euo pipefail
+          python scripts/fortune_regression.py \
+            --base-url http://127.0.0.1:8001 \
+            --max-cases 24 \
+            --timeout 90 | tee /tmp/fortune_regression.log
+
+      - name: Run quality metrics gate
+        run: |
+          set -euo pipefail
+          python scripts/quality_gate.py \
+            --base-url http://127.0.0.1:8001 \
+            --days 1 \
+            --min-route-hit-rate 0.90 \
+            --min-tool-success-rate 0.90 \
+            --min-field-completeness-rate 0.85 \
+            --max-profile-echo-violation-rate 0.00 \
+            --max-template-repeat-rate 0.20 | tee /tmp/quality_gate.log
+
+      - name: Stop API
+        if: always()
+        run: |
+          if [ -f /tmp/server.pid ]; then
+            kill "$(cat /tmp/server.pid)" || true
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fortune-quality-gate-logs
+          path: |
+            /tmp/server.log
+            /tmp/fortune_regression.log
+            /tmp/quality_gate.log
+          if-no-files-found: warn

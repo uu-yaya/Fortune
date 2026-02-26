@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>吉伊大师 - 注册</title>
+    <link rel="stylesheet" href="/static/css/login.css?v=20260226-auth-4">
+</head>
+<body>
+    <main class="auth-page">
+        <section class="auth-card">
+            <h1>手机号注册</h1>
+            <p class="sub">一个手机号对应一个账号，注册后自动生成专属账号ID。</p>
+
+            <label class="field-label" for="phoneInput">手机号</label>
+            <input id="phoneInput" type="tel" maxlength="11" placeholder="请输入11位手机号">
+
+            <label class="field-label" for="codeInput">验证码</label>
+            <div class="code-row">
+                <input id="codeInput" type="text" maxlength="6" placeholder="请输入6位验证码">
+                <button id="sendCodeBtn" type="button">发送验证码</button>
+            </div>
+
+            <label class="field-label" for="passwordInput">设置密码</label>
+            <input id="passwordInput" type="password" maxlength="12" placeholder="请输入8-12位字母或数字">
+
+            <label class="field-label" for="confirmPasswordInput">确认密码</label>
+            <input id="confirmPasswordInput" type="password" maxlength="12" placeholder="请再次输入密码">
+
+            <div class="actions single">
+                <button id="submitBtn" type="button" class="secondary">注册</button>
+            </div>
+
+            <p id="statusText" class="status"></p>
+            <p class="hint">已经有账号？<a href="/login">去登录</a></p>
+            <p class="hint">密码仅支持字母和数字，长度8-12位。</p>
+            <p class="hint">演示版本：验证码会直接显示在页面提示中，后续可接短信服务。</p>
+        </section>
+    </main>
+
+    <script src="/static/js/auth.js?v=20260226-auth-4" data-mode="register"></script>
+</body>
+</html>

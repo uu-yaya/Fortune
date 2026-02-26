@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Env
+.env
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Local runtime/data
+local_qdrand/
+output/
+*.log
+
+# OS
+.DS_Store

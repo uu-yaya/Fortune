@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>吉伊大师 - 登录</title>
+    <link rel="stylesheet" href="/static/css/login.css?v=20260226-auth-4">
+</head>
+<body>
+    <main class="auth-page">
+        <section class="auth-card">
+            <h1>登录</h1>
+            <p class="sub">支持手机号验证码或账号密码登录。</p>
+
+            <div class="tabs">
+                <button id="tabSms" class="tab-btn active" type="button">手机号登录</button>
+                <button id="tabPwd" class="tab-btn" type="button">账号密码登录</button>
+            </div>
+
+            <div id="smsPanel">
+                <label class="field-label" for="phoneInput">手机号</label>
+                <input id="phoneInput" type="tel" maxlength="11" placeholder="请输入11位手机号">
+
+                <label class="field-label" for="codeInput">验证码</label>
+                <div class="code-row">
+                    <input id="codeInput" type="text" maxlength="6" placeholder="请输入6位验证码">
+                    <button id="sendCodeBtn" type="button">发送验证码</button>
+                </div>
+
+                <div class="actions single">
+                    <button id="submitSmsBtn" type="button">手机号登录</button>
+                </div>
+            </div>
+
+            <div id="pwdPanel" class="hidden">
+                <label class="field-label" for="accountInput">账号</label>
+                <input id="accountInput" type="text" maxlength="24" placeholder="请输入账号（例如 JIYI-AB12CD34）">
+
+                <label class="field-label" for="passwordInput">密码</label>
+                <input id="passwordInput" type="password" maxlength="12" placeholder="请输入密码">
+
+                <div class="actions single">
+                    <button id="submitPwdBtn" type="button">账号密码登录</button>
+                </div>
+            </div>
+
+            <p id="statusText" class="status"></p>
+            <p class="hint"><a href="/forgot-password">忘记密码？</a></p>
+            <p class="hint">还没有账号？<a href="/register">去注册</a></p>
+            <p class="hint">演示版本：验证码会直接显示在页面提示中，后续可接短信服务。</p>
+        </section>
+    </main>
+
+    <script src="/static/js/login_multi.js?v=20260226-login-multi-1"></script>
+</body>
+</html>

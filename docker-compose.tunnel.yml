@@ -1,0 +1,5 @@
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://host.docker.internal:8001
+    restart: unless-stopped

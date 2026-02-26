@@ -1,0 +1,55 @@
+services:
+  numerology:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "8001:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_DB=${MYSQL_DB:-fortune_telling}
+      - MYSQL_USER=${MYSQL_USER:-fortune_app}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-fortune_app_dev}
+    depends_on:
+      redis:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./local_qdrand:/app/local_qdrand
+
+  redis:
+    image: redis:latest
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_data:/data
+
+  mysql:
+    image: mysql:8.0
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root_dev_only_change_me}
+      - MYSQL_DATABASE=${MYSQL_DB:-fortune_telling}
+      - MYSQL_USER=${MYSQL_USER:-fortune_app}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-fortune_app_dev}
+      - TZ=Asia/Shanghai
+    ports:
+      - "127.0.0.1:3307:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+volumes:
+  mysql_data:
+  redis_data:

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>吉伊大师 - 命理咨询</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=20260226-auth-header-6">
+    <link rel="icon" type="image/svg+xml" href="/static/images/cheer_bear.svg?v=20260225-cheerbear-1">
+</head>
+<body>
+    <div class="container">
+        <div class="chat-box">
+            <img src="/static/images/jiyi-anim.gif?v=20260226-gif-1" alt="吉伊动图" class="auth-jiyi-gif">
+            <div class="auth-user">
+                <img src="/static/images/cheer_bear.svg?v=20260225-cheerbear-1" alt="用户头像" class="auth-avatar">
+                <span class="auth-phone" title="{{ user_uuid }}">{{ user_short_account }}</span>
+                <button id="logoutBtn" type="button" class="logout-btn">退出登录</button>
+            </div>
+            <div class="chat-header">
+                <img src="/static/images/cheer_bear.svg?v=20260225-cheerbear-1" alt="头像" class="avatar">
+                <div class="header-info">
+                    <h2>吉伊大师</h2>
+                    <p>不诚不算,不疑不算,不义不算</p>
+                </div>
+            </div>
+            <div class="ornaments" aria-hidden="true">
+                <span class="orn star1">✦</span>
+                <span class="orn star2">✧</span>
+                <span class="orn heart1">❤</span>
+                <span class="orn heart2">♡</span>
+                <span class="orn cloud1">☁</span>
+                <span class="orn cloud2">☁</span>
+            </div>
+            
+            <div class="chat-messages" id="chatMessages">
+                <!-- 欢迎消息 -->
+                <div class="message bot-message initial-message">
+                    呀哈～吉伊大师来啦。啊…嗯…那个……本鼠鼠会一点点阴阳五行、八字和占卜，会认真帮你慢慢看看方向。
+                    如果你最近有点迷糊、紧张，或者遇到怪难题，也可以告诉我，吉伊会一边“呜啦”一边帮你细细推演的。
+                </div>
+            </div>
+
+            <div class="chat-input">
+                <textarea id="userInput" placeholder="呀哈～想问什么就告诉本鼠鼠吧，我会认真听的……"></textarea>
+                <button id="sendButton">
+                    <img src="/static/images/cheer_bear.svg?v=20260225-cheerbear-1" alt="发送" class="send-icon send-icon-static">
+                    <img src="/static/images/jiyi-anim.gif?v=20260226-gif-1" alt="发送动图" class="send-icon send-icon-hover">
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 加载动画 -->
+    <div class="loading-overlay hidden">
+        <div class="loading-spinner"></div>
+    </div>
+
+    <script src="/static/js/main.js?v=20260226-auth-header-4"></script>
+</body>
+</html> 

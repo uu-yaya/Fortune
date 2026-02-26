@@ -1,0 +1,151 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: "Microsoft YaHei", sans-serif;
+    background: linear-gradient(135deg, #fff8fe 0%, #f9fcff 50%, #fffdf7 100%);
+    color: #2b2b2b;
+    min-height: 100vh;
+}
+
+.auth-page {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+}
+
+.auth-card {
+    width: 100%;
+    max-width: 460px;
+    background: #fff;
+    border: 1px solid #ffd4e9;
+    border-radius: 24px;
+    box-shadow: 0 14px 32px rgba(239, 154, 193, 0.18);
+    padding: 24px;
+}
+
+.auth-card h1 {
+    margin: 0 0 6px;
+    font-size: 26px;
+}
+
+.sub {
+    margin: 0 0 18px;
+    color: #7a6c74;
+    font-size: 14px;
+}
+
+.tabs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 14px;
+}
+
+.tab-btn {
+    height: 40px;
+    border: 1px solid #f0cada;
+    background: #fff7fb;
+    color: #6a4f61;
+}
+
+.tab-btn.active {
+    background: #ff8fc3;
+    color: #fff;
+    border-color: #ff8fc3;
+}
+
+.hidden {
+    display: none;
+}
+
+.field-label {
+    display: block;
+    margin: 10px 0 6px;
+    font-size: 14px;
+    color: #654e5f;
+}
+
+input {
+    width: 100%;
+    border: 1px solid #f0cada;
+    border-radius: 14px;
+    padding: 12px 14px;
+    font-size: 16px;
+    outline: none;
+}
+
+input:focus {
+    border-color: #f59fcb;
+    box-shadow: 0 0 0 3px rgba(245, 159, 203, 0.18);
+}
+
+.code-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+}
+
+button {
+    border: none;
+    border-radius: 14px;
+    background: #ff8fc3;
+    color: #fff;
+    font-size: 14px;
+    padding: 0 14px;
+    cursor: pointer;
+}
+
+button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.actions {
+    margin-top: 16px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.actions.single {
+    grid-template-columns: 1fr;
+}
+
+.actions button {
+    height: 44px;
+    font-size: 15px;
+}
+
+.actions .secondary {
+    background: #a7c9ff;
+}
+
+.status {
+    min-height: 22px;
+    margin: 12px 0 0;
+    color: #4d7d3e;
+    font-size: 14px;
+}
+
+.status.error {
+    color: #d64f62;
+}
+
+.hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #8d7f88;
+}
+
+.hint a {
+    color: #d86ca6;
+    text-decoration: none;
+}
+
+.hint a:hover {
+    text-decoration: underline;
+}
