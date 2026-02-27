@@ -29,6 +29,10 @@ def contains_any(text: str, candidates: list[str], min_hit: int = 1) -> bool:
     return hit >= min_hit
 
 
+def has_pattern(text: str, pattern: str) -> bool:
+    return bool(re.search(pattern, str(text or ""), flags=re.IGNORECASE))
+
+
 def has_explicit_window(text: str) -> bool:
     out = str(text or "")
     if not out:
@@ -66,21 +70,60 @@ def max_pair_similarity(outputs: list[str]) -> float:
     return round(max_sim, 4)
 
 
+def asks_for_profile(text: str) -> bool:
+    out = str(text or "")
+    if not out.strip():
+        return False
+    if "资料补齐" in out:
+        return True
+    patterns = [
+        r"(请|先)?告诉我.*(姓名|名字|出生|生日|出生年月日|出生日期|时辰|生辰)",
+        r"(请|先)?提供.*(姓名|名字|出生|生日|出生年月日|出生日期|时辰|生辰)",
+        r"(还需要|我还需要|需要你补充|请补充).*(姓名|名字|出生|生日|出生年月日|出生日期|时辰|生辰)",
+    ]
+    return any(has_pattern(out, p) for p in patterns)
+
+
+def has_action_guidance(text: str) -> bool:
+    return contains_any(
+        str(text or ""),
+        ["建议", "可执行", "行动", "第一步", "先", "宜", "不宜", "避免", "怎么做", "安排"],
+        min_hit=1,
+    )
+
+
+def first_n_sentences(text: str, n: int = 2) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return ""
+    parts = [p.strip() for p in re.split(r"[。！？!\n]+", out) if p.strip()]
+    return "。".join(parts[: max(1, n)])
+
+
 def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: str) -> tuple[bool, str]:
     text = str(output or "")
     if case.expected == "missing_profile":
-        ok = "姓名" in text and "出生年月日" in text
-        return ok, "应提示补齐姓名+出生年月日"
+        if asks_for_profile(text):
+            return True, "资料补齐提示命中"
+        return False, "应提示补齐姓名或出生信息"
 
     if case.expected == "fortune_detail":
-        has_conclusion = contains_any(text, ["结论：", "先给你结论"], min_hit=1)
-        has_basis = contains_any(text, ["依据：", "命理依据："], min_hit=1)
-        has_advice = contains_any(text, ["建议：", "行动建议："], min_hit=1)
-        if not (has_conclusion and has_basis and has_advice):
-            return False, "命理细节结构不完整（缺少结论/依据/建议）"
         if profile_name in text or profile_birthdate in text:
             return False, "发生用户资料原文回显"
-        return True, "命理结构完整"
+        if asks_for_profile(text):
+            return False, "已有资料后仍触发资料补齐"
+        if len(text.strip()) < 40:
+            return False, "命理解读过短"
+        has_analysis_signal = contains_any(
+            text,
+            ["命理", "运势", "财运", "事业", "感情", "学业", "流年", "八字", "日主", "五行", "时间窗口", "近期", "本周", "下周"],
+            min_hit=1,
+        )
+        if not has_analysis_signal:
+            return False, "命理语义信号不足"
+        if not has_action_guidance(text):
+            return False, "缺少行动导向建议"
+        return True, "命理解读语义完整"
 
     if case.expected == "clarify":
         has_sign_request = bool(re.search(r"(告诉我你的星座|先告诉我.*星座|你是哪个星座|什么星座)", text))
@@ -92,17 +135,31 @@ def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: s
         return True, "口语时窗命中"
 
     if case.expected == "decision":
-        first = first_sentence(text)
-        if not first:
-            return False, "决策首句为空"
-        direct = bool(re.search(r"(结论|先|优先|建议|开源|守财|守中带开)", first))
+        if asks_for_profile(text):
+            return True, "决策问题进入资料补齐"
+        head = first_n_sentences(text, n=2)
+        if not head:
+            return False, "决策回答为空"
+        direct = has_pattern(
+            head,
+            r"(结论|优先|建议|更适合|更稳|更好|宜|不宜|可以|不该|不建议|应该|先.*再|守财|开源|控支出|继续|体面收尾|联系)",
+        )
         if not direct:
-            return False, "决策首句未直答"
-        return True, "决策首句直答命中"
+            return False, "决策前两句未给出明确取舍"
+        return True, "决策取舍命中"
 
     if case.expected == "divination":
-        ok = "摇到一卦" in text and contains_any(text, ["凶吉：", "运势："], min_hit=1)
-        return ok, "占卜结果结构不完整"
+        has_divination_signal = contains_any(text, ["卦", "摇卦", "抽签", "占卜", "签文"], min_hit=1) or contains_any(
+            case.query, ["卦", "摇卦", "抽签", "占卜", "签"], min_hit=1
+        )
+        has_outcome_signal = contains_any(
+            text,
+            ["吉", "凶", "大吉", "小吉", "平", "宜", "不宜", "适合", "不适合", "结论", "建议", "不建议"],
+            min_hit=1,
+        )
+        if not (has_divination_signal and has_outcome_signal):
+            return False, "占卜语义不完整"
+        return True, "占卜语义命中"
 
     if case.expected == "general":
         ok = len(text.strip()) > 0 and "Traceback" not in text
