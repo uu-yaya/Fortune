@@ -1,67 +1,138 @@
-# 命理机器人
+# 吉伊大师命理咨询系统
 
-命理机器人是一个基于 Python 的智能问答系统，结合RAG、AI Agent和现代 Web 前端，能够为用户提供命理相关的自动化问答服务。
+基于 FastAPI + LangChain + MySQL + Redis + Qdrant 的命理问答系统，支持验证码注册登录、账号密码登录、资料抽取、命理问答、质量指标统计与回归门禁。
 
-## 目录结构
+## 1. 功能概览
 
+- 鉴权与账户
+  - 手机号验证码登录/注册
+  - 账号密码登录
+  - 忘记密码（验证码校验 + 密码重置）
+- 智能问答
+  - 普通聊天、时间快捷回复
+  - 命理问答（资料补齐、命理工具链路）
+  - 星座问答、解梦、占卜
+- 数据与知识
+  - MySQL 持久化用户、资料、会话审计、密码重置日志
+  - Redis 存储会话、验证码、冷却计时、短期聊天历史、质量指标
+  - 本地 Qdrant 向量库支持网页知识入库
+- 质量治理
+  - `/quality/metrics` 质量指标看板
+  - `scripts/fortune_regression.py` 回归脚本
+  - `scripts/quality_gate.py` 门禁脚本
+
+## 2. 技术栈
+
+- 后端：Python 3.11、FastAPI、Uvicorn、LangChain
+- 数据：MySQL 8、Redis、Qdrant（本地持久化）
+- 前端：Jinja2 模板 + 原生 JavaScript
+- 日志：loguru
+
+## 3. 项目结构
+
+```text
+fortune-telling/
+├── server.py                  # 核心后端：路由 + 业务编排 + AI链路
+├── config.py                  # 环境变量配置
+├── models.py                  # LLM / Embedding 客户端工厂
+├── mytools.py                 # Agent 工具函数
+├── sql/001_init_auth_schema.sql
+├── scripts/
+│   ├── fortune_regression.py  # 命理回归脚本
+│   └── quality_gate.py        # 质量门禁脚本
+├── templates/                 # 页面模板
+├── static/                    # 静态资源（JS/CSS）
+├── docs/                      # 设计/接口/测试与历史报告
+├── docker-compose.yml
+└── README.md
 ```
-命理机器人/
-├── local_qdrand/         # 本地知识库及相关数据
-├── static/               # 前端静态资源（CSS/JS/图片）
-├── templates/            # 前端模板（HTML）
-├── mytools.py            # 工具函数
-├── logger.py             # 日志配置
-├── models.py             # 产生大模型客户端
-├── requirements.txt      # Python 依赖包列表
-├── server.py             # 主服务端代码
-└── README.md             # 本文件，项目说明文档
-```
 
-## 快速开始
+## 4. 快速开始
 
-### 1. 安装依赖
+### 4.1 本地运行
 
-建议使用虚拟环境：
+1. 安装依赖
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-复制环境变量模板并填写密钥：
+2. 配置环境变量
 
 ```bash
 cp .env.example .env
 ```
 
-### 2. 启动服务
+关键变量（详见 `.env.example`）：
+
+- `REDIS_URL`
+- `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_DB` / `MYSQL_USER` / `MYSQL_PASSWORD`
+- `DASHSCOPE_API_KEY`（模型）
+- `SERPAPI_API_KEY`（可选）
+- `YUANFENJU_API_KEY`（命理工具）
+- `SMS_DEBUG_CODE_ENABLED`（开发环境可为 `true`）
+
+3. 启动服务
 
 ```bash
 python server.py
 ```
 
-默认会在本地 http://127.0.0.1:8000/ 启动 Web 服务。
+默认监听：`http://127.0.0.1:8000`
 
-### 3. 访问前端
+4. 访问入口
 
-浏览器打开 [http://127.0.0.1:8000/index](http://127.0.0.1:8000/index) 即可体验命理机器人。
-浏览器打开 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) 即可打开API文档，并通过接口新增知识。
+- 前端：`http://127.0.0.1:8000/index`
+- API文档：`http://127.0.0.1:8000/docs`
 
-## 主要功能
+### 4.2 Docker Compose 运行（推荐）
 
-- 命理相关知识问答
-- 本地知识库检索和知识增加
-- 现代 Web 前端界面
-- 可扩展的工具函数（mytools.py）
+```bash
+docker compose -p zhipo-numerology up -d --build
+```
 
+默认端口映射：
 
-## 使用以下命令构建和运行Docker镜像：
-### 方法一，该方法是本项目和依赖的Redis是独立容器：
-使用docker build
-docker build -t zhipo-numerology-app .
+- 应用：`127.0.0.1:8001 -> 8000`
+- Redis：`127.0.0.1:6380 -> 6379`
+- MySQL：`127.0.0.1:3307 -> 3306`
 
-运行容器
-docker run --name zhipo-numerology -p 8001:8000 zhipo-numerology-app
+停止服务：
 
-###  方法二，该方法是本项目和依赖的Redis打包在一个容器中： 
-或者使用docker-compose（推荐）
-docker-compose -p zhipo-numerology up --build
+```bash
+docker compose -p zhipo-numerology down
+```
+
+## 5. 测试与质量门禁
+
+1. 命理回归
+
+```bash
+python3 scripts/fortune_regression.py --base-url http://127.0.0.1:8001 --max-cases 24
+```
+
+2. 质量门禁
+
+```bash
+python3 scripts/quality_gate.py --base-url http://127.0.0.1:8001 --days 1
+```
+
+## 6. 文档导航
+
+核心规范文档：
+
+- `docs/01-概要设计说明书.md`
+- `docs/02-详细设计说明书.md`
+- `docs/03-数据库设计说明书.md`
+- `docs/04-API接口文档.md`
+- `docs/05-测试用例.md`
+- `docs/README.md`（全部文档导航）
+
+## 7. 安全与上线注意事项
+
+- 生产环境必须关闭 `SMS_DEBUG_CODE_ENABLED`，避免回传验证码。
+- 建议在 HTTPS 场景下启用更严格 Cookie 策略（如 `Secure`）。
+- 对外部模型/工具依赖做好降级与熔断策略。
+- `.env` 中包含敏感信息，不应提交到仓库。

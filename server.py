@@ -62,6 +62,7 @@ AUTH_COOKIE_NAME = "jiyi_auth_token"
 CODE_TTL_SECONDS = 300
 RESEND_COOLDOWN_SECONDS = 60
 AUTH_TTL_DAYS = 30
+PREFERRED_NAME_PROMPT_TTL_SECONDS = 24 * 3600
 _REDIS_CLIENT = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
@@ -146,6 +147,11 @@ def _sms_cooldown_key(phone: str, scene: str = "default") -> str:
 
 def _session_key(token: str) -> str:
     return f"auth:session:{token}"
+
+
+def _preferred_name_prompt_key(session_id: str) -> str:
+    sid = str(session_id or "").strip()
+    return f"chat:preferred_name_prompt:{sid}"
 
 
 def _pwd_reset_verified_key(phone: str) -> str:
@@ -275,11 +281,36 @@ def _log_password_reset(user_id: int, phone: str, request: Request):
             )
 
 
+def _load_profile_json(raw_value) -> dict:
+    if isinstance(raw_value, dict):
+        return raw_value
+    if raw_value in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(str(raw_value))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _dump_profile_json(preferred_name: str = "") -> str | None:
+    payload: dict[str, str] = {}
+    call_name = str(preferred_name or "").strip()
+    if call_name:
+        payload["preferred_name"] = call_name
+    if not payload:
+        return None
+    try:
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return None
+
+
 def _get_profile_by_user_id(user_id: int) -> dict[str, str]:
     with _db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT name, birth_date, birth_time FROM user_profile WHERE user_id = %s LIMIT 1",
+                "SELECT name, birth_date, birth_time, profile_json FROM user_profile WHERE user_id = %s LIMIT 1",
                 (user_id,),
             )
             row = cur.fetchone() or {}
@@ -303,7 +334,14 @@ def _get_profile_by_user_id(user_id: int) -> dict[str, str]:
             m = re.match(r"^(\d{1,2}):(\d{2})", bt_text)
             if m:
                 birthtime = f"{int(m.group(1)):02d}:{m.group(2)}"
-    return {"name": row.get("name") or "", "birthdate": birthdate, "birthtime": birthtime}
+    ext = _load_profile_json(row.get("profile_json"))
+    preferred_name = str(ext.get("preferred_name") or "").strip()
+    return {
+        "name": row.get("name") or "",
+        "birthdate": birthdate,
+        "birthtime": birthtime,
+        "preferred_name": preferred_name,
+    }
 
 
 def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str]:
@@ -319,7 +357,12 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
     if current.get("birthtime") and not merged.get("birthtime"):
         merged["birthtime"] = current["birthtime"]
         changed = True
+    incoming_preferred_name = str(current.get("preferred_name") or "").strip()
+    if incoming_preferred_name and incoming_preferred_name != str(merged.get("preferred_name") or "").strip():
+        merged["preferred_name"] = incoming_preferred_name
+        changed = True
     if changed:
+        profile_json = _dump_profile_json(preferred_name=str(merged.get("preferred_name") or "").strip())
         with _db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -328,6 +371,7 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
                     SET name = %s,
                         birth_date = %s,
                         birth_time = %s,
+                        profile_json = %s,
                         updated_at = NOW()
                     WHERE user_id = %s
                     """,
@@ -335,6 +379,7 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
                         merged.get("name") or None,
                         merged.get("birthdate") or None,
                         merged.get("birthtime") or None,
+                        profile_json,
                         user_id,
                     ),
                 )
@@ -587,15 +632,19 @@ def _is_fortune_field_complete(payload: dict) -> bool:
     return bool(bazi and day_master and has_scores)
 
 
-def _has_profile_echo(text: str, profile: dict | None = None) -> bool:
+def _has_profile_echo(text: str, profile: dict | None = None, query: str = "") -> bool:
     out = str(text or "")
     p = profile or {}
     if not out:
         return False
     name = str(p.get("name") or "").strip()
+    preferred_name = str(p.get("preferred_name") or "").strip()
     birthdate = str(p.get("birthdate") or "").strip()
     birthtime = str(p.get("birthtime") or "").strip()
-    if name and name in out:
+    allow_name_echo = _is_asking_own_name(query)
+    if preferred_name and preferred_name in out:
+        allow_name_echo = True
+    if name and name in out and not allow_name_echo:
         return True
     if birthdate and birthdate in out:
         return True
@@ -718,7 +767,7 @@ def track_output_quality(
             pass
 
     _metric_incr("profile_echo_total")
-    if _has_profile_echo(text, profile):
+    if _has_profile_echo(text, profile, query=query):
         _metric_incr("profile_echo_violation")
 
     qtype = str(question_type or "default")
@@ -1053,7 +1102,11 @@ def build_time_anchor(window_days: int = 3) -> dict:
     }
 
 
-RELATIVE_WINDOW_PATTERN = re.compile(r"(本周|这周|下周|最近一周|这一周|近几天|这几天|哪几天|哪天|最近两天|这两天|本月|这个月)")
+RELATIVE_WINDOW_PATTERN = re.compile(
+    r"(本周|这周|下周|最近一周|这一周|近几天|这几天|哪几天|哪天|最近两天|这两天|本月|这个月|"
+    r"接下来(?:的)?一个月|未来(?:的)?一个月|接下来1个月|未来1个月|接下来30天|未来30天|"
+    r"接下来(?:的)?一段时间|未来(?:的)?一段时间|接下来这段时间|未来这段时间|后面一段时间|之后一段时间)"
+)
 
 
 def _cn_day(dt: datetime) -> str:
@@ -1086,6 +1139,18 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
         start = (now - timedelta(days=now.weekday())) + timedelta(days=7)
         end = start + timedelta(days=6)
         label = "next_week"
+    elif re.search(
+        r"(接下来(?:的)?一个月|未来(?:的)?一个月|接下来1个月|未来1个月|接下来30天|未来30天)", q
+    ):
+        start = now
+        end = now + timedelta(days=29)
+        label = "next_30_days"
+    elif re.search(
+        r"(接下来(?:的)?一段时间|未来(?:的)?一段时间|接下来这段时间|未来这段时间|后面一段时间|之后一段时间)", q
+    ):
+        start = now
+        end = now + timedelta(days=29)
+        label = "coming_period"
     elif re.search(r"(本周|这周|最近一周|这一周|上半段|下半段)", q):
         start = now - timedelta(days=now.weekday())
         end = start + timedelta(days=6)
@@ -1121,7 +1186,9 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
     if start > end:
         start, end = end, start
 
-    days = _enumerate_days(start, end, limit=14)
+    span_days = max(1, (end.date() - start.date()).days + 1)
+    day_limit = span_days if label in {"this_month", "next_30_days", "coming_period"} else 14
+    days = _enumerate_days(start, end, limit=day_limit)
     window_text = f"{_cn_day(start)}至{_cn_day(end)}"
     return {
         "label": label,
@@ -1433,13 +1500,142 @@ def _is_valid_name(name: str) -> bool:
     n = (name or "").strip()
     if not n:
         return False
+    if len(n) < 2 or len(n) > 16:
+        return False
     # 过滤明显非姓名内容，避免把“我是谁”“我叫什么”误识别为名字
-    invalid_tokens = {"谁", "谁呀", "谁啊", "什么", "啥", "名字", "姓名", "自己"}
+    invalid_tokens = {"谁", "谁呀", "谁啊", "什么", "啥", "名字", "姓名", "自己", "你", "我", "他", "她", "它"}
     if n in invalid_tokens:
         return False
     if re.search(r"(谁|什么|吗|呢|呀|啊|\?|？)", n):
         return False
     return True
+
+
+def _is_valid_call_name(name: str) -> bool:
+    n = str(name or "").strip()
+    if not n or len(n) > 12:
+        return False
+    invalid_tokens = {
+        "你", "我", "他", "她", "它", "自己", "名字", "姓名", "昵称", "称呼", "随便", "都行", "都可以", "无所谓",
+        "不知道", "不告诉你",
+    }
+    if n in invalid_tokens:
+        return False
+    if re.search(r"(怎么|什么|谁|吗|呢|呀|啊|\?|？|!|！|,|，|。)", n):
+        return False
+    return True
+
+
+def _extract_preferred_name_from_query(query: str) -> str:
+    source = str(query or "").strip()
+    if not source:
+        return ""
+    patterns = [
+        r"(?:你可以|以后|之后)?(?:叫我|喊我|称呼我)\s*([^\s，。！？,.]{1,12})",
+        r"(?<!我)叫\s*([^\s，。！？,.]{1,12})\s*(?:就行|即可|吧|呀|啦|哦|喔)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, source)
+        if not m:
+            continue
+        candidate = str(m.group(1) or "").strip()
+        candidate = re.sub(r"(吧|呀|啦|哦|喔|呢)$", "", candidate).strip()
+        if _is_valid_call_name(candidate):
+            return candidate
+    normalized = re.sub(r"[\s，。！？,.!？、；;:：]", "", source)
+    normalized = re.sub(r"^(那就|就|那|嗯|啊|呀|呜啦|呀哈)", "", normalized).strip()
+    normalized = re.sub(r"(吧|呀|啦|哦|喔|呢|就行|即可)$", "", normalized).strip()
+    if 1 <= len(normalized) <= 6 and _is_valid_call_name(normalized):
+        return normalized
+    return ""
+
+
+def _is_asking_own_name(query: str) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    return bool(
+        re.search(r"(我叫什?么|我是谁|我的名字|你知道我叫什?么|你知道我的名字|我叫什么名字|记得我叫)", q)
+    )
+
+
+def _name_alias_candidates(name: str) -> list[str]:
+    raw = str(name or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    if len(raw) >= 2:
+        out.append(raw[-2:])
+        out.append(raw[-1])
+        out.append(raw[-1] * 2)
+    if len(raw) >= 3:
+        out.append(raw[1:])
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in out:
+        token = str(item or "").strip()
+        if not token or token in seen:
+            continue
+        if not _is_valid_call_name(token):
+            continue
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def _pick_address_name(profile: dict | None, user_query: str = "") -> str:
+    p = profile or {}
+    preferred_name = str(p.get("preferred_name") or "").strip()
+    if _is_valid_call_name(preferred_name):
+        return preferred_name
+    name = str(p.get("name") or "").strip()
+    if not _is_valid_name(name):
+        return "你"
+    if not _is_asking_own_name(user_query):
+        return "你"
+    aliases = _name_alias_candidates(name)
+    if not aliases:
+        return name
+    choices = [name] + aliases
+    seed = hashlib.sha256(f"{name}|{user_query}".encode("utf-8")).hexdigest()
+    idx = int(seed[:8], 16) % len(choices)
+    return choices[idx]
+
+
+def _is_name_intro_query(query: str, extracted: dict[str, str] | None = None) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    e = extracted or {}
+    if not str(e.get("name") or "").strip():
+        return False
+    if re.search(r"(我叫|名字是|姓名是|我是|^.{1,16}\s*[，,]\s*(?:19|20)\d{2})", q):
+        return True
+    return False
+
+
+def _set_preferred_name_prompt_pending(session_id: str, pending: bool) -> None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    key = _preferred_name_prompt_key(sid)
+    try:
+        if pending:
+            _REDIS_CLIENT.setex(key, PREFERRED_NAME_PROMPT_TTL_SECONDS, "1")
+        else:
+            _REDIS_CLIENT.delete(key)
+    except Exception:
+        return
+
+
+def _is_preferred_name_prompt_pending(session_id: str) -> bool:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    try:
+        return bool(_REDIS_CLIENT.exists(_preferred_name_prompt_key(sid)))
+    except Exception:
+        return False
 
 
 def extract_profile_from_query(query: str) -> dict[str, str]:
@@ -1462,6 +1658,9 @@ def extract_profile_from_query(query: str) -> dict[str, str]:
     birthtime = _normalize_birthtime(source)
     if birthtime:
         profile["birthtime"] = birthtime
+    preferred_name = _extract_preferred_name_from_query(source)
+    if preferred_name:
+        profile["preferred_name"] = preferred_name
     return profile
 
 
@@ -1469,7 +1668,7 @@ def merge_session_profile(session_id: str, current: dict[str, str]) -> dict[str,
     # session_id 在当前实现中绑定用户 uuid
     user = _get_user_by_uuid(session_id)
     if not user:
-        return {"name": "", "birthdate": "", "birthtime": ""}
+        return {"name": "", "birthdate": "", "birthtime": "", "preferred_name": ""}
     return _merge_profile_to_db(int(user["id"]), current)
 
 
@@ -1479,6 +1678,8 @@ def build_profile_context(profile: dict[str, str]) -> str:
     parts = []
     if profile.get("name"):
         parts.append(f"姓名：{profile['name']}")
+    if profile.get("preferred_name"):
+        parts.append(f"称呼偏好：{profile['preferred_name']}")
     if profile.get("birthdate"):
         parts.append(f"出生日期：{profile['birthdate']}")
     if profile.get("birthtime"):
@@ -1486,7 +1687,7 @@ def build_profile_context(profile: dict[str, str]) -> str:
     if not parts:
         return "暂无用户资料。"
     profile_line = "；".join(parts)
-    return f"{profile_line}。可据此推断，但不要逐字回显个人信息。"
+    return f"{profile_line}。可自然使用用户偏好的称呼；不要逐字回显完整生日和时辰。"
 
 
 def extract_profile_from_history(chat_message_history) -> dict[str, str]:
@@ -1500,6 +1701,8 @@ def extract_profile_from_history(chat_message_history) -> dict[str, str]:
             piece = extract_profile_from_query(content)
             if piece.get("name") and not profile.get("name"):
                 profile["name"] = piece["name"]
+            if piece.get("preferred_name") and not profile.get("preferred_name"):
+                profile["preferred_name"] = piece["preferred_name"]
             if piece.get("birthdate") and not profile.get("birthdate"):
                 profile["birthdate"] = piece["birthdate"]
             if piece.get("birthtime") and not profile.get("birthtime"):
@@ -2155,7 +2358,7 @@ def _generate_fortune_reply_with_model(
 4) 如问题涉及趋势/口语时窗，并且提供了窗口信息，需自然写出明确时间窗口。
 5) 结合“命理信号、依据、建议候选、证据点”组织内容，不要编造工具结果里不存在的细节。
 6) 给1-3条可执行建议，可写成自然句或短列表；避免模板腔和重复句式。
-7) 不要回显用户姓名和生日原文，不要输出JSON。
+7) 不要回显完整生日和时辰原文；如果用户主动问“我叫什么”或已给称呼偏好，可用真实姓名或昵称自然称呼。不要输出JSON。
 
 输入信息：
 - 用户问题：{query}
@@ -2770,18 +2973,24 @@ def add_light_jiyi_particle(text: str, user_query: str = "") -> str:
     return f"{p}{out}"
 
 
-def strip_profile_echo(text: str, profile: dict | None = None) -> str:
+def strip_profile_echo(text: str, profile: dict | None = None, user_query: str = "") -> str:
     out = str(text or "").strip()
     if not out:
         return out
     p = profile or {}
     name = str(p.get("name") or "").strip()
+    preferred_name = str(p.get("preferred_name") or "").strip()
     birthdate = str(p.get("birthdate") or "").strip()
     birthtime = str(p.get("birthtime") or "").strip()
 
-    # 去掉显式资料回显，避免重复用户个人信息
+    # 姓名处理：若用户有称呼偏好，优先替换成偏好；若在“我叫什么”场景，允许显示姓名/昵称；其余场景维持匿名“你”。
+    replace_name = "你"
+    if _is_valid_call_name(preferred_name):
+        replace_name = preferred_name
+    else:
+        replace_name = _pick_address_name(p, user_query=user_query)
     if name and len(name) >= 2:
-        out = out.replace(name, "你")
+        out = out.replace(name, replace_name)
     if birthdate:
         out = out.replace(birthdate, "你的生日")
         out = out.replace(birthdate.replace("-", "年", 1).replace("-", "月") + "日", "你的生日")
@@ -2822,12 +3031,26 @@ def sanitize_output(text: str, user_query: str = "", profile: dict | None = None
     emotion_level = detect_emotion_level(user_query)
     out = diversify_fortune_opening(out.strip(), user_query=user_query)
     # 降低硬编码后处理，避免把模型答案“模板化”
-    out = strip_profile_echo(out, profile=profile)
+    out = strip_profile_echo(out, profile=profile, user_query=user_query)
     if emotion_level in {"L2", "L3"}:
         out = trim_for_emotion_level(out, emotion_level)
         out = add_recovery_tail(out, emotion_level)
     out = add_light_jiyi_particle(out, user_query=user_query)
     return out.strip()
+
+
+def maybe_append_preferred_name_probe(output: str, session_id: str, should_probe: bool = False) -> str:
+    out = str(output or "").strip()
+    if not out or not should_probe:
+        return out
+    if _is_preferred_name_prompt_pending(session_id):
+        return out
+    if re.search(r"(怎么称呼你|希望我怎么称呼|该怎么称呼你|叫你什么|你希望.*称呼)", out):
+        _set_preferred_name_prompt_pending(session_id, True)
+        return out
+    tail = "顺便问一下，你希望我怎么称呼你呀？可以直接给我一个你喜欢的昵称。"
+    _set_preferred_name_prompt_pending(session_id, True)
+    return f"{out}\n\n{tail}".strip()
 
 
 @app.get("/", summary="主页", tags=["Pages"])
@@ -2894,7 +3117,7 @@ async def auth_me(request: Request):
     phone = str(auth.get("phone", ""))
     user = _get_user_by_phone(phone) or {}
     user_id = int(user["id"]) if user.get("id") else 0
-    profile = _get_profile_by_user_id(user_id) if user_id else {"name": "", "birthdate": ""}
+    profile = _get_profile_by_user_id(user_id) if user_id else {"name": "", "birthdate": "", "preferred_name": ""}
     return {
         "ok": True,
         "user": {
@@ -2904,6 +3127,7 @@ async def auth_me(request: Request):
         },
         "profile": {
             "name": str((profile or {}).get("name", "")),
+            "preferred_name": str((profile or {}).get("preferred_name", "")),
             "birthdate": str((profile or {}).get("birthdate", "")),
         },
     }
@@ -3144,7 +3368,7 @@ async def chat(request: Request, payload: ChatRequest):
     if not auth:
         return JSONResponse({"output": "请先登录后再继续聊天。"}, status_code=401)
     response_data = {"session_id": str(uuid.uuid4().hex), "output": "天机暂时紊乱，请稍后再试。"}
-    profile: dict[str, str] = {"name": "", "birthdate": "", "birthtime": ""}
+    profile: dict[str, str] = {"name": "", "birthdate": "", "birthtime": "", "preferred_name": ""}
     session_id = ""
     time_anchor = build_time_anchor()
     flag_snapshot = dict(V2_FLAG_DEFAULTS)
@@ -3187,8 +3411,30 @@ async def chat(request: Request, payload: ChatRequest):
         chat_message_history = RedisChatMessageHistory(url=REDIS_URL, session_id=session_id, ttl=SESSION_TTL_SECONDS)
         history_profile = extract_profile_from_history(chat_message_history)
         profile = merge_session_profile(session_id, history_profile)
+        pending_preferred_name_prompt = _is_preferred_name_prompt_pending(session_id)
         extracted = extract_profile_from_query(query)
+        if pending_preferred_name_prompt and not str(extracted.get("preferred_name") or "").strip():
+            pending_name = _extract_preferred_name_from_query(query)
+            if pending_name:
+                extracted["preferred_name"] = pending_name
         profile = merge_session_profile(session_id, extracted)
+        preferred_name_set_this_turn = bool(str(extracted.get("preferred_name") or "").strip())
+        if preferred_name_set_this_turn:
+            _set_preferred_name_prompt_pending(session_id, False)
+        should_probe_preferred_name = _is_name_intro_query(query, extracted) and not str(profile.get("preferred_name") or "").strip()
+
+        def _postprocess_output(raw_output: str) -> str:
+            out = sanitize_output(raw_output, user_query=query, profile=profile)
+            chosen = str(profile.get("preferred_name") or "").strip()
+            if preferred_name_set_this_turn and chosen and chosen not in out:
+                out = f"好呀～那我就叫你{chosen}。\n\n{out}"
+            out = maybe_append_preferred_name_probe(
+                out,
+                session_id=session_id,
+                should_probe=should_probe_preferred_name,
+            )
+            return out
+
         emotion_level = detect_emotion_level(query)
         is_fortune_intent = domain_intent in {"fortune", "zodiac", "divination"}
         if is_fortune_intent:
@@ -3196,6 +3442,7 @@ async def chat(request: Request, payload: ChatRequest):
         fast_reply = get_fast_reply(query, time_anchor=time_anchor)
         if fast_reply:
             safe_fast_reply = validate_time_consistency(fast_reply, query, time_anchor, window_meta=window_meta)
+            safe_fast_reply = _postprocess_output(safe_fast_reply)
             if profile.get("name") or profile.get("birthdate"):
                 response_data = {"session_id": session_id, "output": safe_fast_reply}
             else:
@@ -3218,7 +3465,7 @@ async def chat(request: Request, payload: ChatRequest):
             return response_data
         dream_reply, dream_meta = route_dream_pipeline(query)
         if dream_reply is not None:
-            out = sanitize_output(dream_reply, user_query=query, profile=profile)
+            out = _postprocess_output(dream_reply)
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
             _append_chat_history(chat_message_history, query, out)
             d_qtype = str(((dream_meta or {}).get("question_type") if isinstance(dream_meta, dict) else "") or "dream")
@@ -3244,7 +3491,7 @@ async def chat(request: Request, payload: ChatRequest):
         if zodiac_reply is not None:
             if is_fortune_intent:
                 _metric_incr("fortune_route_hit_total")
-            out = sanitize_output(zodiac_reply, user_query=query, profile=profile)
+            out = _postprocess_output(zodiac_reply)
             z_qtype = str(((zodiac_meta or {}).get("question_type") if isinstance(zodiac_meta, dict) else "") or question_type)
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
             _append_chat_history(chat_message_history, query, out)
@@ -3284,7 +3531,7 @@ async def chat(request: Request, payload: ChatRequest):
         if fortune_reply is not None:
             if is_fortune_intent:
                 _metric_incr("fortune_route_hit_total")
-            out = sanitize_output(fortune_reply, user_query=query, profile=profile)
+            out = _postprocess_output(fortune_reply)
             if not window_meta and isinstance(fortune_payload, dict):
                 if str(fortune_payload.get("window_start") or "").strip() and str(fortune_payload.get("window_end") or "").strip():
                     window_meta = {
@@ -3353,13 +3600,13 @@ async def chat(request: Request, payload: ChatRequest):
         if isinstance(result, dict):
             if 'output' in result:
                 logger.info(f"/chat接口最终输出: {result['output']}")
-                response_data["output"] = sanitize_output(result['output'], user_query=query, profile=profile)
+                response_data["output"] = _postprocess_output(result['output'])
             else:
                 logger.info(f"/chat接口最终输出(无output字段): {str(result)}")
-                response_data["output"] = sanitize_output(str(result), user_query=query, profile=profile)
+                response_data["output"] = _postprocess_output(str(result))
         else:
             logger.info(f"/chat接口最终输出(非dict): {str(result)}")
-            response_data["output"] = sanitize_output(str(result), user_query=query, profile=profile)
+            response_data["output"] = _postprocess_output(str(result))
         response_data["output"] = validate_time_consistency(response_data["output"], query, time_anchor, window_meta=window_meta)
         track_output_quality(
             session_id,
