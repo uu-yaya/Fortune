@@ -1,7 +1,6 @@
 const phoneInput = document.getElementById("phoneInput");
 const codeInput = document.getElementById("codeInput");
 const sendCodeBtn = document.getElementById("sendCodeBtn");
-const verifyCodeBtn = document.getElementById("verifyCodeBtn");
 const newPasswordInput = document.getElementById("newPasswordInput");
 const confirmPasswordInput = document.getElementById("confirmPasswordInput");
 const resetBtn = document.getElementById("resetBtn");
@@ -9,7 +8,6 @@ const statusText = document.getElementById("statusText");
 
 let countdown = 0;
 let timer = null;
-let verified = false;
 
 function setStatus(msg, isError = false) {
     statusText.textContent = msg || "";
@@ -78,44 +76,17 @@ async function sendCode() {
     }
 }
 
-async function verifyCode() {
+async function resetPassword() {
     const phone = normalizePhone(phoneInput.value);
     const code = String(codeInput.value || "").trim();
+    const newPassword = String(newPasswordInput.value || "").trim();
+    const confirmPassword = String(confirmPasswordInput.value || "").trim();
     if (!validPhone(phone)) {
         setStatus("请输入有效的11位手机号", true);
         return;
     }
     if (!/^\d{6}$/.test(code)) {
         setStatus("请输入6位验证码", true);
-        return;
-    }
-    setStatus("正在校验验证码...");
-    try {
-        const resp = await fetch("/auth/password/verify_code", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ phone, code })
-        });
-        const data = await resp.json();
-        if (!resp.ok || !data.ok) {
-            verified = false;
-            setStatus(data.message || "验证码校验失败", true);
-            return;
-        }
-        verified = true;
-        setStatus("验证码校验通过，请输入新密码。");
-    } catch (e) {
-        verified = false;
-        setStatus("请求失败，请稍后重试", true);
-    }
-}
-
-async function resetPassword() {
-    const phone = normalizePhone(phoneInput.value);
-    const newPassword = String(newPasswordInput.value || "").trim();
-    const confirmPassword = String(confirmPasswordInput.value || "").trim();
-    if (!verified) {
-        setStatus("请先完成验证码校验", true);
         return;
     }
     if (!validPassword(newPassword)) {
@@ -126,8 +97,20 @@ async function resetPassword() {
         setStatus("两次输入的密码不一致", true);
         return;
     }
-    setStatus("正在重置密码...");
+    setStatus("正在校验验证码...");
     try {
+        const verifyResp = await fetch("/auth/password/verify_code", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ phone, code })
+        });
+        const verifyData = await verifyResp.json();
+        if (!verifyResp.ok || !verifyData.ok) {
+            setStatus(verifyData.message || "验证码校验失败", true);
+            return;
+        }
+
+        setStatus("正在重置密码...");
         const resp = await fetch("/auth/password/reset", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -148,5 +131,4 @@ async function resetPassword() {
 }
 
 sendCodeBtn.addEventListener("click", sendCode);
-verifyCodeBtn.addEventListener("click", verifyCode);
 resetBtn.addEventListener("click", resetPassword);

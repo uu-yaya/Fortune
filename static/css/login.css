@@ -5,7 +5,11 @@
 body {
     margin: 0;
     font-family: "Microsoft YaHei", sans-serif;
-    background: linear-gradient(135deg, #fff8fe 0%, #f9fcff 50%, #fffdf7 100%);
+    background:
+        radial-gradient(circle at 12% 18%, rgba(255, 157, 207, 0.26), transparent 34%),
+        radial-gradient(circle at 88% 12%, rgba(142, 216, 255, 0.24), transparent 30%),
+        radial-gradient(circle at 42% 92%, rgba(152, 239, 206, 0.2), transparent 42%),
+        linear-gradient(135deg, #fff9fe 0%, #fffdf8 45%, #f8fcff 100%);
     color: #2b2b2b;
     min-height: 100vh;
 }
@@ -18,13 +22,26 @@ body {
 }
 
 .auth-card {
+    position: relative;
     width: 100%;
     max-width: 460px;
-    background: #fff;
+    background: rgba(255, 255, 255, 0.9);
     border: 1px solid #ffd4e9;
     border-radius: 24px;
     box-shadow: 0 14px 32px rgba(239, 154, 193, 0.18);
     padding: 24px;
+    backdrop-filter: blur(2px);
+}
+
+.auth-mascot {
+    position: absolute;
+    top: -34px;
+    right: -14px;
+    width: 96px;
+    height: 96px;
+    object-fit: contain;
+    pointer-events: none;
+    filter: drop-shadow(0 6px 10px rgba(255, 128, 190, 0.2));
 }
 
 .auth-card h1 {
@@ -148,4 +165,13 @@ button:disabled {
 
 .hint a:hover {
     text-decoration: underline;
+}
+
+@media (max-width: 768px) {
+    .auth-mascot {
+        top: -28px;
+        right: -8px;
+        width: 82px;
+        height: 82px;
+    }
 }

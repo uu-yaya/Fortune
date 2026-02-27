@@ -7,13 +7,16 @@ import json
 import hashlib
 import hmac
 import difflib
+import base64
 from datetime import datetime
 from datetime import timedelta
 from typing import Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pymysql
 import redis
+import requests
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,7 +39,16 @@ from config import (
     MYSQL_PORT,
     MYSQL_USER,
     REDIS_URL,
+    SMS_ALIYUN_ACCESS_KEY_ID,
+    SMS_ALIYUN_ACCESS_KEY_SECRET,
+    SMS_ALIYUN_ENDPOINT,
+    SMS_ALIYUN_REGION_ID,
+    SMS_ALIYUN_SIGN_NAME,
+    SMS_ALIYUN_TEMPLATE_CODE,
     SMS_DEBUG_CODE_ENABLED,
+    SMS_HTTP_TIMEOUT_SECONDS,
+    SMS_PROVIDER,
+    SMS_TEMPLATE_PARAM_CODE_KEY,
     SERPAPI_API_KEY,
     SESSION_TTL_SECONDS,
     VECTOR_COLLECTION_NAME,
@@ -3151,6 +3163,81 @@ def _is_valid_cn_phone(phone: str) -> bool:
     return bool(re.fullmatch(r"1\d{10}", phone or ""))
 
 
+def _aliyun_percent_encode(value: str) -> str:
+    return quote(str(value or ""), safe="~")
+
+
+def _send_sms_via_aliyun(phone: str, code: str, scene: str = "default") -> tuple[bool, str]:
+    required = {
+        "SMS_ALIYUN_ACCESS_KEY_ID": SMS_ALIYUN_ACCESS_KEY_ID,
+        "SMS_ALIYUN_ACCESS_KEY_SECRET": SMS_ALIYUN_ACCESS_KEY_SECRET,
+        "SMS_ALIYUN_SIGN_NAME": SMS_ALIYUN_SIGN_NAME,
+        "SMS_ALIYUN_TEMPLATE_CODE": SMS_ALIYUN_TEMPLATE_CODE,
+    }
+    missing = [k for k, v in required.items() if not str(v or "").strip()]
+    if missing:
+        logger.error(f"短信发送失败：阿里云短信配置缺失 {missing}")
+        return False, "SMS_PROVIDER_CONFIG_MISSING"
+
+    params = {
+        "AccessKeyId": SMS_ALIYUN_ACCESS_KEY_ID,
+        "Action": "SendSms",
+        "Format": "JSON",
+        "PhoneNumbers": phone,
+        "RegionId": SMS_ALIYUN_REGION_ID,
+        "SignName": SMS_ALIYUN_SIGN_NAME,
+        "SignatureMethod": "HMAC-SHA1",
+        "SignatureNonce": uuid.uuid4().hex,
+        "SignatureVersion": "1.0",
+        "TemplateCode": SMS_ALIYUN_TEMPLATE_CODE,
+        "TemplateParam": json.dumps({SMS_TEMPLATE_PARAM_CODE_KEY: code}, ensure_ascii=False, separators=(",", ":")),
+        "Timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "Version": "2017-05-25",
+        "OutId": f"{scene}:{phone}:{int(datetime.utcnow().timestamp())}",
+    }
+    canonicalized = "&".join(
+        f"{_aliyun_percent_encode(k)}={_aliyun_percent_encode(v)}" for k, v in sorted(params.items(), key=lambda x: x[0])
+    )
+    string_to_sign = f"GET&%2F&{_aliyun_percent_encode(canonicalized)}"
+    key = f"{SMS_ALIYUN_ACCESS_KEY_SECRET}&".encode("utf-8")
+    signature = base64.b64encode(hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha1).digest()).decode("utf-8")
+    params["Signature"] = signature
+    try:
+        resp = requests.get(
+            f"https://{SMS_ALIYUN_ENDPOINT}/",
+            params=params,
+            timeout=max(1, int(SMS_HTTP_TIMEOUT_SECONDS or 8)),
+        )
+    except Exception as e:
+        logger.error(f"阿里云短信调用异常: {e}")
+        return False, "SMS_PROVIDER_REQUEST_ERROR"
+    if resp.status_code != 200:
+        logger.error(f"阿里云短信HTTP异常: status={resp.status_code} body={resp.text[:400]}")
+        return False, "SMS_PROVIDER_HTTP_ERROR"
+    try:
+        data = resp.json()
+    except Exception:
+        logger.error(f"阿里云短信响应非JSON: {resp.text[:400]}")
+        return False, "SMS_PROVIDER_BAD_RESPONSE"
+    if str(data.get("Code") or "") != "OK":
+        logger.error(
+            "阿里云短信返回失败: "
+            f"Code={data.get('Code')} Message={data.get('Message')} RequestId={data.get('RequestId')}"
+        )
+        return False, "SMS_PROVIDER_REJECTED"
+    return True, "OK"
+
+
+def _send_sms_code(phone: str, code: str, scene: str = "default") -> tuple[bool, str]:
+    provider = str(SMS_PROVIDER or "mock").strip().lower()
+    if provider in {"mock", "debug", "local"}:
+        return True, "MOCK"
+    if provider in {"aliyun", "aliyun_dysmsapi", "aliyun_sms"}:
+        return _send_sms_via_aliyun(phone, code, scene=scene)
+    logger.error(f"短信发送失败：不支持的SMS_PROVIDER={provider}")
+    return False, "SMS_PROVIDER_UNSUPPORTED"
+
+
 @app.post(
     "/auth/send_code",
     summary="发送验证码",
@@ -3166,6 +3253,9 @@ async def auth_send_code(payload: SendCodeRequest):
     if ttl > 0:
         return JSONResponse({"ok": False, "message": f"发送过于频繁，请{ttl}秒后再试"}, status_code=429)
     code = f"{secrets.randbelow(900000) + 100000}"
+    ok, reason = _send_sms_code(phone, code, scene=scene)
+    if not ok:
+        return JSONResponse({"ok": False, "message": "短信发送失败，请稍后重试", "reason": reason}, status_code=502)
     _set_sms_code(phone, code, scene=scene)
     resp = {"ok": True, "message": "验证码已发送", "ttl_seconds": RESEND_COOLDOWN_SECONDS}
     # 仅开发/演示环境回传 debug_code；生产环境应关闭

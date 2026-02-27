@@ -4,11 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>吉伊大师 - 登录</title>
-    <link rel="stylesheet" href="/static/css/login.css?v=20260226-auth-4">
+    <link rel="stylesheet" href="/static/css/login.css?v=20260227-auth-5">
+    <link rel="icon" type="image/svg+xml" href="/static/images/cheer_bear.svg?v=20260225-cheerbear-1">
 </head>
 <body>
     <main class="auth-page">
         <section class="auth-card">
+            <img src="/static/images/image01.gif?v=20260227-image01-1" alt="吉伊装饰" class="auth-mascot">
             <h1>登录</h1>
             <p class="sub">支持手机号验证码或账号密码登录。</p>
 
@@ -47,7 +49,7 @@
             <p id="statusText" class="status"></p>
             <p class="hint"><a href="/forgot-password">忘记密码？</a></p>
             <p class="hint">还没有账号？<a href="/register">去注册</a></p>
-            <p class="hint">演示版本：验证码会直接显示在页面提示中，后续可接短信服务。</p>
+            <p class="hint">验证码默认通过短信发送；测试环境若开启调试模式，会显示 debug_code。</p>
         </section>
     </main>
 

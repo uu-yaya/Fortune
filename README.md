@@ -73,6 +73,9 @@ cp .env.example .env
 - `SERPAPI_API_KEY`（可选）
 - `YUANFENJU_API_KEY`（命理工具）
 - `SMS_DEBUG_CODE_ENABLED`（开发环境可为 `true`）
+- `SMS_PROVIDER`（`mock` 或 `aliyun`）
+- `SMS_ALIYUN_ACCESS_KEY_ID` / `SMS_ALIYUN_ACCESS_KEY_SECRET`
+- `SMS_ALIYUN_SIGN_NAME` / `SMS_ALIYUN_TEMPLATE_CODE`
 
 3. 启动服务
 
@@ -133,6 +136,7 @@ python3 scripts/quality_gate.py --base-url http://127.0.0.1:8001 --days 1
 ## 7. 安全与上线注意事项
 
 - 生产环境必须关闭 `SMS_DEBUG_CODE_ENABLED`，避免回传验证码。
+- 生产环境请设置 `SMS_PROVIDER=aliyun`，并配置阿里云短信签名、模板与密钥。
 - 建议在 HTTPS 场景下启用更严格 Cookie 策略（如 `Secure`）。
 - 对外部模型/工具依赖做好降级与熔断策略。
 - `.env` 中包含敏感信息，不应提交到仓库。
