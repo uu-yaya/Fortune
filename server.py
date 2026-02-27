@@ -1116,6 +1116,8 @@ def build_time_anchor(window_days: int = 3) -> dict:
 
 RELATIVE_WINDOW_PATTERN = re.compile(
     r"(本周|这周|下周|最近一周|这一周|近几天|这几天|哪几天|哪天|最近两天|这两天|本月|这个月|"
+    r"今年|本年|明年|后年|去年|前年|上半年|下半年|全年|年度|"
+    r"(?:未来|接下来)(?:的)?(?:[一二两三四五六七八九]|[1-9])年|(?:[一二两三四五六七八九]|[1-9])年内|"
     r"接下来(?:的)?一个月|未来(?:的)?一个月|接下来1个月|未来1个月|接下来30天|未来30天|"
     r"接下来(?:的)?一段时间|未来(?:的)?一段时间|接下来这段时间|未来这段时间|后面一段时间|之后一段时间)"
 )
@@ -1123,6 +1125,49 @@ RELATIVE_WINDOW_PATTERN = re.compile(
 
 def _cn_day(dt: datetime) -> str:
     return f"{dt.month}月{dt.day}日（{_weekday_cn_from_date(dt.year, dt.month, dt.day)}）"
+
+
+def _cn_num_to_int(token: str) -> int | None:
+    t = str(token or "").strip()
+    if not t:
+        return None
+    if t.isdigit():
+        v = int(t)
+        return v if v > 0 else None
+    return {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }.get(t)
+
+
+def _safe_add_years(dt: datetime, years: int) -> datetime:
+    try:
+        return dt.replace(year=dt.year + years)
+    except ValueError:
+        # 兼容闰年2月29日
+        return dt.replace(month=2, day=28, year=dt.year + years)
+
+
+def _build_year_window(now: datetime, year: int, half: str = "") -> tuple[datetime, datetime, str]:
+    if half == "H1":
+        start = now.replace(year=year, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now.replace(year=year, month=6, day=30, hour=23, minute=59, second=59, microsecond=0)
+        return start, end, "year_h1"
+    if half == "H2":
+        start = now.replace(year=year, month=7, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now.replace(year=year, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+        return start, end, "year_h2"
+    start = now.replace(year=year, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = now.replace(year=year, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+    return start, end, "year_full"
 
 
 def _enumerate_days(start: datetime, end: datetime, limit: int = 14) -> list[dict[str, str]]:
@@ -1147,53 +1192,118 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
         now = datetime.now()
 
     label = "near_days"
-    if re.search(r"(下周)", q):
-        start = (now - timedelta(days=now.weekday())) + timedelta(days=7)
-        end = start + timedelta(days=6)
-        label = "next_week"
-    elif re.search(
-        r"(接下来(?:的)?一个月|未来(?:的)?一个月|接下来1个月|未来1个月|接下来30天|未来30天)", q
-    ):
+    half_flag = "H2" if "下半年" in q else ("H1" if "上半年" in q else "")
+    anchor_year = now.year
+
+    m_y_m_after = re.search(r"(20\d{2})年\s*(\d{1,2})月(?:后|起|开始)", q)
+    if m_y_m_after:
+        year = int(m_y_m_after.group(1))
+        month = max(1, min(12, int(m_y_m_after.group(2))))
+        if half_flag == "H2" and month < 7:
+            month = 7
+        if half_flag == "H1" and month > 6:
+            month = 1
+        start = now.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+        if half_flag == "H1":
+            end = now.replace(year=year, month=6, day=30, hour=23, minute=59, second=59, microsecond=0)
+        else:
+            end = now.replace(year=year, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+        label = "year_partial"
+    elif re.findall(r"(20\d{2})年", q):
+        explicit_years = [int(x) for x in re.findall(r"(20\d{2})年", q)]
+        y0 = min(explicit_years)
+        y1 = max(explicit_years)
+        if y0 == y1:
+            start, end, label = _build_year_window(now, y0, half=half_flag)
+            if label == "year_full":
+                label = "explicit_year"
+        else:
+            start = now.replace(year=y0, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = now.replace(year=y1, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+            label = "explicit_year_span"
+    elif ("去年" in q and "今年" in q) or ("前年" in q and "去年" in q):
+        y0 = anchor_year - 1 if "去年" in q else anchor_year - 2
+        y1 = anchor_year
+        start = now.replace(year=y0, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now.replace(year=y1, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+        label = "relative_year_span"
+    elif ("今年" in q and "明年" in q) or ("明年" in q and "后年" in q):
+        y0 = anchor_year if "今年" in q else anchor_year + 1
+        y1 = anchor_year + 1 if "今年" in q else anchor_year + 2
+        start = now.replace(year=y0, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now.replace(year=y1, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+        label = "relative_year_span"
+    elif re.search(r"(今年|本年|全年|年度)", q):
+        start, end, label = _build_year_window(now, anchor_year, half=half_flag)
+    elif re.search(r"(明年)", q):
+        start, end, label = _build_year_window(now, anchor_year + 1, half=half_flag)
+    elif re.search(r"(后年)", q):
+        start, end, label = _build_year_window(now, anchor_year + 2, half=half_flag)
+    elif re.search(r"(去年)", q):
+        start, end, label = _build_year_window(now, anchor_year - 1, half=half_flag)
+    elif re.search(r"(前年)", q):
+        start, end, label = _build_year_window(now, anchor_year - 2, half=half_flag)
+    elif re.search(r"(?:未来|接下来)(?:的)?(?:[一二两三四五六七八九]|[1-9])年|(?:[一二两三四五六七八九]|[1-9])年内", q):
+        years_token = None
+        m_years = re.search(r"(?:未来|接下来)(?:的)?([一二两三四五六七八九]|[1-9])年", q)
+        if m_years:
+            years_token = m_years.group(1)
+        if not years_token:
+            m_years = re.search(r"([一二两三四五六七八九]|[1-9])年内", q)
+            if m_years:
+                years_token = m_years.group(1)
+        years = _cn_num_to_int(str(years_token or "1")) or 1
         start = now
-        end = now + timedelta(days=29)
-        label = "next_30_days"
-    elif re.search(
-        r"(接下来(?:的)?一段时间|未来(?:的)?一段时间|接下来这段时间|未来这段时间|后面一段时间|之后一段时间)", q
-    ):
-        start = now
-        end = now + timedelta(days=29)
-        label = "coming_period"
-    elif re.search(r"(本周|这周|最近一周|这一周|上半段|下半段)", q):
-        start = now - timedelta(days=now.weekday())
-        end = start + timedelta(days=6)
-        label = "this_week"
-    elif re.search(r"(本月|这个月)", q):
-        start = now.replace(day=1)
-        next_month = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
-        end = next_month - timedelta(days=1)
-        label = "this_month"
-    elif re.search(r"(最近两天|这两天)", q):
-        start = now
-        end = now + timedelta(days=1)
-        label = "two_days"
+        end = _safe_add_years(now, years) - timedelta(days=1)
+        label = "multi_year" if years >= 2 else "one_year"
     else:
-        near_days = time_anchor.get("near_days") or []
-        if near_days:
-            try:
-                start = datetime.strptime(str(near_days[0].get("date")), "%Y-%m-%d").replace(
-                    hour=now.hour, minute=now.minute, second=now.second
-                )
-                last = near_days[min(len(near_days), 7) - 1]
-                end = datetime.strptime(str(last.get("date")), "%Y-%m-%d").replace(
-                    hour=now.hour, minute=now.minute, second=now.second
-                )
-            except Exception:
+        if re.search(r"(下周)", q):
+            start = (now - timedelta(days=now.weekday())) + timedelta(days=7)
+            end = start + timedelta(days=6)
+            label = "next_week"
+        elif re.search(
+            r"(接下来(?:的)?一个月|未来(?:的)?一个月|接下来1个月|未来1个月|接下来30天|未来30天)", q
+        ):
+            start = now
+            end = now + timedelta(days=29)
+            label = "next_30_days"
+        elif re.search(
+            r"(接下来(?:的)?一段时间|未来(?:的)?一段时间|接下来这段时间|未来这段时间|后面一段时间|之后一段时间)", q
+        ):
+            start = now
+            end = now + timedelta(days=29)
+            label = "coming_period"
+        elif re.search(r"(本周|这周|最近一周|这一周|上半段|下半段)", q):
+            start = now - timedelta(days=now.weekday())
+            end = start + timedelta(days=6)
+            label = "this_week"
+        elif re.search(r"(本月|这个月)", q):
+            start = now.replace(day=1)
+            next_month = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+            end = next_month - timedelta(days=1)
+            label = "this_month"
+        elif re.search(r"(最近两天|这两天)", q):
+            start = now
+            end = now + timedelta(days=1)
+            label = "two_days"
+        else:
+            near_days = time_anchor.get("near_days") or []
+            if near_days:
+                try:
+                    start = datetime.strptime(str(near_days[0].get("date")), "%Y-%m-%d").replace(
+                        hour=now.hour, minute=now.minute, second=now.second
+                    )
+                    last = near_days[min(len(near_days), 7) - 1]
+                    end = datetime.strptime(str(last.get("date")), "%Y-%m-%d").replace(
+                        hour=now.hour, minute=now.minute, second=now.second
+                    )
+                except Exception:
+                    start = now
+                    end = now + timedelta(days=2)
+            else:
                 start = now
                 end = now + timedelta(days=2)
-        else:
-            start = now
-            end = now + timedelta(days=2)
-        label = "near_days"
+            label = "near_days"
 
     if start > end:
         start, end = end, start
@@ -1214,7 +1324,8 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
 
 
 TIME_SENSITIVE_QUERY_PATTERN = re.compile(
-    r"(今天|现在|当前|日期|几号|星期|周几|近几天|这几天|本周|这周|下周|本月|这个月|时间窗口|哪天|哪几天|刚才|你说错|纠正|纠错|气场)"
+    r"(今天|现在|当前|日期|几号|星期|周几|近几天|这几天|本周|这周|下周|本月|这个月|今年|本年|明年|后年|去年|前年|"
+    r"上半年|下半年|时间窗口|哪天|哪几天|刚才|你说错|纠正|纠错|气场)"
 )
 NEAR_DAYS_QUERY_PATTERN = re.compile(r"(近几天|这几天|哪几天|哪天|最近三天|最近几天)")
 DATE_WEEKDAY_PATTERN = re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日[，,\s]*((?:星期|周)[一二三四五六日天])")
@@ -1225,6 +1336,25 @@ YEAR_PATTERN = re.compile(r"(20\d{2})年")
 
 def is_time_sensitive_query(query: str) -> bool:
     return bool(TIME_SENSITIVE_QUERY_PATTERN.search(str(query or "")))
+
+
+def _expected_year_from_query(query: str, time_anchor: dict) -> int | None:
+    q = str(query or "")
+    try:
+        anchor_year = int(str(time_anchor.get("today_date") or "2000-01-01").split("-")[0])
+    except Exception:
+        return None
+    if "后年" in q:
+        return anchor_year + 2
+    if "明年" in q:
+        return anchor_year + 1
+    if "前年" in q:
+        return anchor_year - 2
+    if "去年" in q:
+        return anchor_year - 1
+    if "今年" in q or "本年" in q:
+        return anchor_year
+    return None
 
 
 def _normalize_weekday_label(text: str) -> str:
@@ -1369,6 +1499,16 @@ def _patch_time_text_locally(
         if years and any(abs(y - anchor_year) >= 2 for y in years):
             severe_mismatch = True
 
+    expected_year = _expected_year_from_query(query, time_anchor)
+    if expected_year is not None:
+        year_matches = list(YEAR_PATTERN.finditer(patched))
+        for m in reversed(year_matches):
+            year = int(m.group(1))
+            if year == expected_year:
+                continue
+            conflict_count += 1
+            patched = patched[:m.start(1)] + str(expected_year) + patched[m.end(1):]
+
     if conflict_count >= 3:
         severe_mismatch = True
     return patched, conflict_count, severe_mismatch
@@ -1419,6 +1559,15 @@ def _validate_time_consistency_legacy(text: str, query: str, time_anchor: dict, 
 
         years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(out)}
         if years and any(str(y) not in {x[:4] for x in allowed_dates} for y in years):
+            _metric_incr("time_validation_fail_total")
+            _metric_incr("time_validation_autofix_total")
+            _metric_incr("temporal_consistency_fail")
+            return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
+
+    expected_year = _expected_year_from_query(q, time_anchor)
+    if expected_year is not None:
+        years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(out)}
+        if years and any(y != expected_year for y in years):
             _metric_incr("time_validation_fail_total")
             _metric_incr("time_validation_autofix_total")
             _metric_incr("temporal_consistency_fail")
@@ -1838,13 +1987,19 @@ BAZI_FORTUNE_QUERY_PATTERN = re.compile(
 )
 DIVINATION_QUERY_PATTERN = re.compile(r"(占卜|摇卦|抽签|起卦|卦象|卦)")
 DREAM_QUERY_PATTERN = re.compile(r"(解梦|梦见|做梦|周公)")
-FORTUNE_SCENE_PATTERN = re.compile(r"(今天|本周|这周|本月|最近|这段时间|现在|未来)")
+FORTUNE_SCENE_PATTERN = re.compile(
+    r"(今天|本周|这周|本月|最近|这段时间|现在|未来|今年|本年|明年|后年|去年|前年|上半年|下半年)"
+)
 FORTUNE_DECISION_PATTERN = re.compile(
     r"(开源|守财|扩收入|控支出|先.*还是|二选一|更适合|哪个更|优先|先守后开|守中带开|"
     r"最旺.*方向|行动方向|避免.*决策|换岗.*积累|适合.*换岗|先积累|该不该换岗|更容易提运|提运.*领域)"
 )
 FORTUNE_COLLOQUIAL_PATTERN = re.compile(r"(气场|更顺|顺不顺|哪几天|哪天|近几天|这几天)")
-FORTUNE_TREND_PATTERN = re.compile(r"(本周|这周|最近一周|这一周|走势|趋势|节奏|上半段|下半段)")
+FORTUNE_TREND_PATTERN = re.compile(
+    r"(本周|这周|最近一周|这一周|走势|趋势|节奏|上半段|下半段|"
+    r"今年|本年|明年|后年|去年|前年|全年|年度|"
+    r"(?:未来|接下来)(?:的)?(?:[一二两三四五六七八九]|[1-9])年|(?:[一二两三四五六七八九]|[1-9])年内)"
+)
 FORTUNE_ACTION_PATTERN = re.compile(r"(先做什么|第一步|怎么安排|如何安排|怎么排更稳|怎么做|怎么行动)")
 FORTUNE_SHORT_DECISION_PATTERN = re.compile(
     r"(开源还是守财|守财还是开源|先开源还是先守财|先守财还是先开源|"
@@ -2067,6 +2222,11 @@ def detect_question_type(query: str) -> str:
     if FORTUNE_COLLOQUIAL_PATTERN.search(q):
         return "colloquial"
     if FORTUNE_TREND_PATTERN.search(q):
+        return "trend"
+    if re.search(
+        r"(今年|本年|明年|后年|去年|前年|全年|年度|上半年|下半年|(?:未来|接下来)(?:的)?(?:[一二两三四五六七八九]|[1-9])年|(?:[一二两三四五六七八九]|[1-9])年内)",
+        q,
+    ):
         return "trend"
     return "default"
 
@@ -2359,8 +2519,10 @@ def _generate_fortune_reply_with_model(
     strength = str(payload.get("strength") or "balanced")
     advice = _resolve_fortune_advice(payload, topic, strength)
     window_text = ""
+    window_label = ""
     if isinstance(window_meta, dict):
         window_text = str(window_meta.get("window_text") or "").strip()
+        window_label = str(window_meta.get("label") or "").strip()
     prompt = ChatPromptTemplate.from_template(
         """你是“吉伊大师”，需要根据工具返回的结构化命理结果，生成自然中文回复。
 要求：
@@ -2371,11 +2533,13 @@ def _generate_fortune_reply_with_model(
 5) 结合“命理信号、依据、建议候选、证据点”组织内容，不要编造工具结果里不存在的细节。
 6) 给1-3条可执行建议，可写成自然句或短列表；避免模板腔和重复句式。
 7) 不要回显完整生日和时辰原文；如果用户主动问“我叫什么”或已给称呼偏好，可用真实姓名或昵称自然称呼。不要输出JSON。
+8) 如果时间窗口跨度是“月/年/多年”，不要自动收缩为“近三天”。
 
 输入信息：
 - 用户问题：{query}
 - 问题类型：{question_type}
 - 主题：{topic_cn}
+- 时间窗口标签：{window_label}
 - 时间窗口：{window_text}
 - 命理信号：{signal_line}
 - 命理依据：{basis_line}
@@ -2391,6 +2555,7 @@ def _generate_fortune_reply_with_model(
                     "query": q,
                     "question_type": str(question_type or "default"),
                     "topic_cn": topic_cn,
+                    "window_label": window_label or "none",
                     "window_text": window_text or "无",
                     "signal_line": _signal_for_topic(payload, topic) or "无",
                     "basis_line": _basis_line(payload),
@@ -2408,6 +2573,24 @@ def _generate_fortune_reply_with_model(
         out = f"先给你结论：{_decision_conclusion_from_query(q, strength)}。\n{out}"
     if str(question_type or "") in {"trend", "colloquial"} and window_text and window_text not in out:
         out = f"时间上先对齐：{window_text}。\n{out}"
+    long_horizon_labels = {
+        "this_month",
+        "next_30_days",
+        "coming_period",
+        "year_full",
+        "year_h1",
+        "year_h2",
+        "year_partial",
+        "one_year",
+        "multi_year",
+        "explicit_year",
+        "explicit_year_span",
+        "relative_year_span",
+    }
+    if window_label in long_horizon_labels:
+        out = re.sub(r"接下来这三天[，、,:：\-\s]*", "", out)
+        out = re.sub(r"最近三天", "这个时间范围内", out)
+        out = re.sub(r"这三天", "这个阶段", out)
     return _ensure_jiyi_tone(out)
 
 
@@ -2804,7 +2987,10 @@ def route_fortune_pipeline(
         return None, None
     anchor = time_anchor or build_time_anchor()
     active_flags = flags or dict(V2_FLAG_DEFAULTS)
-    window_meta = date_window_resolver(q, anchor) if active_flags.get("window_v2") else None
+    need_window = bool(active_flags.get("window_v2")) and (
+        question_type in {"trend", "colloquial"} or RELATIVE_WINDOW_PATTERN.search(q) or is_time_sensitive_query(q)
+    )
+    window_meta = date_window_resolver(q, anchor) if need_window else None
 
     if is_divination_query(q) and not is_bazi_fortune_query(q):
         try:
@@ -2841,14 +3027,25 @@ def route_fortune_pipeline(
     birthdate = str(profile.get("birthdate") or "").strip()
     birthtime = str(profile.get("birthtime") or "").strip()
     near_days = anchor.get("near_days") or []
-    window_text = "、".join([f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")]) or "今天起未来3天"
+    window_text = ""
+    window_label = ""
     if isinstance(window_meta, dict) and str(window_meta.get("window_text") or "").strip():
         window_text = str(window_meta.get("window_text")).strip()
+        window_label = str(window_meta.get("label") or "").strip()
+    elif near_days and need_window:
+        window_text = "、".join([f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")])
+        window_label = "near_days"
+    time_window_clause = ""
+    if window_text:
+        if window_label in {"near_days", "two_days", "this_week", "next_week"}:
+            time_window_clause = f"若用户问“近几天/哪几天”，仅允许在此窗口判断：{window_text}。"
+        else:
+            time_window_clause = f"时间范围：{window_text}。回答不要收缩成“近三天”，要覆盖该范围。"
     tool_query = (
         f"请按结构化JSON返回{topic}命理结果。"
         f"姓名：{name}；出生日期：{birthdate}；出生时间：{birthtime or '未知'}；用户问题：{q}。"
         f"当前时间锚点：{anchor.get('today_cn')}（{anchor.get('weekday_cn')}，{anchor.get('tz_name')}，{anchor.get('utc_offset')}）。"
-        f"若用户问“近几天/哪几天”，仅允许在此窗口判断：{window_text}。"
+        f"{time_window_clause}"
     )
     raw = ""
     try:
