@@ -1448,6 +1448,14 @@ def extract_profile_from_query(query: str) -> dict[str, str]:
     name_match = re.search(r"(?:我叫|名字是|姓名是|我是)\s*([^\s，。！？,.]{1,16})", source)
     if name_match and _is_valid_name(name_match.group(1)):
         profile["name"] = name_match.group(1).strip()
+    # 兼容“姓名 + 出生日期(可含时间)”的裸输入，例如：刘芷华 2005-06-15 早上5:45
+    if not profile.get("name"):
+        bare_name_match = re.search(
+            r"^\s*([^\s，。！？,.]{2,16})\s*[，,\s]\s*(?:19|20)\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?",
+            source,
+        )
+        if bare_name_match and _is_valid_name(bare_name_match.group(1)):
+            profile["name"] = bare_name_match.group(1).strip()
     birthdate = _normalize_birthdate(source)
     if birthdate:
         profile["birthdate"] = birthdate
@@ -1501,6 +1509,21 @@ def extract_profile_from_history(chat_message_history) -> dict[str, str]:
     except Exception:
         return profile
     return profile
+
+
+def _append_chat_history(chat_message_history, query: str, output: str) -> None:
+    """在非 Agent 早返回分支补记会话，避免历史缺失。"""
+    if chat_message_history is None:
+        return
+    q = str(query or "").strip()
+    out = str(output or "").strip()
+    if not q or not out:
+        return
+    try:
+        chat_message_history.add_user_message(q)
+        chat_message_history.add_ai_message(out)
+    except Exception as e:
+        logger.warning(f"写入会话历史失败: {e}")
 
 
 def detect_emotion_level(query: str) -> str:
@@ -3177,6 +3200,7 @@ async def chat(request: Request, payload: ChatRequest):
                 response_data = {"session_id": session_id, "output": safe_fast_reply}
             else:
                 response_data["output"] = safe_fast_reply
+            _append_chat_history(chat_message_history, query, safe_fast_reply)
             track_output_quality(
                 session_id,
                 response_data.get("output", ""),
@@ -3196,6 +3220,7 @@ async def chat(request: Request, payload: ChatRequest):
         if dream_reply is not None:
             out = sanitize_output(dream_reply, user_query=query, profile=profile)
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            _append_chat_history(chat_message_history, query, out)
             d_qtype = str(((dream_meta or {}).get("question_type") if isinstance(dream_meta, dict) else "") or "dream")
             track_output_quality(
                 session_id,
@@ -3222,6 +3247,7 @@ async def chat(request: Request, payload: ChatRequest):
             out = sanitize_output(zodiac_reply, user_query=query, profile=profile)
             z_qtype = str(((zodiac_meta or {}).get("question_type") if isinstance(zodiac_meta, dict) else "") or question_type)
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            _append_chat_history(chat_message_history, query, out)
             track_output_quality(
                 session_id,
                 out,
@@ -3267,6 +3293,7 @@ async def chat(request: Request, payload: ChatRequest):
                         "window_text": str(fortune_payload.get("window_text") or ""),
                     }
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            _append_chat_history(chat_message_history, query, out)
             qtype_for_metrics = str((fortune_payload or {}).get("question_type") or fortune_qtype)
             track_output_quality(
                 session_id,
