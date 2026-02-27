@@ -6,6 +6,7 @@ from langchain_core.output_parsers import JsonOutputParser
 import requests
 import json
 import time
+import re
 from loguru import logger
 from models import get_lc_ali_embeddings, get_lc_ali_model_client
 import os
@@ -45,6 +46,10 @@ class BaziToolOutput(BaseModel):
     jishen: str = ""
     wuxing_scores: WuxingScores = Field(default_factory=WuxingScores)
     fortune_signals: FortuneSignals = Field(default_factory=FortuneSignals)
+    risk_points: list[str] = Field(default_factory=list)
+    opportunity_points: list[str] = Field(default_factory=list)
+    time_hints: list[str] = Field(default_factory=list)
+    evidence_lines: list[str] = Field(default_factory=list)
     advice: list[str] = Field(default_factory=list)
     confidence: float = 0.0
     source: str = "yuanfenju"
@@ -116,6 +121,27 @@ def _build_advice(topic: str, strength: str) -> list[str]:
     return advice
 
 
+def _to_lines(raw, limit: int = 4, max_len: int = 80) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    parts = re.split(r"[。\n；;]", text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        clean = str(part or "").strip(" ，,。；;")
+        if not clean:
+            continue
+        key = clean.replace(" ", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clean[:max_len])
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _empty_bazi_output(topic: str, code: str, message: str) -> dict:
     model = BaziToolOutput(
         topic=topic,
@@ -152,6 +178,7 @@ def _parse_bazi_payload(payload: dict, topic: str) -> BaziToolOutput:
     caiyun_desc = caiyun.get("sanshishu_caiyun", {}) if isinstance(caiyun, dict) else {}
     yinyuan = data.get("yinyuan", {}) or {}
     mingyun = data.get("mingyun", {}) or {}
+    taohua = data.get("taohua", {}) or {}
 
     wuxing_scores = WuxingScores(
         metal=_to_int(xiyongshen_info.get("jin_score") or xiyongshen_info.get("jin_number")),
@@ -167,6 +194,41 @@ def _parse_bazi_payload(payload: dict, topic: str) -> BaziToolOutput:
         career=str(mingyun.get("sanshishu_mingyun") or "")[:120],
     )
 
+    opportunity_points = _to_lines(
+        "；".join(
+            [
+                str((caiyun_desc or {}).get("simple_desc") or ""),
+                str(yinyuan.get("sanshishu_yinyuan") or ""),
+                str(mingyun.get("sanshishu_mingyun") or ""),
+            ]
+        )
+    )
+    risk_points = _to_lines(
+        "；".join(
+            [
+                str((caiyun_desc or {}).get("risk_desc") or ""),
+                str(taohua.get("risk_tip") or ""),
+            ]
+        )
+    )
+    time_hints = _to_lines(
+        "；".join(
+            [
+                str(caiyun.get("time_hint") or ""),
+                str(mingyun.get("time_hint") or ""),
+            ]
+        )
+    )
+    evidence_lines = _to_lines(
+        "；".join(
+            [
+                str(bazi_info.get("bazi") or ""),
+                str(xiyongshen_info.get("xiyongshen") or ""),
+                str(xiyongshen_info.get("jishen") or ""),
+            ]
+        )
+    )
+
     model = BaziToolOutput(
         topic=topic,
         bazi=str(bazi_info.get("bazi") or ""),
@@ -180,6 +242,10 @@ def _parse_bazi_payload(payload: dict, topic: str) -> BaziToolOutput:
         jishen=str(xiyongshen_info.get("jishen") or ""),
         wuxing_scores=wuxing_scores,
         fortune_signals=signals,
+        risk_points=risk_points,
+        opportunity_points=opportunity_points,
+        time_hints=time_hints,
+        evidence_lines=evidence_lines,
         advice=_build_advice(topic, _normalize_strength(str(xiyongshen_info.get("qiangruo") or ""))),
     )
     model.confidence = _build_confidence(model)

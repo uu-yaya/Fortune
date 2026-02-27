@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 
 import requests
 
@@ -16,6 +17,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-template-repeat-rate", type=float, default=0.20, help="模板重复率上限")
     parser.add_argument("--max-template-signature-rate", type=float, default=0.20, help="模板签名率上限")
     parser.add_argument("--max-session-repeat-rate", type=float, default=0.15, help="同会话重复率上限")
+    parser.add_argument("--max-blueprint-repeat-rate", type=float, default=0.70, help="蓝图重复率上限")
+    parser.add_argument("--max-advice-repeat-rate", type=float, default=0.75, help="建议重复率上限")
+    parser.add_argument("--min-unique-output-rate", type=float, default=0.45, help="输出唯一率下限")
+    parser.add_argument("--max-pair-similarity", type=float, default=0.92, help="最大两两相似度上限")
     parser.add_argument("--min-direct-answer-hit-rate", type=float, default=0.95, help="决策直答命中率下限")
     parser.add_argument("--min-clarify-hit-rate", type=float, default=0.95, help="澄清命中率下限")
     parser.add_argument("--min-trend-window-hit-rate", type=float, default=0.90, help="趋势窗口命中率下限")
@@ -23,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-temporal-consistency-hit-rate", type=float, default=0.99, help="时序一致性命中率下限")
     parser.add_argument("--max-weekday-mismatch-count", type=float, default=0.0, help="日期星期错配数上限")
     parser.add_argument("--min-observability-coverage", type=float, default=0.99, help="观测日志覆盖率下限")
+    parser.add_argument("--legacy-metrics", action="store_true", help="使用旧版模板指标门禁")
     return parser.parse_args()
 
 
@@ -69,6 +75,10 @@ def main() -> int:
     template_repeat = _to_float(rates.get("template_repeat_rate"))
     template_signature = _to_float(rates.get("template_signature_rate"))
     session_repeat = _to_float(rates.get("session_repeat_rate"))
+    blueprint_repeat = _to_float(rates.get("blueprint_repeat_rate"))
+    advice_repeat = _to_float(rates.get("advice_repeat_rate"))
+    unique_output = _to_float(rates.get("unique_output_rate"))
+    max_pair_similarity = _to_float(rates.get("max_pair_similarity"))
     direct_answer = _to_float(rates.get("direct_answer_hit_rate"))
     clarify_hit = _to_float(rates.get("clarify_hit_rate"))
     trend_window = _to_float(rates.get("trend_window_hit_rate"))
@@ -77,6 +87,12 @@ def main() -> int:
     observability = _to_float(rates.get("observability_coverage"))
     totals = data.get("totals") if isinstance(data, dict) else {}
     weekday_mismatch_count = _to_float((totals or {}).get("weekday_mismatch_count"))
+    legacy_mode = args.legacy_metrics or str(os.getenv("QUALITY_GATE_LEGACY", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     checks = [
         ("fortune_route_hit_rate", route_hit, ">=", args.min_route_hit_rate, route_hit >= args.min_route_hit_rate),
@@ -94,27 +110,6 @@ def main() -> int:
             "<=",
             args.max_profile_echo_violation_rate,
             profile_echo <= args.max_profile_echo_violation_rate,
-        ),
-        (
-            "template_repeat_rate",
-            template_repeat,
-            "<=",
-            args.max_template_repeat_rate,
-            template_repeat <= args.max_template_repeat_rate,
-        ),
-        (
-            "template_signature_rate",
-            template_signature,
-            "<=",
-            args.max_template_signature_rate,
-            template_signature <= args.max_template_signature_rate,
-        ),
-        (
-            "session_repeat_rate",
-            session_repeat,
-            "<=",
-            args.max_session_repeat_rate,
-            session_repeat <= args.max_session_repeat_rate,
         ),
         (
             "direct_answer_hit_rate",
@@ -166,9 +161,69 @@ def main() -> int:
             weekday_mismatch_count <= args.max_weekday_mismatch_count,
         ),
     ]
+    if legacy_mode:
+        checks.extend(
+            [
+                (
+                    "template_repeat_rate",
+                    template_repeat,
+                    "<=",
+                    args.max_template_repeat_rate,
+                    template_repeat <= args.max_template_repeat_rate,
+                ),
+                (
+                    "template_signature_rate",
+                    template_signature,
+                    "<=",
+                    args.max_template_signature_rate,
+                    template_signature <= args.max_template_signature_rate,
+                ),
+                (
+                    "session_repeat_rate",
+                    session_repeat,
+                    "<=",
+                    args.max_session_repeat_rate,
+                    session_repeat <= args.max_session_repeat_rate,
+                ),
+            ]
+        )
+    else:
+        checks.extend(
+            [
+                (
+                    "blueprint_repeat_rate",
+                    blueprint_repeat,
+                    "<=",
+                    args.max_blueprint_repeat_rate,
+                    blueprint_repeat <= args.max_blueprint_repeat_rate,
+                ),
+                (
+                    "advice_repeat_rate",
+                    advice_repeat,
+                    "<=",
+                    args.max_advice_repeat_rate,
+                    advice_repeat <= args.max_advice_repeat_rate,
+                ),
+                (
+                    "unique_output_rate",
+                    unique_output,
+                    ">=",
+                    args.min_unique_output_rate,
+                    unique_output >= args.min_unique_output_rate,
+                ),
+                (
+                    "max_pair_similarity",
+                    max_pair_similarity,
+                    "<=",
+                    args.max_pair_similarity,
+                    max_pair_similarity <= args.max_pair_similarity,
+                ),
+            ]
+        )
 
     failed = 0
     print("[METRICS] rates =", rates)
+    print(f"[MODE] legacy_metrics={'ON' if legacy_mode else 'OFF'}")
     for name, actual, op, target, ok in checks:
         status = "PASS" if ok else "FAIL"
         print(f"[{status}] {name}: actual={actual:.4f} {op} target={target:.4f}")

@@ -6,6 +6,7 @@ import uuid
 import json
 import hashlib
 import hmac
+import difflib
 from datetime import datetime
 from datetime import timedelta
 from typing import Optional
@@ -440,6 +441,26 @@ def _to_bool(value, default: bool = False) -> bool:
     return bool(default)
 
 
+def _feature_enabled(env_key: str, default: bool = False) -> bool:
+    return _to_bool(os.getenv(env_key), default)
+
+
+def _intent_routing_v3_enabled() -> bool:
+    return _feature_enabled("INTENT_ROUTING_V3", False)
+
+
+def _render_v3_enabled() -> bool:
+    return _feature_enabled("RENDER_V3", False)
+
+
+def _evidence_advice_v1_enabled() -> bool:
+    return _feature_enabled("EVIDENCE_ADVICE_V1", False)
+
+
+def _time_patch_v1_enabled() -> bool:
+    return _feature_enabled("TIME_PATCH_V1", False)
+
+
 def get_v2_flags() -> dict[str, bool]:
     flags = dict(V2_FLAG_DEFAULTS)
     # 环境变量兜底（用于本地/容器静态配置）
@@ -501,6 +522,31 @@ def _last_reply_hash_key(session_id: str) -> str:
     return f"jiyi:last_reply_hash:{session_id}"
 
 
+def _quality_day_tag(day: datetime | None = None) -> str:
+    d = day or datetime.now()
+    return d.strftime("%Y%m%d")
+
+
+def _quality_unique_output_key(day: datetime | None = None) -> str:
+    return f"jiyi:quality:unique_output:{_quality_day_tag(day)}"
+
+
+def _quality_recent_output_key(day: datetime | None = None) -> str:
+    return f"jiyi:quality:recent_output:{_quality_day_tag(day)}"
+
+
+def _quality_blueprint_seen_key(day: datetime | None = None) -> str:
+    return f"jiyi:quality:blueprint_seen:{_quality_day_tag(day)}"
+
+
+def _quality_advice_seen_key(day: datetime | None = None) -> str:
+    return f"jiyi:quality:advice_seen:{_quality_day_tag(day)}"
+
+
+def _last_blueprint_key(session_id: str) -> str:
+    return f"jiyi:last_blueprint:{session_id}"
+
+
 def _metric_incr(metric: str, amount: int = 1):
     if not metric:
         return
@@ -510,6 +556,20 @@ def _metric_incr(metric: str, amount: int = 1):
         _REDIS_CLIENT.expire(key, QUALITY_METRICS_TTL_DAYS * 24 * 3600)
     except Exception:
         # 指标统计失败不能影响主链路
+        return
+
+
+def _metric_set_max(metric: str, value: float, scale: int = 10000):
+    if not metric:
+        return
+    try:
+        key = _quality_metrics_key()
+        current = _safe_int((_REDIS_CLIENT.hget(key, metric) or 0))
+        incoming = max(0, int(round(float(value) * scale)))
+        if incoming > current:
+            _REDIS_CLIENT.hset(key, metric, incoming)
+        _REDIS_CLIENT.expire(key, QUALITY_METRICS_TTL_DAYS * 24 * 3600)
+    except Exception:
         return
 
 
@@ -587,11 +647,13 @@ def track_output_quality(
     profile: dict | None = None,
     query: str = "",
     question_type: str = "default",
+    quality_meta: dict | None = None,
 ):
     text = str(output or "")
     if not text:
         return
 
+    _metric_incr("output_total")
     _metric_incr("template_signature_total")
     signature_fields = ["先给你结论", "命理信号", "命理依据", "五行分布", "行动建议", "参考置信度"]
     signature_hit = sum(1 for item in signature_fields if item in text)
@@ -610,6 +672,48 @@ def track_output_quality(
                 _metric_incr("template_repeat_hit")
                 _metric_incr("session_repeat_hit")
             _REDIS_CLIENT.setex(key, SESSION_TTL_SECONDS, current_hash)
+        except Exception:
+            pass
+
+    if normalized:
+        try:
+            output_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            seen_key = _quality_unique_output_key()
+            is_unique = int(_REDIS_CLIENT.sadd(seen_key, output_hash) or 0) > 0
+            _REDIS_CLIENT.expire(seen_key, QUALITY_METRICS_TTL_DAYS * 24 * 3600)
+            if is_unique:
+                _metric_incr("unique_output_hit")
+
+            recent_key = _quality_recent_output_key()
+            prior = [str(x or "") for x in (_REDIS_CLIENT.lrange(recent_key, 0, 29) or []) if str(x or "")]
+            if prior:
+                max_sim = max(difflib.SequenceMatcher(None, normalized, prev).ratio() for prev in prior)
+                _metric_set_max("max_pair_similarity", max_sim)
+            _REDIS_CLIENT.lpush(recent_key, normalized)
+            _REDIS_CLIENT.ltrim(recent_key, 0, 59)
+            _REDIS_CLIENT.expire(recent_key, QUALITY_METRICS_TTL_DAYS * 24 * 3600)
+        except Exception:
+            pass
+
+    meta = quality_meta if isinstance(quality_meta, dict) else {}
+    blueprint_id = str(meta.get("blueprint_id") or meta.get("_render_blueprint_id") or "").strip()
+    advice_signature = str(meta.get("advice_signature") or "").strip()
+    if blueprint_id:
+        _metric_incr("blueprint_total")
+        try:
+            b_key = _quality_blueprint_seen_key()
+            if int(_REDIS_CLIENT.sadd(b_key, blueprint_id) or 0) == 0:
+                _metric_incr("blueprint_repeat_hit")
+            _REDIS_CLIENT.expire(b_key, QUALITY_METRICS_TTL_DAYS * 24 * 3600)
+        except Exception:
+            pass
+    if advice_signature:
+        _metric_incr("advice_total")
+        try:
+            a_key = _quality_advice_seen_key()
+            if int(_REDIS_CLIENT.sadd(a_key, advice_signature) or 0) == 0:
+                _metric_incr("advice_repeat_hit")
+            _REDIS_CLIENT.expire(a_key, QUALITY_METRICS_TTL_DAYS * 24 * 3600)
         except Exception:
             pass
 
@@ -653,6 +757,7 @@ def get_quality_metrics(days: int = 1) -> dict:
     span = max(1, min(int(days or 1), 7))
     totals: dict[str, int] = {}
     series: list[dict] = []
+    max_pair_similarity_raw = 0
     now = datetime.now()
     for offset in range(span):
         day = now - timedelta(days=offset)
@@ -664,10 +769,12 @@ def get_quality_metrics(days: int = 1) -> dict:
         row = {k: _safe_int(v) for k, v in raw.items()}
         row["date"] = day.strftime("%Y-%m-%d")
         series.append(row)
+        max_pair_similarity_raw = max(max_pair_similarity_raw, _safe_int(row.get("max_pair_similarity", 0)))
         for k, v in row.items():
-            if k == "date":
+            if k in {"date", "max_pair_similarity"}:
                 continue
             totals[k] = totals.get(k, 0) + _safe_int(v)
+    totals["max_pair_similarity"] = max_pair_similarity_raw
 
     rates = {
         "fortune_route_hit_rate": _calc_rate(
@@ -688,6 +795,16 @@ def get_quality_metrics(days: int = 1) -> dict:
         "template_signature_rate": _calc_rate(
             totals.get("template_signature_hit", 0), totals.get("template_signature_total", 0)
         ),
+        "blueprint_repeat_rate": _calc_rate(
+            totals.get("blueprint_repeat_hit", 0), totals.get("blueprint_total", 0)
+        ),
+        "advice_repeat_rate": _calc_rate(
+            totals.get("advice_repeat_hit", 0), totals.get("advice_total", 0)
+        ),
+        "unique_output_rate": _calc_rate(
+            totals.get("unique_output_hit", 0), totals.get("output_total", 0)
+        ),
+        "max_pair_similarity": round(float(max_pair_similarity_raw) / 10000.0, 4),
         "session_repeat_rate": _calc_rate(
             totals.get("session_repeat_hit", 0), totals.get("session_repeat_total", 0)
         ),
@@ -1071,7 +1188,114 @@ def _build_time_safe_fallback(query: str, time_anchor: dict, window_meta: dict |
     return f"呀哈～先把时间对齐：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。"
 
 
-def validate_time_consistency(text: str, query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
+def _collect_allowed_dates(time_anchor: dict, window_meta: dict | None = None) -> set[str]:
+    allowed_dates: set[str] = set()
+    for d in (time_anchor.get("near_days") or []):
+        date_str = str(d.get("date") or "").strip()
+        if date_str:
+            allowed_dates.add(date_str)
+    today = str(time_anchor.get("today_date") or "").strip()
+    if today:
+        allowed_dates.add(today)
+    if isinstance(window_meta, dict):
+        for d in (window_meta.get("days") or []):
+            date_str = str((d or {}).get("date") or "").strip()
+            if date_str:
+                allowed_dates.add(date_str)
+    return allowed_dates
+
+
+def _iso_to_cn(date_str: str, short: bool = False) -> str:
+    try:
+        dt = datetime.strptime(str(date_str), "%Y-%m-%d")
+    except Exception:
+        return str(date_str or "")
+    if short:
+        return f"{dt.month}月{dt.day}日"
+    return f"{dt.year}年{dt.month}月{dt.day}日"
+
+
+def _pick_closest_allowed_date(target_date: str, allowed_dates: set[str]) -> str:
+    if not allowed_dates:
+        return ""
+    candidates = sorted([str(x) for x in allowed_dates if str(x)])
+    try:
+        target = datetime.strptime(str(target_date), "%Y-%m-%d")
+    except Exception:
+        return candidates[0]
+    best = candidates[0]
+    best_gap = 10**9
+    for item in candidates:
+        try:
+            dt = datetime.strptime(item, "%Y-%m-%d")
+            gap = abs((dt - target).days)
+        except Exception:
+            continue
+        if gap < best_gap:
+            best_gap = gap
+            best = item
+    return best
+
+
+def _patch_time_text_locally(
+    out: str,
+    query: str,
+    time_anchor: dict,
+    allowed_dates: set[str],
+) -> tuple[str, int, bool]:
+    patched = str(out or "")
+    conflict_count = 0
+    severe_mismatch = False
+
+    for m in reversed(list(DATE_WEEKDAY_PATTERN.finditer(patched))):
+        year = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+        weekday_text = _normalize_weekday_label(m.group(4))
+        expected = _weekday_cn_from_date(year, month, day)
+        if expected and weekday_text and weekday_text != expected:
+            conflict_count += 1
+            _metric_incr("weekday_mismatch_count")
+            start = m.start(4)
+            end = m.end(4)
+            patched = patched[:start] + expected + patched[end:]
+
+    if RELATIVE_WINDOW_PATTERN.search(str(query or "")):
+        anchor_year = int(str(time_anchor.get("today_date") or "2000-01-01").split("-")[0])
+        full_matches = list(DATE_FULL_PATTERN.finditer(patched))
+        for m in reversed(full_matches):
+            year = int(m.group(1))
+            month = int(m.group(2))
+            day = int(m.group(3))
+            date_str = f"{year:04d}-{month:02d}-{day:02d}"
+            if abs(year - anchor_year) >= 2:
+                severe_mismatch = True
+            if allowed_dates and date_str not in allowed_dates:
+                conflict_count += 1
+                replacement = _pick_closest_allowed_date(date_str, allowed_dates)
+                patched = patched[:m.start()] + _iso_to_cn(replacement, short=False) + patched[m.end():]
+        full_spans = [(m.start(), m.end()) for m in DATE_FULL_PATTERN.finditer(patched)]
+        short_matches = list(DATE_SHORT_PATTERN.finditer(patched))
+        for m in reversed(short_matches):
+            if any(start <= m.start() and m.end() <= end for start, end in full_spans):
+                continue
+            month = int(m.group(1))
+            day = int(m.group(2))
+            date_str = f"{anchor_year:04d}-{month:02d}-{day:02d}"
+            if allowed_dates and date_str not in allowed_dates:
+                conflict_count += 1
+                replacement = _pick_closest_allowed_date(date_str, allowed_dates)
+                patched = patched[:m.start()] + _iso_to_cn(replacement, short=True) + patched[m.end():]
+        years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(patched)}
+        if years and any(abs(y - anchor_year) >= 2 for y in years):
+            severe_mismatch = True
+
+    if conflict_count >= 3:
+        severe_mismatch = True
+    return patched, conflict_count, severe_mismatch
+
+
+def _validate_time_consistency_legacy(text: str, query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
     out = str(text or "").strip()
     if not out:
         return out
@@ -1080,20 +1304,7 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
         return out
     _metric_incr("temporal_consistency_total")
 
-    allowed_dates = set()
-    for d in (time_anchor.get("near_days") or []):
-        date_str = str(d.get("date") or "").strip()
-        if date_str:
-            allowed_dates.add(date_str)
-    if str(time_anchor.get("today_date") or "").strip():
-        allowed_dates.add(str(time_anchor.get("today_date")))
-    if isinstance(window_meta, dict):
-        for d in (window_meta.get("days") or []):
-            date_str = str((d or {}).get("date") or "").strip()
-            if date_str:
-                allowed_dates.add(date_str)
-
-    # 校验“日期-星期”匹配
+    allowed_dates = _collect_allowed_dates(time_anchor, window_meta=window_meta)
     for m in DATE_WEEKDAY_PATTERN.finditer(out):
         year = int(m.group(1))
         month = int(m.group(2))
@@ -1107,7 +1318,6 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
             _metric_incr("weekday_mismatch_count")
             return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
 
-    # 对“相对时间窗口”问题，输出日期必须落在允许窗口内
     if RELATIVE_WINDOW_PATTERN.search(q):
         explicit_dates: set[str] = set()
         for m in DATE_FULL_PATTERN.finditer(out):
@@ -1128,7 +1338,6 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
                 _metric_incr("temporal_consistency_fail")
                 return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
 
-        # 近几天场景若出现明显越界年份，直接矫正
         years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(out)}
         if years and any(str(y) not in {x[:4] for x in allowed_dates} for y in years):
             _metric_incr("time_validation_fail_total")
@@ -1138,6 +1347,33 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
 
     _metric_incr("temporal_consistency_hit")
     return out
+
+
+def validate_time_consistency(text: str, query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
+    if not _time_patch_v1_enabled():
+        return _validate_time_consistency_legacy(text, query, time_anchor, window_meta=window_meta)
+
+    out = str(text or "").strip()
+    if not out:
+        return out
+    q = str(query or "")
+    if not is_time_sensitive_query(q) and not is_bazi_fortune_query(q):
+        return out
+    _metric_incr("temporal_consistency_total")
+
+    allowed_dates = _collect_allowed_dates(time_anchor, window_meta=window_meta)
+    patched, conflict_count, severe_mismatch = _patch_time_text_locally(out, q, time_anchor, allowed_dates)
+    if severe_mismatch:
+        _metric_incr("time_validation_fail_total")
+        _metric_incr("time_validation_autofix_total")
+        _metric_incr("temporal_consistency_fail")
+        return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
+    if conflict_count > 0:
+        _metric_incr("time_validation_fail_total")
+        _metric_incr("time_validation_autofix_total")
+        _metric_incr("time_validation_patch_total")
+    _metric_incr("temporal_consistency_hit")
+    return patched
 
 
 def get_fast_reply(query: str, time_anchor: dict | None = None) -> str | None:
@@ -1363,6 +1599,7 @@ BAZI_FORTUNE_QUERY_PATTERN = re.compile(
     r"(算命|八字|流年|运势|桃花|姻缘|感情运|财运|事业运|学业运|贵人运|命盘|命理|紫微|测算|提运|气场|顺不顺|更顺)"
 )
 DIVINATION_QUERY_PATTERN = re.compile(r"(占卜|摇卦|抽签|起卦|卦象|卦)")
+DREAM_QUERY_PATTERN = re.compile(r"(解梦|梦见|做梦|周公)")
 FORTUNE_SCENE_PATTERN = re.compile(r"(今天|本周|这周|本月|最近|这段时间|现在|未来)")
 FORTUNE_DECISION_PATTERN = re.compile(
     r"(开源|守财|扩收入|控支出|先.*还是|二选一|更适合|哪个更|优先|先守后开|守中带开|"
@@ -1371,6 +1608,12 @@ FORTUNE_DECISION_PATTERN = re.compile(
 FORTUNE_COLLOQUIAL_PATTERN = re.compile(r"(气场|更顺|顺不顺|哪几天|哪天|近几天|这几天)")
 FORTUNE_TREND_PATTERN = re.compile(r"(本周|这周|最近一周|这一周|走势|趋势|节奏|上半段|下半段)")
 FORTUNE_ACTION_PATTERN = re.compile(r"(先做什么|第一步|怎么安排|如何安排|怎么排更稳|怎么做|怎么行动)")
+FORTUNE_SHORT_DECISION_PATTERN = re.compile(
+    r"(开源还是守财|守财还是开源|先开源还是先守财|先守财还是先开源|"
+    r"先扩收入还是先控支出|扩收入还是控支出|先控支出还是先扩收入)"
+)
+FORTUNE_CHOICE_PATTERN = re.compile(r"(.{1,12})还是(.{1,12})")
+FORTUNE_DOMAIN_HINT_PATTERN = re.compile(r"(运势|财|收入|支出|工作|事业|学业|感情|节奏|风险|行动|决策)")
 ZODIAC_SIGN_ALIASES = {
     "白羊座": ["白羊座", "白羊"],
     "金牛座": ["金牛座", "金牛"],
@@ -1468,28 +1711,14 @@ def route_zodiac_pipeline(query: str, allow_clarify: bool = True) -> tuple[str |
     topic = detect_fortune_topic(q)
     topic_cn = _topic_cn(topic)
     prompt = ChatPromptTemplate.from_template(
-        """你是专业占星顾问。请输出 {year}年{sign} 的{topic_cn}解读，要求：
-1) 不要使用八字/五行/日主/喜用神等术语。
-2) 先给一句结论，再给“触发点、风险窗口、行动建议、本周一步”。
-3) 每条都要可执行，避免空泛鸡汤。
-4) 结尾只能写“参考强度：中/中高/高（星座解读偏趋势参考）”之一。
-5) 必须严格按以下格式输出：
-【结论】
-...
-【关键触发点】
-1. ...
-2. ...
-3. ...
-【风险窗口】
-1. ...
-2. ...
-【行动建议】
-1. ...
-2. ...
-3. ...
-【本周立即执行一步】
-...
-参考强度：...
+        """你是“吉伊大师”，请结合星座信息回答用户关于{year}年{sign}{topic_cn}的问题。
+要求：
+1) 使用吉伊口吻，温柔自然，可少量加入“呀哈/呜啦/本鼠鼠”。
+2) 先给清晰结论，再解释触发点与风险窗口，最后给1-3条可执行建议。
+3) 不要使用八字/五行/日主/喜用神等术语。
+4) 不要固定骨架标题，避免模板化语句。
+5) 结尾补一句“参考强度：中/中高/高（星座解读偏趋势参考）”之一。
+
 用户问题：{query}
 """
     )
@@ -1502,9 +1731,37 @@ def route_zodiac_pipeline(query: str, allow_clarify: bool = True) -> tuple[str |
             text = re.sub(r"(八字|四柱|日主|喜用神?|忌神|五行|地支|天干)", "星盘线索", text)
         if "参考强度：" not in text:
             text = text.rstrip() + "\n参考强度：中高（星座解读偏趋势参考）"
-        return text, {"topic": topic, "source": "zodiac_llm"}
+        return _ensure_jiyi_tone(text), {"topic": topic, "source": "zodiac_llm"}
     except Exception:
         return _zodiac_default_reply(sign, year, topic), {"topic": topic, "source": "zodiac_fallback"}
+
+
+def _is_short_fortune_decision_hit(query: str) -> bool:
+    q = str(query or "")
+    if not q:
+        return False
+    if FORTUNE_SHORT_DECISION_PATTERN.search(q):
+        return True
+    m = FORTUNE_CHOICE_PATTERN.search(q)
+    if not m:
+        return False
+    left = re.sub(r"\s+", "", m.group(1))
+    right = re.sub(r"\s+", "", m.group(2))
+    combined = f"{left}{right}"
+    if any(x in combined for x in ["开源", "守财", "扩收入", "控支出", "换岗", "积累"]):
+        return True
+    return bool(FORTUNE_DOMAIN_HINT_PATTERN.search(combined))
+
+
+def _route_reason_for_fortune_query(query: str) -> str:
+    if not _intent_routing_v3_enabled():
+        return "none"
+    q = str(query or "")
+    if _is_short_fortune_decision_hit(q):
+        return "fortune_short_decision_hit"
+    if FORTUNE_ACTION_PATTERN.search(q) and not FORTUNE_SCENE_PATTERN.search(q):
+        return "fortune_short_action_hit"
+    return "none"
 
 
 def is_bazi_fortune_query(query: str) -> bool:
@@ -1514,8 +1771,14 @@ def is_bazi_fortune_query(query: str) -> bool:
         return False
     if BAZI_FORTUNE_QUERY_PATTERN.search(q):
         return True
+    if _intent_routing_v3_enabled() and _is_short_fortune_decision_hit(q):
+        return True
     # 覆盖“弱命理意图”问法：未显式写“运势/八字”，但明显在问提运/时运决策。
     if FORTUNE_DECISION_PATTERN.search(q) and FORTUNE_SCENE_PATTERN.search(q):
+        return True
+    if _intent_routing_v3_enabled() and FORTUNE_ACTION_PATTERN.search(q) and (
+        FORTUNE_SCENE_PATTERN.search(q) or FORTUNE_DOMAIN_HINT_PATTERN.search(q) or FORTUNE_DECISION_PATTERN.search(q)
+    ):
         return True
     # 覆盖“口语化问运势”表达（如：近哪几天气场更顺）。
     if FORTUNE_COLLOQUIAL_PATTERN.search(q) and FORTUNE_SCENE_PATTERN.search(q):
@@ -1527,8 +1790,15 @@ def is_divination_query(query: str) -> bool:
     return bool(DIVINATION_QUERY_PATTERN.search(str(query or "")))
 
 
+def is_dream_query(query: str) -> bool:
+    q = str(query or "")
+    return bool(DREAM_QUERY_PATTERN.search(q))
+
+
 def detect_domain_intent(query: str) -> str:
     q = str(query or "")
+    if is_dream_query(q):
+        return "dream"
     if is_divination_query(q):
         return "divination"
     if is_zodiac_intent_query(q):
@@ -1544,18 +1814,22 @@ def detect_question_type(query: str) -> str:
     q = str(query or "")
     if not q:
         return "default"
+    if is_dream_query(q):
+        return "dream"
     if is_time_sensitive_query(q) and not (is_zodiac_intent_query(q) or is_bazi_fortune_query(q)):
         return "time"
     if is_zodiac_intent_query(q) and not _extract_zodiac_sign(q):
         return "clarify"
+    if _intent_routing_v3_enabled() and _is_short_fortune_decision_hit(q):
+        return "decision"
     if FORTUNE_DECISION_PATTERN.search(q):
         return "decision"
+    if FORTUNE_ACTION_PATTERN.search(q):
+        return "action"
     if FORTUNE_COLLOQUIAL_PATTERN.search(q):
         return "colloquial"
     if FORTUNE_TREND_PATTERN.search(q):
         return "trend"
-    if FORTUNE_ACTION_PATTERN.search(q):
-        return "action"
     return "default"
 
 
@@ -1650,6 +1924,10 @@ def _normalize_structured_fortune_payload(raw, topic: str) -> dict:
         "jishen": "",
         "wuxing_scores": {"metal": 0, "wood": 0, "water": 0, "fire": 0, "earth": 0},
         "fortune_signals": {"love": "", "wealth": "", "career": ""},
+        "risk_points": [],
+        "opportunity_points": [],
+        "time_hints": [],
+        "evidence_lines": [],
         "advice": [],
         "confidence": 0.2,
         "source": "yuanfenju",
@@ -1677,6 +1955,11 @@ def _normalize_structured_fortune_payload(raw, topic: str) -> dict:
     if isinstance(raw_signals, dict):
         for key in ["love", "wealth", "career"]:
             base["fortune_signals"][key] = str(raw_signals.get(key) or "")
+
+    for key in ["risk_points", "opportunity_points", "time_hints", "evidence_lines"]:
+        raw_list = payload.get(key) or []
+        if isinstance(raw_list, list):
+            base[key] = [str(x).strip() for x in raw_list if str(x).strip()][:4]
 
     raw_advice = payload.get("advice") or []
     if isinstance(raw_advice, list):
@@ -1713,8 +1996,6 @@ def _topic_cn(topic: str) -> str:
 
 def _signal_for_topic(payload: dict, topic: str) -> str:
     signals = payload.get("fortune_signals") or {}
-    if not isinstance(signals, dict):
-        return ""
     mapping = {
         "love": "love",
         "wealth": "wealth",
@@ -1723,8 +2004,346 @@ def _signal_for_topic(payload: dict, topic: str) -> str:
         "daily": "career",
     }
     key = mapping.get(topic, "career")
-    text = str(signals.get(key) or "").strip()
-    return text[:120]
+    signal_text = ""
+    if isinstance(signals, dict):
+        signal_text = str(signals.get(key) or "").strip()
+    if not _evidence_advice_v1_enabled():
+        return signal_text[:120]
+
+    segments: list[str] = []
+    if signal_text:
+        segments.append(signal_text)
+    for field_name, prefix in [
+        ("opportunity_points", "机会"),
+        ("risk_points", "风险"),
+        ("time_hints", "时间"),
+        ("evidence_lines", "依据"),
+    ]:
+        items = payload.get(field_name) or []
+        if isinstance(items, list):
+            for item in items:
+                clean = str(item or "").strip()
+                if clean:
+                    segments.append(f"{prefix}：{clean}")
+                    break
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for seg in segments:
+        key_seg = re.sub(r"\s+", "", seg)
+        if not key_seg or key_seg in seen:
+            continue
+        seen.add(key_seg)
+        deduped.append(seg)
+    return "；".join(deduped)[:180]
+
+
+def _basis_line(payload: dict) -> str:
+    basis_parts: list[str] = []
+    bazi = str(payload.get("bazi") or "").strip()
+    day_master = str(payload.get("day_master") or "").strip()
+    xiyongshen = str(payload.get("xiyongshen") or "").strip()
+    jishen = str(payload.get("jishen") or "").strip()
+    if bazi:
+        basis_parts.append(f"八字 {bazi}")
+    if day_master:
+        basis_parts.append(f"日主 {day_master}")
+    if xiyongshen:
+        basis_parts.append(f"喜用 {xiyongshen}")
+    if jishen:
+        basis_parts.append(f"忌神 {jishen}")
+    if not basis_parts:
+        return "以当前盘面趋势判断"
+    return "；".join(basis_parts)
+
+
+def _resolve_fortune_advice(payload: dict, topic: str, strength: str) -> list[str]:
+    if _evidence_advice_v1_enabled():
+        candidates: list[str] = []
+        for key in ["opportunity_points", "risk_points", "time_hints", "evidence_lines"]:
+            items = payload.get(key) or []
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                clean = str(item or "").strip()
+                if clean:
+                    candidates.append(clean)
+        if candidates:
+            deduped: list[str] = []
+            seen: set[str] = set()
+            for item in candidates:
+                norm = re.sub(r"\s+", "", item)
+                if not norm or norm in seen:
+                    continue
+                seen.add(norm)
+                deduped.append(item)
+                if len(deduped) >= 3:
+                    break
+            if deduped:
+                return deduped
+    advice = payload.get("advice") or _default_fortune_advice(topic, strength)
+    return [str(x).strip() for x in advice if str(x).strip()][:3]
+
+
+def _advice_signature(advice: list[str]) -> str:
+    joined = "|".join([str(x).strip() for x in advice if str(x).strip()])
+    if not joined:
+        return ""
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def _json_dumps_safe(data) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return str(data)
+
+
+def _ensure_jiyi_tone(text: str) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return ""
+    if re.search(r"(呀哈|呜啦|本鼠鼠|吉伊大师)", out):
+        return out
+    return f"呀哈～{out}"
+
+
+def _generate_fortune_reply_with_model(
+    payload: dict,
+    topic: str,
+    query: str,
+    question_type: str,
+    window_meta: dict | None = None,
+) -> str:
+    q = str(query or "").strip()
+    if not q:
+        return ""
+    topic_cn = _topic_cn(topic)
+    strength = str(payload.get("strength") or "balanced")
+    advice = _resolve_fortune_advice(payload, topic, strength)
+    window_text = ""
+    if isinstance(window_meta, dict):
+        window_text = str(window_meta.get("window_text") or "").strip()
+    prompt = ChatPromptTemplate.from_template(
+        """你是“吉伊大师”，需要根据工具返回的结构化命理结果，生成自然中文回复。
+要求：
+1) 保持吉伊口吻：温柔、轻可爱，适度使用“呀哈/呜啦/本鼠鼠”，但不要每句都用。
+2) 先回答用户核心问题，避免空泛；如果是决策题，首句必须给明确方向（例如先A后B）。
+3) 不要使用固定骨架标题（例如固定“结论/依据/建议”格式），优先自然段表达。
+4) 如问题涉及趋势/口语时窗，并且提供了窗口信息，需自然写出明确时间窗口。
+5) 结合“命理信号、依据、建议候选、证据点”组织内容，不要编造工具结果里不存在的细节。
+6) 给1-3条可执行建议，可写成自然句或短列表；避免模板腔和重复句式。
+7) 不要回显用户姓名和生日原文，不要输出JSON。
+
+输入信息：
+- 用户问题：{query}
+- 问题类型：{question_type}
+- 主题：{topic_cn}
+- 时间窗口：{window_text}
+- 命理信号：{signal_line}
+- 命理依据：{basis_line}
+- 建议候选：{advice_text}
+- 工具原始结果(JSON)：{payload_json}
+"""
+    )
+    try:
+        chain = prompt | get_lc_ali_model_client(temperature=0.55, streaming=False) | StrOutputParser()
+        out = str(
+            chain.invoke(
+                {
+                    "query": q,
+                    "question_type": str(question_type or "default"),
+                    "topic_cn": topic_cn,
+                    "window_text": window_text or "无",
+                    "signal_line": _signal_for_topic(payload, topic) or "无",
+                    "basis_line": _basis_line(payload),
+                    "advice_text": "；".join(advice) if advice else "无",
+                    "payload_json": _json_dumps_safe(payload),
+                }
+            )
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+    if not out:
+        return ""
+    if str(question_type or "") in {"decision", "comparison"} and not _is_direct_answer_hit(q, out):
+        out = f"先给你结论：{_decision_conclusion_from_query(q, strength)}。\n{out}"
+    if str(question_type or "") in {"trend", "colloquial"} and window_text and window_text not in out:
+        out = f"时间上先对齐：{window_text}。\n{out}"
+    return _ensure_jiyi_tone(out)
+
+
+def _format_dream_payload(raw) -> str:
+    if isinstance(raw, dict):
+        ordered = []
+        for k in ["梦境", "解梦", "吉凶", "建议", "result", "content"]:
+            val = str(raw.get(k) or "").strip()
+            if val:
+                ordered.append(f"{k}：{val}")
+        if not ordered:
+            ordered = [f"{k}：{v}" for k, v in raw.items() if str(v).strip()]
+        return "\n".join(ordered[:8])
+    return str(raw or "").strip()
+
+
+def _generate_dream_reply_with_model(query: str, raw) -> str:
+    q = str(query or "").strip()
+    detail = _format_dream_payload(raw)
+    if not q or not detail:
+        return ""
+    prompt = ChatPromptTemplate.from_template(
+        """你是“吉伊大师”。请基于解梦工具结果回答用户，要求：
+1) 使用吉伊口吻（温柔、轻可爱），自然可读，不要模板骨架。
+2) 先给一句结论，再解释梦境含义，最后给1-2条可执行建议。
+3) 不编造工具结果之外的事实，不输出JSON。
+
+用户问题：{query}
+工具结果：{detail}
+"""
+    )
+    try:
+        chain = prompt | get_lc_ali_model_client(temperature=0.5, streaming=False) | StrOutputParser()
+        out = str(chain.invoke({"query": q, "detail": detail}) or "").strip()
+    except Exception:
+        return ""
+    return _ensure_jiyi_tone(out)
+
+
+def _generate_divination_reply_with_model(query: str, raw) -> str:
+    q = str(query or "").strip()
+    detail = _format_divination_reply(raw)
+    if not q or not detail:
+        return ""
+    prompt = ChatPromptTemplate.from_template(
+        """你是“吉伊大师”。请根据卦象结果回答用户：
+1) 保持吉伊口吻，先给结论，再解释卦象，再给1-2条行动建议。
+2) 不要固定标题骨架，不要输出JSON。
+3) 不要编造卦象中没有的信息。
+
+用户问题：{query}
+卦象结果：{detail}
+"""
+    )
+    try:
+        chain = prompt | get_lc_ali_model_client(temperature=0.5, streaming=False) | StrOutputParser()
+        out = str(chain.invoke({"query": q, "detail": detail}) or "").strip()
+    except Exception:
+        return ""
+    return _ensure_jiyi_tone(out)
+
+
+FORTUNE_BLUEPRINT_LIBRARY = {
+    "decision": ["decision_direct", "decision_risk_first", "decision_stepwise"],
+    "action": ["action_direct", "action_window_then_step", "action_signal_focus"],
+    "trend": ["trend_window_first", "trend_signal_first", "trend_balanced"],
+    "colloquial": ["colloquial_window_first", "colloquial_signal_first", "colloquial_balanced"],
+    "default": ["default_concise", "default_signal_first", "default_balanced"],
+}
+
+
+def _select_fortune_blueprint(question_type: str, session_id: str, query_hash: str) -> str:
+    qtype = str(question_type or "default")
+    candidates = FORTUNE_BLUEPRINT_LIBRARY.get(qtype, FORTUNE_BLUEPRINT_LIBRARY["default"])
+    if not candidates:
+        return "default_concise"
+    seed_src = f"{qtype}|{session_id}|{query_hash}"
+    seed = hashlib.sha256(seed_src.encode("utf-8")).hexdigest()
+    idx = int(seed[:8], 16) % len(candidates)
+    selected = candidates[idx]
+    if session_id:
+        try:
+            key = _last_blueprint_key(session_id)
+            last = str(_REDIS_CLIENT.get(key) or "")
+            if last == selected and len(candidates) > 1:
+                selected = candidates[(idx + 1) % len(candidates)]
+            _REDIS_CLIENT.setex(key, SESSION_TTL_SECONDS, selected)
+        except Exception:
+            pass
+    return selected
+
+
+def _render_fortune_with_blueprint(
+    blueprint_id: str,
+    conclusion_line: str,
+    window_line: str,
+    signal_line: str,
+    basis_line: str,
+    advice: list[str],
+) -> str:
+    lines: list[str] = [f"结论：{conclusion_line}。"]
+    advice_lines = [f"{idx}. {tip}" for idx, tip in enumerate(advice, start=1)]
+    if blueprint_id in {"decision_risk_first", "trend_signal_first", "colloquial_signal_first", "action_signal_focus", "default_signal_first"}:
+        if signal_line:
+            lines.append(f"命理信号：{signal_line}")
+        if window_line:
+            lines.append(window_line)
+    elif blueprint_id in {"decision_stepwise", "action_window_then_step", "trend_window_first", "colloquial_window_first"}:
+        if window_line:
+            lines.append(window_line)
+        if signal_line:
+            lines.append(f"命理信号：{signal_line}")
+    else:
+        if signal_line:
+            lines.append(f"命理信号：{signal_line}")
+        if window_line:
+            lines.append(window_line)
+    lines.append(f"依据：{basis_line}。")
+    if advice_lines:
+        lines.append("建议：")
+        lines.extend(advice_lines)
+    return "\n".join(lines)
+
+
+def _render_user_fortune_reply_v2_legacy(
+    payload: dict,
+    topic: str,
+    query: str,
+    question_type: str,
+    window_meta: dict | None = None,
+) -> str:
+    topic_cn = _topic_cn(topic)
+    error = payload.get("error")
+    if isinstance(error, dict) and str(error.get("code") or ""):
+        code = str(error.get("code") or "")
+        msg = str(error.get("message") or "命理链路暂时不可用")
+        return (
+            f"呀哈～这次{topic_cn}盘面暂时没取全（{code}）。{msg}。"
+            f"先给你一个稳妥方向：{_default_fortune_advice(topic, 'balanced')[0]}"
+        )
+
+    strength = str(payload.get("strength") or "balanced")
+    strength_text = {
+        "strong": "势能偏强，适合主动推进",
+        "weak": "势能偏谨慎，先稳节奏更顺",
+        "balanced": "节奏偏平衡，适合稳中求进",
+    }.get(strength, "节奏偏平衡，适合稳中求进")
+
+    lines: list[str] = []
+    if question_type in {"decision", "comparison"}:
+        conclusion = _decision_conclusion_from_query(query, strength)
+        lines.append(f"结论：{conclusion}。")
+    else:
+        lines.append(f"结论：这次{topic_cn}{strength_text}。")
+
+    if question_type in {"trend", "colloquial"} and isinstance(window_meta, dict):
+        window_text = str(window_meta.get("window_text") or "").strip()
+        if window_text:
+            lines.append(f"时间窗口：{window_text}。")
+
+    signal_line = _signal_for_topic(payload, topic)
+    if signal_line:
+        lines.append(f"命理信号：{signal_line}")
+
+    lines.append(f"依据：{_basis_line(payload)}。")
+    advice = _resolve_fortune_advice(payload, topic, strength)
+    payload["advice_signature"] = _advice_signature(advice)
+    if advice:
+        lines.append("建议：")
+        for idx, tip in enumerate(advice, start=1):
+            lines.append(f"{idx}. {tip}")
+    payload["blueprint_id"] = "legacy_v2"
+    payload["_render_blueprint_id"] = "legacy_v2"
+    return "\n".join(lines)
 
 
 def _first_sentence(text: str) -> str:
@@ -1771,62 +2390,76 @@ def render_user_fortune_reply_v2(
     query: str,
     question_type: str,
     window_meta: dict | None = None,
+    session_id: str = "",
 ) -> str:
+    strength = str(payload.get("strength") or "balanced")
+    advice_for_sign = _resolve_fortune_advice(payload, topic, strength)
+    payload["advice_signature"] = _advice_signature(advice_for_sign)
+    raw_error = payload.get("error")
+    has_error = isinstance(raw_error, dict) and str(raw_error.get("code") or "")
+    if not has_error:
+        payload["blueprint_id"] = "llm_nlg_v1"
+        payload["_render_blueprint_id"] = "llm_nlg_v1"
+        model_reply = _generate_fortune_reply_with_model(
+            payload=payload,
+            topic=topic,
+            query=query,
+            question_type=question_type,
+            window_meta=window_meta,
+        )
+        if model_reply:
+            return model_reply
+
+    if not _render_v3_enabled():
+        return _render_user_fortune_reply_v2_legacy(
+            payload, topic, query=query, question_type=question_type, window_meta=window_meta
+        )
+
     topic_cn = _topic_cn(topic)
     error = payload.get("error")
     if isinstance(error, dict) and str(error.get("code") or ""):
         code = str(error.get("code") or "")
         msg = str(error.get("message") or "命理链路暂时不可用")
+        payload["blueprint_id"] = "error_fallback"
+        payload["_render_blueprint_id"] = "error_fallback"
+        payload["advice_signature"] = _advice_signature(_default_fortune_advice(topic, "balanced")[:1])
         return (
             f"呀哈～这次{topic_cn}盘面暂时没取全（{code}）。{msg}。"
             f"先给你一个稳妥方向：{_default_fortune_advice(topic, 'balanced')[0]}"
         )
 
-    strength = str(payload.get("strength") or "balanced")
     strength_text = {
         "strong": "势能偏强，适合主动推进",
         "weak": "势能偏谨慎，先稳节奏更顺",
         "balanced": "节奏偏平衡，适合稳中求进",
     }.get(strength, "节奏偏平衡，适合稳中求进")
-
-    lines: list[str] = []
     if question_type in {"decision", "comparison"}:
         conclusion = _decision_conclusion_from_query(query, strength)
-        lines.append(f"结论：{conclusion}。")
     else:
-        lines.append(f"结论：这次{topic_cn}{strength_text}。")
+        conclusion = f"这次{topic_cn}{strength_text}"
 
+    window_line = ""
     if question_type in {"trend", "colloquial"} and isinstance(window_meta, dict):
         window_text = str(window_meta.get("window_text") or "").strip()
         if window_text:
-            lines.append(f"时间窗口：{window_text}。")
-
+            window_line = f"时间窗口：{window_text}。"
     signal_line = _signal_for_topic(payload, topic)
-    if signal_line:
-        lines.append(f"命理信号：{signal_line}")
-
-    basis_parts = []
-    bazi = str(payload.get("bazi") or "").strip()
-    day_master = str(payload.get("day_master") or "").strip()
-    xiyongshen = str(payload.get("xiyongshen") or "").strip()
-    jishen = str(payload.get("jishen") or "").strip()
-    if bazi:
-        basis_parts.append(f"八字 {bazi}")
-    if day_master:
-        basis_parts.append(f"日主 {day_master}")
-    if xiyongshen:
-        basis_parts.append(f"喜用 {xiyongshen}")
-    if jishen:
-        basis_parts.append(f"忌神 {jishen}")
-    lines.append(f"依据：{'；'.join(basis_parts) if basis_parts else '以当前盘面趋势判断'}。")
-
-    advice = payload.get("advice") or _default_fortune_advice(topic, strength)
-    advice = [str(x).strip() for x in advice if str(x).strip()][:3]
-    if advice:
-        lines.append("建议：")
-        for idx, tip in enumerate(advice, start=1):
-            lines.append(f"{idx}. {tip}")
-    return "\n".join(lines)
+    basis = _basis_line(payload)
+    advice = _resolve_fortune_advice(payload, topic, strength)
+    advice_signature = _advice_signature(advice)
+    query_hash = hashlib.sha256(str(query or "").encode("utf-8")).hexdigest()[:16]
+    blueprint_id = _select_fortune_blueprint(question_type, session_id, query_hash)
+    payload["blueprint_id"] = blueprint_id
+    payload["_render_blueprint_id"] = blueprint_id
+    payload["advice_signature"] = advice_signature
+    return _render_fortune_with_blueprint(
+        blueprint_id=blueprint_id,
+        conclusion_line=conclusion,
+        window_line=window_line,
+        signal_line=signal_line,
+        basis_line=basis,
+        advice=advice,
+    )
 
 
 def render_structured_fortune_reply(payload: dict, topic: str) -> str:
@@ -1856,8 +2489,7 @@ def render_structured_fortune_reply(payload: dict, topic: str) -> str:
         f"金{scores.get('metal', 0)} 木{scores.get('wood', 0)} 水{scores.get('water', 0)} "
         f"火{scores.get('fire', 0)} 土{scores.get('earth', 0)}"
     )
-    advice = payload.get("advice") or _default_fortune_advice(topic, str(payload.get("strength") or "balanced"))
-    advice = [str(x).strip() for x in advice if str(x).strip()][:3]
+    advice = _resolve_fortune_advice(payload, topic, str(payload.get("strength") or "balanced"))
     confidence = int(float(payload.get("confidence", 0.2)) * 100)
 
     lines = [f"呀哈～先给你结论：这次{topic_cn}{strength_text}。"]
@@ -1898,12 +2530,36 @@ def _format_divination_reply(raw) -> str:
     return f"呀哈～本鼠鼠给你摇到一卦：{text}"
 
 
+def route_dream_pipeline(query: str) -> tuple[str | None, dict | None]:
+    q = str(query or "").strip()
+    if not q:
+        return None, None
+    if not is_dream_query(q):
+        return None, None
+    try:
+        raw = jiemeng.invoke(q)
+    except Exception:
+        try:
+            raw = jiemeng.run(q)
+        except Exception:
+            raw = {}
+    reply = _generate_dream_reply_with_model(q, raw)
+    if not reply:
+        detail = _format_dream_payload(raw)
+        if detail:
+            reply = _ensure_jiyi_tone(f"先给你一个梦境方向：{detail}")
+        else:
+            reply = "呀哈～这次梦境线索有点散，本鼠鼠建议你补一句“梦里最强烈的画面”，我再帮你细解。"
+    return reply, {"topic": "dream", "source": "jiemeng", "question_type": "dream"}
+
+
 def route_fortune_pipeline(
     query: str,
     profile: dict[str, str],
     time_anchor: dict | None = None,
     flags: dict[str, bool] | None = None,
     question_type: str = "default",
+    session_id: str = "",
 ) -> tuple[str | None, dict | None]:
     q = str(query or "").strip()
     if not q:
@@ -1923,16 +2579,23 @@ def route_fortune_pipeline(
         _metric_incr("fortune_tool_total")
         if str(raw or "").strip():
             _metric_incr("fortune_tool_success_total")
-        return _format_divination_reply(raw), {"topic": "divination", "error": None, "question_type": question_type}
+        out = _generate_divination_reply_with_model(q, raw) or _format_divination_reply(raw)
+        return out, {"topic": "divination", "error": None, "question_type": question_type}
 
     if not is_bazi_fortune_query(q):
         return None, None
+    route_reason_code = _route_reason_for_fortune_query(q)
 
     missing = _missing_profile_fields_for_fortune(profile)
     if missing:
         return (
             build_fortune_missing_reply(missing),
-            {"topic": detect_fortune_topic(q), "error": {"code": "PROFILE_MISSING"}, "question_type": question_type},
+            {
+                "topic": detect_fortune_topic(q),
+                "error": {"code": "PROFILE_MISSING"},
+                "question_type": question_type,
+                "route_reason_code": route_reason_code,
+            },
         )
 
     topic = detect_fortune_topic(q)
@@ -1972,6 +2635,7 @@ def route_fortune_pipeline(
     payload["question_type"] = str(question_type or "default")
     payload["now_ts"] = str(anchor.get("now_ts") or "")
     payload["tz"] = str(anchor.get("tz_name") or "")
+    payload["route_reason_code"] = route_reason_code
     if isinstance(window_meta, dict):
         payload["window_start"] = str(window_meta.get("window_start") or "")
         payload["window_end"] = str(window_meta.get("window_end") or "")
@@ -1979,10 +2643,25 @@ def route_fortune_pipeline(
     logger.info(
         "fortune_pipeline session_payload: "
         f"topic={payload.get('topic')} error={((payload.get('error') or {}).get('code') if isinstance(payload.get('error'), dict) else '')} "
-        f"confidence={payload.get('confidence')} question_type={question_type}"
+        f"confidence={payload.get('confidence')} question_type={question_type} route_reason={route_reason_code}"
     )
     if active_flags.get("render_v2"):
-        return render_user_fortune_reply_v2(payload, topic, query=q, question_type=question_type, window_meta=window_meta), payload
+        return (
+            render_user_fortune_reply_v2(
+                payload,
+                topic,
+                query=q,
+                question_type=question_type,
+                window_meta=window_meta,
+                session_id=session_id,
+            ),
+            payload,
+        )
+    payload["blueprint_id"] = "structured_v2"
+    payload["_render_blueprint_id"] = "structured_v2"
+    payload["advice_signature"] = _advice_signature(
+        _resolve_fortune_advice(payload, topic, str(payload.get("strength") or "balanced"))
+    )
     return render_structured_fortune_reply(payload, topic), payload
 
 
@@ -2463,7 +3142,12 @@ async def chat(request: Request, payload: ChatRequest):
             domain_intent = detect_domain_intent(query)
             question_type = detect_question_type(query)
         else:
-            domain_intent = "fortune" if (is_bazi_fortune_query(query) or is_divination_query(query) or is_zodiac_intent_query(query)) else "general"
+            if is_dream_query(query):
+                domain_intent = "dream"
+            elif is_bazi_fortune_query(query) or is_divination_query(query) or is_zodiac_intent_query(query):
+                domain_intent = "fortune"
+            else:
+                domain_intent = "general"
             question_type = "default"
         if flags.get("window_v2") and (
             question_type in {"trend", "colloquial"} or RELATIVE_WINDOW_PATTERN.search(str(query or ""))
@@ -2508,6 +3192,29 @@ async def chat(request: Request, payload: ChatRequest):
                 question_type=question_type,
             )
             return response_data
+        dream_reply, dream_meta = route_dream_pipeline(query)
+        if dream_reply is not None:
+            out = sanitize_output(dream_reply, user_query=query, profile=profile)
+            out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            d_qtype = str(((dream_meta or {}).get("question_type") if isinstance(dream_meta, dict) else "") or "dream")
+            track_output_quality(
+                session_id,
+                out,
+                profile=profile,
+                query=query,
+                question_type=d_qtype,
+            )
+            _log_route_observability(
+                route_path="dream_pipeline",
+                reason_code=flag_reason_code,
+                flag_snapshot=flag_snapshot,
+                domain_intent="dream",
+                question_type=d_qtype,
+            )
+            return {
+                "session_id": session_id,
+                "output": out,
+            }
         zodiac_reply, zodiac_meta = route_zodiac_pipeline(query, allow_clarify=bool(flags.get("clarify_v2")))
         if zodiac_reply is not None:
             if is_fortune_intent:
@@ -2546,6 +3253,7 @@ async def chat(request: Request, payload: ChatRequest):
             time_anchor=time_anchor,
             flags=flags,
             question_type=fortune_qtype,
+            session_id=session_id,
         )
         if fortune_reply is not None:
             if is_fortune_intent:
@@ -2566,10 +3274,13 @@ async def chat(request: Request, payload: ChatRequest):
                 profile=profile,
                 query=query,
                 question_type=qtype_for_metrics,
+                quality_meta=fortune_payload if isinstance(fortune_payload, dict) else None,
             )
+            route_reason = str((fortune_payload or {}).get("route_reason_code") or "").strip()
+            final_reason = route_reason if route_reason and route_reason != "none" else flag_reason_code
             _log_route_observability(
                 route_path="fortune_pipeline",
-                reason_code=flag_reason_code,
+                reason_code=final_reason,
                 flag_snapshot=flag_snapshot,
                 domain_intent="fortune",
                 question_type=qtype_for_metrics,
