@@ -90,6 +90,36 @@ python server.py
 - 前端：`http://127.0.0.1:8000/index`
 - API文档：`http://127.0.0.1:8000/docs`
 
+### 4.1.1 本机终端提问流程（登录/注册 → 发送聊天）
+```bash
+# 运行server
+REDIS_URL=redis://127.0.0.1:6380/ \
+MYSQL_HOST=127.0.0.1 MYSQL_PORT=3307 MYSQL_DB=fortune_telling \
+MYSQL_USER=fortune_app MYSQL_PASSWORD=fortune_app_dev \
+SMS_DEBUG_CODE_ENABLED=true \
+./.venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8000
+```
+```bash
+# 1) 发送验证码（开发环境会返回 debug_code）
+curl -sS -X POST http://127.0.0.1:8000/auth/send_code \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"13800138000","scene":"register"}'
+
+# 2) 验证/注册（用上一步的 debug_code）
+curl -sS -X POST http://127.0.0.1:8000/auth/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"13800138000","code":"123456","mode":"register","password":"abc12345"}' \
+  -c /tmp/jiyi.cookie
+
+# 3) 发送聊天
+curl -sS -X POST http://127.0.0.1:8000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"分析一下我今年的运势"}' \
+  -b /tmp/jiyi.cookie
+```
+
+已注册用户可将第 2 步的 `mode` 改为 `login`。
+
 ### 4.2 Docker Compose 运行（推荐）
 
 ```bash

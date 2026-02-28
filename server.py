@@ -75,6 +75,7 @@ CODE_TTL_SECONDS = 300
 RESEND_COOLDOWN_SECONDS = 60
 AUTH_TTL_DAYS = 30
 PREFERRED_NAME_PROMPT_TTL_SECONDS = 24 * 3600
+NAME_CONFIDENCE_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 _REDIS_CLIENT = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
@@ -305,11 +306,34 @@ def _load_profile_json(raw_value) -> dict:
         return {}
 
 
-def _dump_profile_json(preferred_name: str = "") -> str | None:
+def _normalize_name_confidence(level: str) -> str:
+    raw = str(level or "").strip().lower()
+    if raw in NAME_CONFIDENCE_ORDER:
+        return raw
+    return "none"
+
+
+def _confidence_ge(left: str, right: str) -> bool:
+    l = NAME_CONFIDENCE_ORDER.get(_normalize_name_confidence(left), 0)
+    r = NAME_CONFIDENCE_ORDER.get(_normalize_name_confidence(right), 0)
+    return l >= r
+
+
+def _dump_profile_json(
+    preferred_name: str = "",
+    name_confidence: str = "",
+    preferred_name_confidence: str = "",
+) -> str | None:
     payload: dict[str, str] = {}
     call_name = str(preferred_name or "").strip()
     if call_name:
         payload["preferred_name"] = call_name
+    n_conf = _normalize_name_confidence(name_confidence)
+    p_conf = _normalize_name_confidence(preferred_name_confidence)
+    if n_conf != "none":
+        payload["name_confidence"] = n_conf
+    if p_conf != "none":
+        payload["preferred_name_confidence"] = p_conf
     if not payload:
         return None
     try:
@@ -348,11 +372,19 @@ def _get_profile_by_user_id(user_id: int) -> dict[str, str]:
                 birthtime = f"{int(m.group(1)):02d}:{m.group(2)}"
     ext = _load_profile_json(row.get("profile_json"))
     preferred_name = str(ext.get("preferred_name") or "").strip()
+    name_confidence = _normalize_name_confidence(str(ext.get("name_confidence") or ""))
+    preferred_name_confidence = _normalize_name_confidence(str(ext.get("preferred_name_confidence") or ""))
+    if (row.get("name") or "").strip() and name_confidence == "none":
+        name_confidence = "high"
+    if preferred_name and preferred_name_confidence == "none":
+        preferred_name_confidence = "high"
     return {
         "name": row.get("name") or "",
         "birthdate": birthdate,
         "birthtime": birthtime,
         "preferred_name": preferred_name,
+        "name_confidence": name_confidence,
+        "preferred_name_confidence": preferred_name_confidence,
     }
 
 
@@ -360,9 +392,25 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
     profile = _get_profile_by_user_id(user_id)
     merged = profile.copy()
     changed = False
-    if current.get("name") and not merged.get("name"):
-        merged["name"] = current["name"]
-        changed = True
+    merged_name_conf = _normalize_name_confidence(str(merged.get("name_confidence") or ""))
+    merged_pref_conf = _normalize_name_confidence(str(merged.get("preferred_name_confidence") or ""))
+    incoming_name_conf = _normalize_name_confidence(str(current.get("name_confidence") or "none"))
+    incoming_pref_conf = _normalize_name_confidence(str(current.get("preferred_name_confidence") or "none"))
+    incoming_name = str(current.get("name") or "").strip()
+    if incoming_name:
+        _metric_incr("name_write_total")
+        if _confidence_ge(incoming_name_conf, "medium"):
+            if _confidence_ge(incoming_name_conf, merged_name_conf):
+                if (not merged.get("name")) or str(merged.get("name") or "").strip() != incoming_name:
+                    merged["name"] = incoming_name
+                    changed = True
+                if merged_name_conf != incoming_name_conf:
+                    merged["name_confidence"] = incoming_name_conf
+                    changed = True
+            if _confidence_ge(incoming_name_conf, "high"):
+                _metric_incr("name_write_high_confidence_total")
+        else:
+            _metric_incr("name_slot_pollution")
     if current.get("birthdate") and not merged.get("birthdate"):
         merged["birthdate"] = current["birthdate"]
         changed = True
@@ -370,11 +418,26 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
         merged["birthtime"] = current["birthtime"]
         changed = True
     incoming_preferred_name = str(current.get("preferred_name") or "").strip()
-    if incoming_preferred_name and incoming_preferred_name != str(merged.get("preferred_name") or "").strip():
-        merged["preferred_name"] = incoming_preferred_name
-        changed = True
+    if incoming_preferred_name:
+        _metric_incr("name_write_total")
+        if _confidence_ge(incoming_pref_conf, "medium"):
+            if _confidence_ge(incoming_pref_conf, merged_pref_conf):
+                if incoming_preferred_name != str(merged.get("preferred_name") or "").strip():
+                    merged["preferred_name"] = incoming_preferred_name
+                    changed = True
+                if merged_pref_conf != incoming_pref_conf:
+                    merged["preferred_name_confidence"] = incoming_pref_conf
+                    changed = True
+            if _confidence_ge(incoming_pref_conf, "high"):
+                _metric_incr("name_write_high_confidence_total")
+        else:
+            _metric_incr("name_slot_pollution")
     if changed:
-        profile_json = _dump_profile_json(preferred_name=str(merged.get("preferred_name") or "").strip())
+        profile_json = _dump_profile_json(
+            preferred_name=str(merged.get("preferred_name") or "").strip(),
+            name_confidence=str(merged.get("name_confidence") or "none"),
+            preferred_name_confidence=str(merged.get("preferred_name_confidence") or "none"),
+        )
         with _db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -515,7 +578,7 @@ def _evidence_advice_v1_enabled() -> bool:
 
 
 def _time_patch_v1_enabled() -> bool:
-    return _feature_enabled("TIME_PATCH_V1", False)
+    return _feature_enabled("TIME_PATCH_V1", True)
 
 
 def get_v2_flags() -> dict[str, bool]:
@@ -683,6 +746,45 @@ def _has_explicit_window(text: str) -> bool:
     return False
 
 
+def _is_long_horizon_query(query: str) -> bool:
+    q = str(query or "")
+    if not q:
+        return False
+    return bool(
+        re.search(
+            r"(本月|这个月|今年|本年|明年|后年|去年|前年|上半年|下半年|全年|年度|未来(?:的)?[一二两三四五六七八九1-9]年|[一二两三四五六七八九1-9]年内|未来三年|接下来一个月|未来30天|20\d{2}(?:年)?\s*(?:和|跟|与|对比|比较)\s*20\d{2}(?:年)?)",
+            q,
+        )
+    )
+
+
+def _has_long_horizon_shrink(text: str) -> bool:
+    out = str(text or "")
+    if not out:
+        return False
+    return bool(re.search(r"(这三天|最近三天|未来三天|接下来三天|2月27日到3月1日)", out))
+
+
+def _has_fact_hallucination(query: str, output: str, profile: dict | None = None) -> bool:
+    if not _is_identity_fact_query(query):
+        return False
+    out = str(output or "")
+    p = profile or {}
+    known_name = str(p.get("preferred_name") or "").strip() or str(p.get("name") or "").strip()
+    if not known_name:
+        if re.search(r"(你叫|你是)\s*[^\s，。！？,.]{2,12}", out) and not re.search(r"(不知道|还没有|没记录|告诉我)", out):
+            return True
+        if re.search(r"(19|20)\d{2}年\d{1,2}月\d{1,2}日", out):
+            return True
+        return False
+    if known_name in out:
+        return False
+    m = re.search(r"(你叫|你是)\s*([^\s，。！？,.]{2,12})", out)
+    if m and str(m.group(2) or "").strip() != known_name:
+        return True
+    return False
+
+
 def _is_clarify_reply(text: str) -> bool:
     out = str(text or "")
     return bool(re.search(r"(你是什么星座|告诉我你的星座|先告诉我.*星座|你是哪个星座)", out))
@@ -800,6 +902,16 @@ def track_output_quality(
         if _has_explicit_window(text):
             _metric_incr("colloquial_window_hit")
 
+    if _is_long_horizon_query(query):
+        _metric_incr("long_horizon_total")
+        if _has_long_horizon_shrink(text):
+            _metric_incr("long_horizon_shrink_total")
+
+    if _is_identity_fact_query(query):
+        _metric_incr("fact_check_total")
+        if _has_fact_hallucination(query, text, profile=profile):
+            _metric_incr("fact_hallucination_total")
+
 
 def _safe_int(value) -> int:
     try:
@@ -892,6 +1004,21 @@ def get_quality_metrics(days: int = 1) -> dict:
         ),
         "time_validation_autofix_rate": _calc_rate(
             totals.get("time_validation_autofix_total", 0), totals.get("time_validation_fail_total", 0)
+        ),
+        "time_guard_overwrite_rate": _calc_rate(
+            totals.get("time_guard_overwrite_total", 0), totals.get("time_guard_total", 0)
+        ),
+        "name_slot_pollution_rate": _calc_rate(
+            totals.get("name_slot_pollution", 0), totals.get("name_slot_total", 0)
+        ),
+        "name_write_high_confidence_rate": _calc_rate(
+            totals.get("name_write_high_confidence_total", 0), totals.get("name_write_total", 0)
+        ),
+        "long_horizon_shrink_rate": _calc_rate(
+            totals.get("long_horizon_shrink_total", 0), totals.get("long_horizon_total", 0)
+        ),
+        "fact_hallucination_rate": _calc_rate(
+            totals.get("fact_hallucination_total", 0), totals.get("fact_check_total", 0)
         ),
     }
     return {"days": span, "totals": totals, "rates": rates, "series": series}
@@ -1118,6 +1245,8 @@ RELATIVE_WINDOW_PATTERN = re.compile(
     r"(本周|这周|下周|最近一周|这一周|近几天|这几天|哪几天|哪天|最近两天|这两天|本月|这个月|"
     r"今年|本年|明年|后年|去年|前年|上半年|下半年|全年|年度|"
     r"(?:未来|接下来)(?:的)?(?:[一二两三四五六七八九]|[1-9])年|(?:[一二两三四五六七八九]|[1-9])年内|"
+    r"(?:今年|明年|后年|去年|前年)\s*(?:和|跟|与|对比|比较)\s*(?:今年|明年|后年|去年|前年)|"
+    r"(?:20\d{2})(?:年)?\s*(?:和|跟|与|对比|比较)\s*(?:20\d{2})(?:年)?|"
     r"接下来(?:的)?一个月|未来(?:的)?一个月|接下来1个月|未来1个月|接下来30天|未来30天|"
     r"接下来(?:的)?一段时间|未来(?:的)?一段时间|接下来这段时间|未来这段时间|后面一段时间|之后一段时间)"
 )
@@ -1125,6 +1254,10 @@ RELATIVE_WINDOW_PATTERN = re.compile(
 
 def _cn_day(dt: datetime) -> str:
     return f"{dt.month}月{dt.day}日（{_weekday_cn_from_date(dt.year, dt.month, dt.day)}）"
+
+
+def _cn_day_with_year(dt: datetime) -> str:
+    return f"{dt.year}年{dt.month}月{dt.day}日（{_weekday_cn_from_date(dt.year, dt.month, dt.day)}）"
 
 
 def _cn_num_to_int(token: str) -> int | None:
@@ -1209,8 +1342,8 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
         else:
             end = now.replace(year=year, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
         label = "year_partial"
-    elif re.findall(r"(20\d{2})年", q):
-        explicit_years = [int(x) for x in re.findall(r"(20\d{2})年", q)]
+    elif re.findall(r"(?<!\d)(20\d{2})(?:年)?(?!\d)", q):
+        explicit_years = [int(x) for x in re.findall(r"(?<!\d)(20\d{2})(?:年)?(?!\d)", q)]
         y0 = min(explicit_years)
         y1 = max(explicit_years)
         if y0 == y1:
@@ -1220,19 +1353,22 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
         else:
             start = now.replace(year=y0, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
             end = now.replace(year=y1, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
-            label = "explicit_year_span"
+            if re.search(r"(对比|比较|和|跟|与)", q):
+                label = "compare_year_span"
+            else:
+                label = "explicit_year_span"
     elif ("去年" in q and "今年" in q) or ("前年" in q and "去年" in q):
         y0 = anchor_year - 1 if "去年" in q else anchor_year - 2
         y1 = anchor_year
         start = now.replace(year=y0, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
         end = now.replace(year=y1, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
-        label = "relative_year_span"
+        label = "compare_year_span" if re.search(r"(对比|比较|和|跟|与)", q) else "relative_year_span"
     elif ("今年" in q and "明年" in q) or ("明年" in q and "后年" in q):
         y0 = anchor_year if "今年" in q else anchor_year + 1
         y1 = anchor_year + 1 if "今年" in q else anchor_year + 2
         start = now.replace(year=y0, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
         end = now.replace(year=y1, month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
-        label = "relative_year_span"
+        label = "compare_year_span" if re.search(r"(对比|比较|和|跟|与)", q) else "relative_year_span"
     elif re.search(r"(今年|本年|全年|年度)", q):
         start, end, label = _build_year_window(now, anchor_year, half=half_flag)
     elif re.search(r"(明年)", q):
@@ -1311,7 +1447,11 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
     span_days = max(1, (end.date() - start.date()).days + 1)
     day_limit = span_days if label in {"this_month", "next_30_days", "coming_period"} else 14
     days = _enumerate_days(start, end, limit=day_limit)
-    window_text = f"{_cn_day(start)}至{_cn_day(end)}"
+    year_span_labels = {"compare_year_span", "explicit_year_span", "relative_year_span"}
+    if label in year_span_labels or start.year != end.year:
+        window_text = f"{_cn_day_with_year(start)}至{_cn_day_with_year(end)}"
+    else:
+        window_text = f"{_cn_day(start)}至{_cn_day(end)}"
     return {
         "label": label,
         "now_ts": now.isoformat(timespec="seconds"),
@@ -1338,11 +1478,36 @@ def is_time_sensitive_query(query: str) -> bool:
     return bool(TIME_SENSITIVE_QUERY_PATTERN.search(str(query or "")))
 
 
+def _need_time_window(query: str, question_type: str = "default") -> bool:
+    q = str(query or "")
+    qtype = str(question_type or "default")
+    if qtype in {"trend", "colloquial"}:
+        return True
+    if RELATIVE_WINDOW_PATTERN.search(q):
+        return True
+    return bool(re.search(r"(今天|本周|这周|下周|本月|这个月|上半年|下半年|今年|本年|明年|后年|去年|前年)", q))
+
+
+def _should_show_window_text(query: str, window_label: str, question_type: str = "default") -> bool:
+    q = str(query or "")
+    label = str(window_label or "")
+    if NEAR_DAYS_QUERY_PATTERN.search(q):
+        return True
+    if question_type in {"colloquial"} and label in {"near_days", "two_days", "this_week", "next_week"}:
+        return True
+    if label in {"near_days", "two_days", "this_week", "next_week"}:
+        return True
+    return False
+
+
 def _expected_year_from_query(query: str, time_anchor: dict) -> int | None:
     q = str(query or "")
     try:
         anchor_year = int(str(time_anchor.get("today_date") or "2000-01-01").split("-")[0])
     except Exception:
+        return None
+    relative_tokens = ["前年", "去年", "今年", "本年", "明年", "后年"]
+    if sum(1 for t in relative_tokens if t in q) >= 2:
         return None
     if "后年" in q:
         return anchor_year + 2
@@ -1379,13 +1544,6 @@ def _build_time_safe_fallback(query: str, time_anchor: dict, window_meta: dict |
     utc_offset = str(time_anchor.get("utc_offset") or "")
     near_days = time_anchor.get("near_days") or []
     q = str(query or "")
-    if window_meta and RELATIVE_WINDOW_PATTERN.search(q):
-        window_text = str(window_meta.get("window_text") or "").strip()
-        if window_text:
-            return (
-                f"呀哈～我先把时间对齐：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。\n"
-                f"你问的时间窗口按这个范围计算：{window_text}。"
-            )
     if NEAR_DAYS_QUERY_PATTERN.search(q) and near_days:
         window_text = "、".join(
             [f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")]
@@ -1446,11 +1604,63 @@ def _pick_closest_allowed_date(target_date: str, allowed_dates: set[str]) -> str
     return best
 
 
+def _allowed_years_from_window(window_meta: dict | None) -> set[int]:
+    if not isinstance(window_meta, dict):
+        return set()
+    years: set[int] = set()
+    for key in ("window_start", "window_end"):
+        value = str(window_meta.get(key) or "").strip()
+        m = re.match(r"^(20\d{2})-\d{2}-\d{2}$", value)
+        if not m:
+            continue
+        years.add(int(m.group(1)))
+    if len(years) >= 2:
+        y0 = min(years)
+        y1 = max(years)
+        years = set(range(y0, y1 + 1))
+    return years
+
+
+def _date_within_window(date_str: str, window_meta: dict | None) -> bool:
+    if not isinstance(window_meta, dict):
+        return False
+    start = str(window_meta.get("window_start") or "").strip()
+    end = str(window_meta.get("window_end") or "").strip()
+    if not start or not end:
+        return False
+    try:
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        low = datetime.strptime(start, "%Y-%m-%d").date()
+        high = datetime.strptime(end, "%Y-%m-%d").date()
+    except Exception:
+        return False
+    if low > high:
+        low, high = high, low
+    return low <= target <= high
+
+
+def _short_md_has_any_valid_year_in_window(month: int, day: int, window_meta: dict | None) -> bool:
+    if not isinstance(window_meta, dict):
+        return False
+    years = _allowed_years_from_window(window_meta)
+    if not years:
+        return False
+    for year in sorted(years):
+        try:
+            dt = datetime(year=year, month=int(month), day=int(day))
+        except Exception:
+            continue
+        if _date_within_window(dt.strftime("%Y-%m-%d"), window_meta):
+            return True
+    return False
+
+
 def _patch_time_text_locally(
     out: str,
     query: str,
     time_anchor: dict,
     allowed_dates: set[str],
+    window_meta: dict | None = None,
 ) -> tuple[str, int, bool]:
     patched = str(out or "")
     conflict_count = 0
@@ -1471,15 +1681,21 @@ def _patch_time_text_locally(
 
     if RELATIVE_WINDOW_PATTERN.search(str(query or "")):
         anchor_year = int(str(time_anchor.get("today_date") or "2000-01-01").split("-")[0])
+        allowed_years = _allowed_years_from_window(window_meta)
         full_matches = list(DATE_FULL_PATTERN.finditer(patched))
         for m in reversed(full_matches):
             year = int(m.group(1))
             month = int(m.group(2))
             day = int(m.group(3))
             date_str = f"{year:04d}-{month:02d}-{day:02d}"
-            if abs(year - anchor_year) >= 2:
+            if allowed_years:
+                if year not in allowed_years:
+                    severe_mismatch = True
+            elif abs(year - anchor_year) >= 2 and _expected_year_from_query(query, time_anchor) is None:
                 severe_mismatch = True
             if allowed_dates and date_str not in allowed_dates:
+                if _date_within_window(date_str, window_meta):
+                    continue
                 conflict_count += 1
                 replacement = _pick_closest_allowed_date(date_str, allowed_dates)
                 patched = patched[:m.start()] + _iso_to_cn(replacement, short=False) + patched[m.end():]
@@ -1490,14 +1706,22 @@ def _patch_time_text_locally(
                 continue
             month = int(m.group(1))
             day = int(m.group(2))
+            if _short_md_has_any_valid_year_in_window(month, day, window_meta):
+                continue
             date_str = f"{anchor_year:04d}-{month:02d}-{day:02d}"
             if allowed_dates and date_str not in allowed_dates:
+                if _date_within_window(date_str, window_meta):
+                    continue
                 conflict_count += 1
                 replacement = _pick_closest_allowed_date(date_str, allowed_dates)
                 patched = patched[:m.start()] + _iso_to_cn(replacement, short=True) + patched[m.end():]
         years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(patched)}
-        if years and any(abs(y - anchor_year) >= 2 for y in years):
-            severe_mismatch = True
+        if years:
+            if allowed_years and any(y not in allowed_years for y in years):
+                severe_mismatch = True
+            elif not allowed_years and any(abs(y - anchor_year) >= 2 for y in years):
+                if _expected_year_from_query(query, time_anchor) is None:
+                    severe_mismatch = True
 
     expected_year = _expected_year_from_query(query, time_anchor)
     if expected_year is not None:
@@ -1509,7 +1733,7 @@ def _patch_time_text_locally(
             conflict_count += 1
             patched = patched[:m.start(1)] + str(expected_year) + patched[m.end(1):]
 
-    if conflict_count >= 3:
+    if conflict_count >= 6:
         severe_mismatch = True
     return patched, conflict_count, severe_mismatch
 
@@ -1522,6 +1746,7 @@ def _validate_time_consistency_legacy(text: str, query: str, time_anchor: dict, 
     if not is_time_sensitive_query(q) and not is_bazi_fortune_query(q):
         return out
     _metric_incr("temporal_consistency_total")
+    _metric_incr("time_guard_total")
 
     allowed_dates = _collect_allowed_dates(time_anchor, window_meta=window_meta)
     for m in DATE_WEEKDAY_PATTERN.finditer(out):
@@ -1577,6 +1802,36 @@ def _validate_time_consistency_legacy(text: str, query: str, time_anchor: dict, 
     return out
 
 
+def _strip_time_alignment_sentences(text: str) -> str:
+    normalized = str(text or "").replace("\\n", "\n")
+    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+    kept: list[str] = []
+    for line in lines:
+        if re.search(
+            r"(时间对齐|当前时间|现在是|你问的时间窗口按这个范围计算|时间窗口按这个范围计算|时间窗口是|窗口计算|今天起|近几天|UTC|Asia/Shanghai)",
+            line,
+        ):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _extract_business_sentences(text: str) -> str:
+    normalized = str(text or "").replace("\\n", "\n")
+    if not normalized.strip():
+        return ""
+    pieces = [p.strip() for p in re.split(r"[\n。！？!?；;]+", normalized) if p.strip()]
+    if not pieces:
+        return ""
+    kept: list[str] = []
+    for piece in pieces:
+        if re.search(r"(时间对齐|当前时间|现在是|时间窗口按这个范围计算|时间窗口是|UTC|Asia/Shanghai)", piece):
+            continue
+        if re.search(r"(结论|建议|先|避免|适合|财运|事业|感情|学业|风险)", piece):
+            kept.append(piece)
+    return "。".join(kept).strip()
+
+
 def validate_time_consistency(text: str, query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
     if not _time_patch_v1_enabled():
         return _validate_time_consistency_legacy(text, query, time_anchor, window_meta=window_meta)
@@ -1588,14 +1843,28 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
     if not is_time_sensitive_query(q) and not is_bazi_fortune_query(q):
         return out
     _metric_incr("temporal_consistency_total")
+    _metric_incr("time_guard_total")
 
     allowed_dates = _collect_allowed_dates(time_anchor, window_meta=window_meta)
-    patched, conflict_count, severe_mismatch = _patch_time_text_locally(out, q, time_anchor, allowed_dates)
+    patched, conflict_count, severe_mismatch = _patch_time_text_locally(
+        out,
+        q,
+        time_anchor,
+        allowed_dates,
+        window_meta=window_meta,
+    )
     if severe_mismatch:
         _metric_incr("time_validation_fail_total")
         _metric_incr("time_validation_autofix_total")
         _metric_incr("temporal_consistency_fail")
-        return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
+        safe = _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
+        residual = _strip_time_alignment_sentences(patched)
+        if not residual:
+            residual = _extract_business_sentences(patched)
+        if residual:
+            return f"{safe}\n\n{residual}".strip()
+        _metric_incr("time_guard_overwrite_total")
+        return safe
     if conflict_count > 0:
         _metric_incr("time_validation_fail_total")
         _metric_incr("time_validation_autofix_total")
@@ -1604,11 +1873,20 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
     return patched
 
 
-def get_fast_reply(query: str, time_anchor: dict | None = None) -> str | None:
+def get_fast_reply(query: str, time_anchor: dict | None = None, profile: dict | None = None) -> str | None:
     raw_text = (query or "").strip()
     text = raw_text.lower()
     if not raw_text:
         return None
+    if _is_asking_own_name(raw_text):
+        p = profile or {}
+        call_name = str(p.get("preferred_name") or "").strip()
+        legal_name = str(p.get("name") or "").strip()
+        if _is_valid_call_name(call_name):
+            return f"我记得你喜欢我叫你{call_name}。"
+        if _is_valid_name(legal_name):
+            return f"我记得你叫{legal_name}。"
+        return "我这边还没有你的姓名记录。你可以直接告诉我“我叫XXX”。"
 
     # 时间/日期类问题：使用系统实时时间，避免大模型产生日期幻觉
     time_keywords = re.compile(
@@ -1687,13 +1965,69 @@ def _is_valid_call_name(name: str) -> bool:
     return True
 
 
-def _extract_preferred_name_from_query(query: str) -> str:
+def _looks_like_time_or_date_fragment(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if re.search(
+        r"(20\d{2}|19\d{2}|\d{1,2}[:：点时分]|今天|现在|时间|今年|明年|后年|本周|下周|本月|星期|周[一二三四五六日天])",
+        t,
+    ):
+        return True
+    if re.search(r"^\d+$", t):
+        return True
+    return False
+
+
+def _is_name_question_query(query: str) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    return bool(
+        re.search(r"(我叫什?么|我叫什么名字|我是谁|你知道我叫什?么|你记得我叫什?么|你记得我的名字|我叫什么你记得吗)", q)
+    )
+
+
+def _extract_legal_name_with_confidence(query: str) -> tuple[str, str]:
     source = str(query or "").strip()
     if not source:
-        return ""
+        return "", "none"
+    if _is_name_question_query(source):
+        return "", "none"
+    explicit_patterns = [
+        r"(?:我叫|我的名字是|名字是|姓名是)\s*([^\s，。！？,.]{2,16})",
+        r"^([^\s，。！？,.]{2,16})[，,\s]+(?:19|20)\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?",
+    ]
+    for pattern in explicit_patterns:
+        m = re.search(pattern, source)
+        if not m:
+            continue
+        candidate = str(m.group(1) or "").strip()
+        if not _is_valid_name(candidate):
+            continue
+        if _looks_like_time_or_date_fragment(candidate):
+            _metric_incr("name_slot_total")
+            _metric_incr("name_slot_pollution")
+            return "", "none"
+        _metric_incr("name_slot_total")
+        return candidate, "high"
+    if re.search(r"(我叫|名字是|姓名是|我是)", source):
+        _metric_incr("name_slot_total")
+        _metric_incr("name_slot_pollution")
+    return "", "none"
+
+
+def _extract_preferred_name_with_confidence(query: str, allow_soft: bool = False) -> tuple[str, str]:
+    source = str(query or "").strip()
+    if not source:
+        return "", "none"
+    if _is_name_question_query(source):
+        return "", "none"
+    if is_time_sensitive_query(source) and not re.search(r"(叫我|喊我|称呼我)", source):
+        return "", "none"
     patterns = [
         r"(?:你可以|以后|之后)?(?:叫我|喊我|称呼我)\s*([^\s，。！？,.]{1,12})",
-        r"(?<!我)叫\s*([^\s，。！？,.]{1,12})\s*(?:就行|即可|吧|呀|啦|哦|喔)",
+        r"(?<!我)(?:叫我|喊我)\s*([^\s，。！？,.]{1,12})\s*(?:就行|即可|吧|呀|啦|哦|喔)",
     ]
     for pattern in patterns:
         m = re.search(pattern, source)
@@ -1701,14 +2035,32 @@ def _extract_preferred_name_from_query(query: str) -> str:
             continue
         candidate = str(m.group(1) or "").strip()
         candidate = re.sub(r"(吧|呀|啦|哦|喔|呢)$", "", candidate).strip()
-        if _is_valid_call_name(candidate):
-            return candidate
-    normalized = re.sub(r"[\s，。！？,.!？、；;:：]", "", source)
-    normalized = re.sub(r"^(那就|就|那|嗯|啊|呀|呜啦|呀哈)", "", normalized).strip()
-    normalized = re.sub(r"(吧|呀|啦|哦|喔|呢|就行|即可)$", "", normalized).strip()
-    if 1 <= len(normalized) <= 6 and _is_valid_call_name(normalized):
-        return normalized
-    return ""
+        if not _is_valid_call_name(candidate):
+            _metric_incr("name_slot_total")
+            _metric_incr("name_slot_pollution")
+            return "", "none"
+        if _looks_like_time_or_date_fragment(candidate):
+            _metric_incr("name_slot_total")
+            _metric_incr("name_slot_pollution")
+            return "", "none"
+        _metric_incr("name_slot_total")
+        return candidate, "high"
+    if allow_soft:
+        normalized = re.sub(r"[\s，。！？,.!？、；;:：]", "", source)
+        normalized = re.sub(r"^(那就|就|那|嗯|啊|呀|呜啦|呀哈)", "", normalized).strip()
+        normalized = re.sub(r"(吧|呀|啦|哦|喔|呢|就行|即可)$", "", normalized).strip()
+        if 1 <= len(normalized) <= 6 and _is_valid_call_name(normalized) and not _looks_like_time_or_date_fragment(normalized):
+            _metric_incr("name_slot_total")
+            return normalized, "medium"
+    if re.search(r"(叫我|喊我|称呼我|昵称|名字)", source):
+        _metric_incr("name_slot_total")
+        _metric_incr("name_slot_pollution")
+    return "", "none"
+
+
+def _extract_preferred_name_from_query(query: str) -> str:
+    preferred_name, _ = _extract_preferred_name_with_confidence(query, allow_soft=False)
+    return preferred_name
 
 
 def _is_asking_own_name(query: str) -> bool:
@@ -1718,6 +2070,15 @@ def _is_asking_own_name(query: str) -> bool:
     return bool(
         re.search(r"(我叫什?么|我是谁|我的名字|你知道我叫什?么|你知道我的名字|我叫什么名字|记得我叫)", q)
     )
+
+
+def _is_identity_fact_query(query: str) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    if _is_asking_own_name(q):
+        return True
+    return bool(re.search(r"(你记得我吗|你记得我是谁吗|我是谁你还记得吗)", q))
 
 
 def _name_alias_candidates(name: str) -> list[str]:
@@ -1752,6 +2113,8 @@ def _pick_address_name(profile: dict | None, user_query: str = "") -> str:
     name = str(p.get("name") or "").strip()
     if not _is_valid_name(name):
         return "你"
+    if _is_identity_fact_query(user_query):
+        return name
     if not _is_asking_own_name(user_query):
         return "你"
     aliases = _name_alias_candidates(name)
@@ -1770,7 +2133,9 @@ def _is_name_intro_query(query: str, extracted: dict[str, str] | None = None) ->
     e = extracted or {}
     if not str(e.get("name") or "").strip():
         return False
-    if re.search(r"(我叫|名字是|姓名是|我是|^.{1,16}\s*[，,]\s*(?:19|20)\d{2})", q):
+    if not _confidence_ge(str(e.get("name_confidence") or "none"), "high"):
+        return False
+    if re.search(r"(我叫|名字是|姓名是|^.{1,16}\s*[，,]\s*(?:19|20)\d{2})", q):
         return True
     return False
 
@@ -1802,26 +2167,20 @@ def _is_preferred_name_prompt_pending(session_id: str) -> bool:
 def extract_profile_from_query(query: str) -> dict[str, str]:
     source = (query or "").strip()
     profile: dict[str, str] = {}
-    name_match = re.search(r"(?:我叫|名字是|姓名是|我是)\s*([^\s，。！？,.]{1,16})", source)
-    if name_match and _is_valid_name(name_match.group(1)):
-        profile["name"] = name_match.group(1).strip()
-    # 兼容“姓名 + 出生日期(可含时间)”的裸输入，例如：刘芷华 2005-06-15 早上5:45
-    if not profile.get("name"):
-        bare_name_match = re.search(
-            r"^\s*([^\s，。！？,.]{2,16})\s*[，,\s]\s*(?:19|20)\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?",
-            source,
-        )
-        if bare_name_match and _is_valid_name(bare_name_match.group(1)):
-            profile["name"] = bare_name_match.group(1).strip()
+    legal_name, legal_conf = _extract_legal_name_with_confidence(source)
+    if legal_name:
+        profile["name"] = legal_name
+        profile["name_confidence"] = legal_conf
     birthdate = _normalize_birthdate(source)
     if birthdate:
         profile["birthdate"] = birthdate
     birthtime = _normalize_birthtime(source)
     if birthtime:
         profile["birthtime"] = birthtime
-    preferred_name = _extract_preferred_name_from_query(source)
+    preferred_name, preferred_conf = _extract_preferred_name_with_confidence(source, allow_soft=False)
     if preferred_name:
         profile["preferred_name"] = preferred_name
+        profile["preferred_name_confidence"] = preferred_conf
     return profile
 
 
@@ -1829,7 +2188,14 @@ def merge_session_profile(session_id: str, current: dict[str, str]) -> dict[str,
     # session_id 在当前实现中绑定用户 uuid
     user = _get_user_by_uuid(session_id)
     if not user:
-        return {"name": "", "birthdate": "", "birthtime": "", "preferred_name": ""}
+        return {
+            "name": "",
+            "birthdate": "",
+            "birthtime": "",
+            "preferred_name": "",
+            "name_confidence": "none",
+            "preferred_name_confidence": "none",
+        }
     return _merge_profile_to_db(int(user["id"]), current)
 
 
@@ -1856,14 +2222,24 @@ def extract_profile_from_history(chat_message_history) -> dict[str, str]:
     try:
         messages = getattr(chat_message_history, "messages", []) or []
         for msg in messages:
+            role = str(getattr(msg, "type", "")).lower()
+            if role not in {"human", "user"}:
+                continue
             content = getattr(msg, "content", "")
             if not isinstance(content, str):
                 continue
             piece = extract_profile_from_query(content)
-            if piece.get("name") and not profile.get("name"):
+            current_name_conf = str(profile.get("name_confidence") or "none")
+            incoming_name_conf = str(piece.get("name_confidence") or "none")
+            if piece.get("name") and (
+                not profile.get("name")
+                or (_confidence_ge(incoming_name_conf, "high") and not _confidence_ge(current_name_conf, "high"))
+            ):
                 profile["name"] = piece["name"]
+                profile["name_confidence"] = incoming_name_conf
             if piece.get("preferred_name") and not profile.get("preferred_name"):
                 profile["preferred_name"] = piece["preferred_name"]
+                profile["preferred_name_confidence"] = str(piece.get("preferred_name_confidence") or "none")
             if piece.get("birthdate") and not profile.get("birthdate"):
                 profile["birthdate"] = piece["birthdate"]
             if piece.get("birthtime") and not profile.get("birthtime"):
@@ -1998,7 +2374,9 @@ FORTUNE_COLLOQUIAL_PATTERN = re.compile(r"(气场|更顺|顺不顺|哪几天|哪
 FORTUNE_TREND_PATTERN = re.compile(
     r"(本周|这周|最近一周|这一周|走势|趋势|节奏|上半段|下半段|"
     r"今年|本年|明年|后年|去年|前年|全年|年度|"
-    r"(?:未来|接下来)(?:的)?(?:[一二两三四五六七八九]|[1-9])年|(?:[一二两三四五六七八九]|[1-9])年内)"
+    r"(?:未来|接下来)(?:的)?(?:[一二两三四五六七八九]|[1-9])年|(?:[一二两三四五六七八九]|[1-9])年内|"
+    r"(?:今年|明年|后年|去年|前年)\s*(?:和|跟|与|对比|比较)\s*(?:今年|明年|后年|去年|前年)|"
+    r"(?:20\d{2})(?:年)?\s*(?:和|跟|与|对比|比较)\s*(?:20\d{2})(?:年)?)"
 )
 FORTUNE_ACTION_PATTERN = re.compile(r"(先做什么|第一步|怎么安排|如何安排|怎么排更稳|怎么做|怎么行动)")
 FORTUNE_SHORT_DECISION_PATTERN = re.compile(
@@ -2207,6 +2585,8 @@ def detect_question_type(query: str) -> str:
     q = str(query or "")
     if not q:
         return "default"
+    if _is_identity_fact_query(q):
+        return "identity_fact"
     if is_dream_query(q):
         return "dream"
     if is_time_sensitive_query(q) and not (is_zodiac_intent_query(q) or is_bazi_fortune_query(q)):
@@ -2571,8 +2951,24 @@ def _generate_fortune_reply_with_model(
         return ""
     if str(question_type or "") in {"decision", "comparison"} and not _is_direct_answer_hit(q, out):
         out = f"先给你结论：{_decision_conclusion_from_query(q, strength)}。\n{out}"
-    if str(question_type or "") in {"trend", "colloquial"} and window_text and window_text not in out:
+    if (
+        str(question_type or "") in {"trend", "colloquial"}
+        and window_text
+        and window_text not in out
+        and _should_show_window_text(q, window_label, question_type=str(question_type or "default"))
+    ):
         out = f"时间上先对齐：{window_text}。\n{out}"
+    if window_text and not _should_show_window_text(q, window_label, question_type=str(question_type or "default")):
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        filtered: list[str] = []
+        for line in lines:
+            if window_text and window_text in line:
+                continue
+            if re.search(r"(时间上先对齐|时间窗口|从\\d{1,2}月\\d{1,2}日到\\d{1,2}月\\d{1,2}日)", line):
+                continue
+            filtered.append(line)
+        if filtered:
+            out = "\n".join(filtered).strip()
     long_horizon_labels = {
         "this_month",
         "next_30_days",
@@ -2585,11 +2981,13 @@ def _generate_fortune_reply_with_model(
         "multi_year",
         "explicit_year",
         "explicit_year_span",
+        "compare_year_span",
         "relative_year_span",
     }
     if window_label in long_horizon_labels:
         out = re.sub(r"接下来这三天[，、,:：\-\s]*", "", out)
         out = re.sub(r"最近三天", "这个时间范围内", out)
+        out = re.sub(r"三天内", "这个阶段内", out)
         out = re.sub(r"这三天", "这个阶段", out)
     return _ensure_jiyi_tone(out)
 
@@ -2748,7 +3146,8 @@ def _render_user_fortune_reply_v2_legacy(
 
     if question_type in {"trend", "colloquial"} and isinstance(window_meta, dict):
         window_text = str(window_meta.get("window_text") or "").strip()
-        if window_text:
+        window_label = str(window_meta.get("label") or "").strip()
+        if window_text and _should_show_window_text(query, window_label, question_type=question_type):
             lines.append(f"时间窗口：{window_text}。")
 
     signal_line = _signal_for_topic(payload, topic)
@@ -2862,7 +3261,8 @@ def render_user_fortune_reply_v2(
     window_line = ""
     if question_type in {"trend", "colloquial"} and isinstance(window_meta, dict):
         window_text = str(window_meta.get("window_text") or "").strip()
-        if window_text:
+        window_label = str(window_meta.get("label") or "").strip()
+        if window_text and _should_show_window_text(query, window_label, question_type=question_type):
             window_line = f"时间窗口：{window_text}。"
     signal_line = _signal_for_topic(payload, topic)
     basis = _basis_line(payload)
@@ -2987,9 +3387,7 @@ def route_fortune_pipeline(
         return None, None
     anchor = time_anchor or build_time_anchor()
     active_flags = flags or dict(V2_FLAG_DEFAULTS)
-    need_window = bool(active_flags.get("window_v2")) and (
-        question_type in {"trend", "colloquial"} or RELATIVE_WINDOW_PATTERN.search(q) or is_time_sensitive_query(q)
-    )
+    need_window = bool(active_flags.get("window_v2")) and _need_time_window(q, question_type=question_type)
     window_meta = date_window_resolver(q, anchor) if need_window else None
 
     if is_divination_query(q) and not is_bazi_fortune_query(q):
@@ -3237,6 +3635,15 @@ def sanitize_output(text: str, user_query: str = "", profile: dict | None = None
     out = "\n".join(deduped)
     out = re.sub(r"\n{3,}", "\n\n", out)
 
+    if _is_identity_fact_query(user_query):
+        out = strip_profile_echo(out.strip(), profile=profile, user_query=user_query)
+        out = re.sub(r"(19|20)\d{2}年\d{1,2}月\d{1,2}日", "你的生日", out)
+        out = re.sub(r"(清晨|凌晨|早上|上午|中午|下午|晚上)\s*\d{1,2}[:：点]\d{0,2}", "你的出生时段", out)
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if len(lines) > 2:
+            out = "\n".join(lines[:2])
+        return out.strip()
+
     emotion_level = detect_emotion_level(user_query)
     out = diversify_fortune_opening(out.strip(), user_query=user_query)
     # 降低硬编码后处理，避免把模型答案“模板化”
@@ -3246,6 +3653,38 @@ def sanitize_output(text: str, user_query: str = "", profile: dict | None = None
         out = add_recovery_tail(out, emotion_level)
     out = add_light_jiyi_particle(out, user_query=user_query)
     return out.strip()
+
+
+def _is_time_alignment_only_answer(text: str) -> bool:
+    out = str(text or "").strip()
+    if not out:
+        return True
+    if "时间对齐" not in out and "时间窗口" not in out:
+        return False
+    residue = _strip_time_alignment_sentences(out)
+    if not residue:
+        return True
+    return len(residue) < 18 and not re.search(r"(建议|结论|先|避免|适合|不宜|财运|事业|感情|学业)", residue)
+
+
+def _enforce_min_answer_contract(output: str, query: str, question_type: str) -> str:
+    out = str(output or "").strip()
+    if not out:
+        return out
+    qtype = str(question_type or "default")
+    enforce = qtype in {"trend", "colloquial", "decision"} or is_bazi_fortune_query(query)
+    if not enforce:
+        return out
+    if not _is_time_alignment_only_answer(out):
+        return out
+    topic = detect_fortune_topic(query)
+    if qtype == "decision":
+        tail = f"先给你方向：{_decision_conclusion_from_query(query, 'balanced')}。"
+    else:
+        tail = "先给你一个方向：别只盯日期，把重点放在可执行动作上。"
+    advice = _default_fortune_advice(topic, "balanced")[0]
+    _metric_incr("time_guard_overwrite_total")
+    return f"{out}\n\n{tail}今天先执行：{advice}".strip()
 
 
 def maybe_append_preferred_name_probe(output: str, session_id: str, should_probe: bool = False) -> str:
@@ -3655,7 +4094,14 @@ async def chat(request: Request, payload: ChatRequest):
     if not auth:
         return JSONResponse({"output": "请先登录后再继续聊天。"}, status_code=401)
     response_data = {"session_id": str(uuid.uuid4().hex), "output": "天机暂时紊乱，请稍后再试。"}
-    profile: dict[str, str] = {"name": "", "birthdate": "", "birthtime": "", "preferred_name": ""}
+    profile: dict[str, str] = {
+        "name": "",
+        "birthdate": "",
+        "birthtime": "",
+        "preferred_name": "",
+        "name_confidence": "none",
+        "preferred_name_confidence": "none",
+    }
     session_id = ""
     time_anchor = build_time_anchor()
     flag_snapshot = dict(V2_FLAG_DEFAULTS)
@@ -3683,9 +4129,7 @@ async def chat(request: Request, payload: ChatRequest):
             else:
                 domain_intent = "general"
             question_type = "default"
-        if flags.get("window_v2") and (
-            question_type in {"trend", "colloquial"} or RELATIVE_WINDOW_PATTERN.search(str(query or ""))
-        ):
+        if flags.get("window_v2") and _need_time_window(query, question_type=question_type):
             window_meta = date_window_resolver(query, time_anchor)
 
         phone = str(auth.get("phone", ""))
@@ -3701,16 +4145,17 @@ async def chat(request: Request, payload: ChatRequest):
         pending_preferred_name_prompt = _is_preferred_name_prompt_pending(session_id)
         extracted = extract_profile_from_query(query)
         if pending_preferred_name_prompt and not str(extracted.get("preferred_name") or "").strip():
-            pending_name = _extract_preferred_name_from_query(query)
+            pending_name, pending_conf = _extract_preferred_name_with_confidence(query, allow_soft=True)
             if pending_name:
                 extracted["preferred_name"] = pending_name
+                extracted["preferred_name_confidence"] = pending_conf
         profile = merge_session_profile(session_id, extracted)
         preferred_name_set_this_turn = bool(str(extracted.get("preferred_name") or "").strip())
         if preferred_name_set_this_turn:
             _set_preferred_name_prompt_pending(session_id, False)
         should_probe_preferred_name = _is_name_intro_query(query, extracted) and not str(profile.get("preferred_name") or "").strip()
 
-        def _postprocess_output(raw_output: str) -> str:
+        def _postprocess_output(raw_output: str, qtype: str = question_type) -> str:
             out = sanitize_output(raw_output, user_query=query, profile=profile)
             chosen = str(profile.get("preferred_name") or "").strip()
             if preferred_name_set_this_turn and chosen and chosen not in out:
@@ -3720,16 +4165,17 @@ async def chat(request: Request, payload: ChatRequest):
                 session_id=session_id,
                 should_probe=should_probe_preferred_name,
             )
+            out = _enforce_min_answer_contract(out, query=query, question_type=qtype)
             return out
 
         emotion_level = detect_emotion_level(query)
         is_fortune_intent = domain_intent in {"fortune", "zodiac", "divination"}
         if is_fortune_intent:
             _metric_incr("fortune_intent_total")
-        fast_reply = get_fast_reply(query, time_anchor=time_anchor)
+        fast_reply = get_fast_reply(query, time_anchor=time_anchor, profile=profile)
         if fast_reply:
             safe_fast_reply = validate_time_consistency(fast_reply, query, time_anchor, window_meta=window_meta)
-            safe_fast_reply = _postprocess_output(safe_fast_reply)
+            safe_fast_reply = _postprocess_output(safe_fast_reply, qtype=question_type)
             if profile.get("name") or profile.get("birthdate"):
                 response_data = {"session_id": session_id, "output": safe_fast_reply}
             else:
@@ -3754,6 +4200,7 @@ async def chat(request: Request, payload: ChatRequest):
         if dream_reply is not None:
             out = _postprocess_output(dream_reply)
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            out = _enforce_min_answer_contract(out, query=query, question_type="dream")
             _append_chat_history(chat_message_history, query, out)
             d_qtype = str(((dream_meta or {}).get("question_type") if isinstance(dream_meta, dict) else "") or "dream")
             track_output_quality(
@@ -3778,9 +4225,10 @@ async def chat(request: Request, payload: ChatRequest):
         if zodiac_reply is not None:
             if is_fortune_intent:
                 _metric_incr("fortune_route_hit_total")
-            out = _postprocess_output(zodiac_reply)
             z_qtype = str(((zodiac_meta or {}).get("question_type") if isinstance(zodiac_meta, dict) else "") or question_type)
+            out = _postprocess_output(zodiac_reply, qtype=z_qtype)
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            out = _enforce_min_answer_contract(out, query=query, question_type=z_qtype)
             _append_chat_history(chat_message_history, query, out)
             track_output_quality(
                 session_id,
@@ -3818,7 +4266,7 @@ async def chat(request: Request, payload: ChatRequest):
         if fortune_reply is not None:
             if is_fortune_intent:
                 _metric_incr("fortune_route_hit_total")
-            out = _postprocess_output(fortune_reply)
+            out = _postprocess_output(fortune_reply, qtype=fortune_qtype)
             if not window_meta and isinstance(fortune_payload, dict):
                 if str(fortune_payload.get("window_start") or "").strip() and str(fortune_payload.get("window_end") or "").strip():
                     window_meta = {
@@ -3827,6 +4275,7 @@ async def chat(request: Request, payload: ChatRequest):
                         "window_text": str(fortune_payload.get("window_text") or ""),
                     }
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
+            out = _enforce_min_answer_contract(out, query=query, question_type=fortune_qtype)
             _append_chat_history(chat_message_history, query, out)
             qtype_for_metrics = str((fortune_payload or {}).get("question_type") or fortune_qtype)
             track_output_quality(
@@ -3887,14 +4336,17 @@ async def chat(request: Request, payload: ChatRequest):
         if isinstance(result, dict):
             if 'output' in result:
                 logger.info(f"/chat接口最终输出: {result['output']}")
-                response_data["output"] = _postprocess_output(result['output'])
+                response_data["output"] = _postprocess_output(result['output'], qtype=question_type)
             else:
                 logger.info(f"/chat接口最终输出(无output字段): {str(result)}")
-                response_data["output"] = _postprocess_output(str(result))
+                response_data["output"] = _postprocess_output(str(result), qtype=question_type)
         else:
             logger.info(f"/chat接口最终输出(非dict): {str(result)}")
-            response_data["output"] = _postprocess_output(str(result))
+            response_data["output"] = _postprocess_output(str(result), qtype=question_type)
         response_data["output"] = validate_time_consistency(response_data["output"], query, time_anchor, window_meta=window_meta)
+        response_data["output"] = _enforce_min_answer_contract(
+            response_data["output"], query=query, question_type=question_type
+        )
         track_output_quality(
             session_id,
             response_data.get("output", ""),

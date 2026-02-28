@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-temporal-consistency-hit-rate", type=float, default=0.99, help="时序一致性命中率下限")
     parser.add_argument("--max-weekday-mismatch-count", type=float, default=0.0, help="日期星期错配数上限")
     parser.add_argument("--min-observability-coverage", type=float, default=0.99, help="观测日志覆盖率下限")
+    parser.add_argument("--max-time-guard-overwrite-rate", type=float, default=0.02, help="时间守卫覆盖业务回答率上限")
+    parser.add_argument("--max-name-slot-pollution-rate", type=float, default=0.005, help="姓名槽位污染率上限")
+    parser.add_argument("--min-name-write-high-confidence-rate", type=float, default=0.95, help="姓名高置信写入率下限")
+    parser.add_argument("--max-long-horizon-shrink-rate", type=float, default=0.01, help="长周期收缩到三天比率上限")
+    parser.add_argument("--max-fact-hallucination-rate", type=float, default=0.005, help="事实问答幻觉率上限")
     parser.add_argument("--legacy-metrics", action="store_true", help="使用旧版模板指标门禁")
     return parser.parse_args()
 
@@ -85,8 +90,14 @@ def main() -> int:
     colloquial_window = _to_float(rates.get("colloquial_window_hit_rate"))
     temporal_hit = _to_float(rates.get("temporal_consistency_hit_rate"))
     observability = _to_float(rates.get("observability_coverage"))
+    time_guard_overwrite = _to_float(rates.get("time_guard_overwrite_rate"))
+    name_slot_pollution = _to_float(rates.get("name_slot_pollution_rate"))
+    name_write_high_conf = _to_float(rates.get("name_write_high_confidence_rate"))
+    long_horizon_shrink = _to_float(rates.get("long_horizon_shrink_rate"))
+    fact_hallucination = _to_float(rates.get("fact_hallucination_rate"))
     totals = data.get("totals") if isinstance(data, dict) else {}
     weekday_mismatch_count = _to_float((totals or {}).get("weekday_mismatch_count"))
+    name_write_total = _to_float((totals or {}).get("name_write_total"))
     legacy_mode = args.legacy_metrics or str(os.getenv("QUALITY_GATE_LEGACY", "")).strip().lower() in {
         "1",
         "true",
@@ -152,6 +163,41 @@ def main() -> int:
             ">=",
             args.min_observability_coverage,
             observability >= args.min_observability_coverage,
+        ),
+        (
+            "time_guard_overwrite_rate",
+            time_guard_overwrite,
+            "<=",
+            args.max_time_guard_overwrite_rate,
+            time_guard_overwrite <= args.max_time_guard_overwrite_rate,
+        ),
+        (
+            "name_slot_pollution_rate",
+            name_slot_pollution,
+            "<=",
+            args.max_name_slot_pollution_rate,
+            name_slot_pollution <= args.max_name_slot_pollution_rate,
+        ),
+        (
+            "name_write_high_confidence_rate",
+            name_write_high_conf,
+            ">=",
+            args.min_name_write_high_confidence_rate,
+            (name_write_total <= 0) or (name_write_high_conf >= args.min_name_write_high_confidence_rate),
+        ),
+        (
+            "long_horizon_shrink_rate",
+            long_horizon_shrink,
+            "<=",
+            args.max_long_horizon_shrink_rate,
+            long_horizon_shrink <= args.max_long_horizon_shrink_rate,
+        ),
+        (
+            "fact_hallucination_rate",
+            fact_hallucination,
+            "<=",
+            args.max_fact_hallucination_rate,
+            fact_hallucination <= args.max_fact_hallucination_rate,
         ),
         (
             "weekday_mismatch_count",

@@ -92,6 +92,36 @@ def has_action_guidance(text: str) -> bool:
     )
 
 
+def is_time_alignment_only(text: str) -> bool:
+    out = str(text or "").strip()
+    if not out:
+        return True
+    if "时间对齐" not in out and "时间窗口" not in out:
+        return False
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    residual = []
+    for line in lines:
+        if re.search(r"(时间对齐|时间窗口|UTC|Asia/Shanghai|现在是|窗口按这个范围)", line):
+            continue
+        residual.append(line)
+    return len("".join(residual)) < 18
+
+
+def has_long_horizon_shrink(text: str) -> bool:
+    out = str(text or "")
+    return bool(re.search(r"(这三天|最近三天|未来三天|2月27日到3月1日)", out))
+
+
+def _is_long_horizon_case(query: str) -> bool:
+    q = str(query or "")
+    return bool(re.search(r"(本月|这个月|今年|明年|后年|全年|年度|未来三年|[一二两三四五六七八九1-9]年内|对比)", q))
+
+
+def _is_identity_query(query: str) -> bool:
+    q = str(query or "")
+    return bool(re.search(r"(我叫什么|我是谁|记得我叫|你记得我吗)", q))
+
+
 def first_n_sentences(text: str, n: int = 2) -> str:
     out = str(text or "").strip()
     if not out:
@@ -112,6 +142,8 @@ def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: s
             return False, "发生用户资料原文回显"
         if asks_for_profile(text):
             return False, "已有资料后仍触发资料补齐"
+        if is_time_alignment_only(text):
+            return False, "命理回答被时间对齐模板覆盖"
         if len(text.strip()) < 40:
             return False, "命理解读过短"
         has_analysis_signal = contains_any(
@@ -123,6 +155,8 @@ def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: s
             return False, "命理语义信号不足"
         if not has_action_guidance(text):
             return False, "缺少行动导向建议"
+        if _is_long_horizon_case(case.query) and has_long_horizon_shrink(text):
+            return False, "长周期问题被收缩为三天窗口"
         return True, "命理解读语义完整"
 
     if case.expected == "clarify":
@@ -162,6 +196,9 @@ def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: s
         return True, "占卜语义命中"
 
     if case.expected == "general":
+        if _is_identity_query(case.query):
+            if re.search(r"(200\d|201\d|202\d)年", text) and "生日" not in text:
+                return False, "身份问答出现疑似编造出生细节"
         ok = len(text.strip()) > 0 and "Traceback" not in text
         return ok, "通用问答异常或空输出"
 
@@ -172,9 +209,14 @@ def build_cases() -> list[Case]:
     return [
         Case("FORTUNE-001", "给我算一下今日运势", "missing_profile"),
         Case("GENERAL-001", "我叫测试甲，2002-03-14出生。", "general"),
+        Case("TIME-001", "今年是多少年", "general"),
+        Case("TREND-001", "分析一下我今年的运势", "fortune_detail"),
+        Case("TREND-002", "今年和明年财运对比", "fortune_detail"),
+        Case("TREND-003", "未来三年运势", "fortune_detail"),
         Case("CLARIFY-001", "帮我看一下星座运势", "clarify"),
         Case("COLLOQUIAL-001", "我近哪几天气场更顺？", "colloquial"),
         Case("DECISION-001", "我这个月财运上该先开源还是先守财？", "decision"),
+        Case("IDENTITY-001", "我叫什么你记得吗", "general"),
         Case("FORTUNE-002", "我今天财运如何？", "fortune_detail"),
         Case("FORTUNE-003", "帮我看看最近事业运", "fortune_detail"),
         Case("FORTUNE-004", "我这周感情运的关键点是什么？", "fortune_detail"),
