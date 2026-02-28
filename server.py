@@ -1465,7 +1465,8 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
 
 TIME_SENSITIVE_QUERY_PATTERN = re.compile(
     r"(今天|现在|当前|日期|几号|星期|周几|近几天|这几天|本周|这周|下周|本月|这个月|今年|本年|明年|后年|去年|前年|"
-    r"上半年|下半年|时间窗口|哪天|哪几天|刚才|你说错|纠正|纠错|气场)"
+    r"上半年|下半年|时间窗口|哪天|哪几天|刚才|你说错|纠正|纠错|气场|"
+    r"接下来(?:的)?一个月|未来(?:的)?一个月|接下来1个月|未来1个月|接下来30天|未来30天)"
 )
 NEAR_DAYS_QUERY_PATTERN = re.compile(r"(近几天|这几天|哪几天|哪天|最近三天|最近几天)")
 DATE_WEEKDAY_PATTERN = re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日[，,\s]*((?:星期|周)[一二三四五六日天])")
@@ -1475,7 +1476,8 @@ YEAR_PATTERN = re.compile(r"(20\d{2})年")
 
 
 def is_time_sensitive_query(query: str) -> bool:
-    return bool(TIME_SENSITIVE_QUERY_PATTERN.search(str(query or "")))
+    q = str(query or "")
+    return bool(TIME_SENSITIVE_QUERY_PATTERN.search(q) or RELATIVE_WINDOW_PATTERN.search(q))
 
 
 def _need_time_window(query: str, question_type: str = "default") -> bool:
@@ -1840,7 +1842,7 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
     if not out:
         return out
     q = str(query or "")
-    if not is_time_sensitive_query(q) and not is_bazi_fortune_query(q):
+    if not is_time_sensitive_query(q) and not is_bazi_fortune_query(q) and not RELATIVE_WINDOW_PATTERN.search(q):
         return out
     _metric_incr("temporal_consistency_total")
     _metric_incr("time_guard_total")
