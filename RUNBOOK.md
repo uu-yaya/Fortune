@@ -150,3 +150,60 @@ curl -sS -o /dev/null -w "login=%{http_code}\n" http://127.0.0.1:8001/login && \
 curl -sS -o /dev/null -w "docs=%{http_code}\n" http://127.0.0.1:8001/docs && \
 docker compose logs --tail=80 numerology
 ```
+
+## 实时监控
+```bash
+cd /opt/fortune-telling && \
+cat >/opt/fortune-telling/scripts/tail_chat_by_uuid.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+USER_UUID="${1:-}"
+if [[ -z "$USER_UUID" ]]; then
+  echo "Usage: $0 <user_uuid>"
+  exit 2
+fi
+
+cd /opt/fortune-telling
+docker compose exec -T numerology env USER_UUID="$USER_UUID" python -u - <<'PY'
+import os, json, time, hashlib, redis
+
+u = os.environ["USER_UUID"]
+r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/"), decode_responses=True)
+key = f"message_store:{u}"
+
+def decode_msg(raw: str):
+    try:
+        d = json.loads(raw)
+        role = d.get("type", "raw")
+        content = ((d.get("data") or {}).get("content") or "")
+        return role, content
+    except Exception:
+        return "raw", raw
+
+rows = r.lrange(key, 0, -1)  # new -> old
+print(f"key={key} len={len(rows)}", flush=True)
+for i, raw in enumerate(reversed(rows)):  # old -> new
+    role, content = decode_msg(raw)
+    print(f"[{i}] {role}: {content}", flush=True)
+
+seen = {hashlib.md5(x.encode('utf-8')).hexdigest() for x in rows}
+print("tailing... Ctrl+C stop", flush=True)
+
+while True:
+    latest = r.lrange(key, 0, 30)  # new -> old
+    fresh = [x for x in latest if hashlib.md5(x.encode('utf-8')).hexdigest() not in seen]
+    if fresh:
+        for raw in reversed(fresh):  # old -> new
+            role, content = decode_msg(raw)
+            print(f"{role}: {content}", flush=True)
+            seen.add(hashlib.md5(raw.encode('utf-8')).hexdigest())
+    time.sleep(1)
+PY
+EOF
+```
+```bash
+chmod +x /opt/fortune-telling/scripts/tail_chat_by_uuid.sh && \
+```
+```bash
+/opt/fortune-telling/scripts/tail_chat_by_uuid.sh 9bed834ed4f8482bb406ba772a02eec1
+```

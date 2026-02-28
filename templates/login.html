@@ -12,14 +12,14 @@
         <section class="auth-card">
             <img src="/static/images/image01.gif?v=20260227-image01-1" alt="吉伊装饰" class="auth-mascot">
             <h1>登录</h1>
-            <p class="sub">支持手机号验证码或账号密码登录。</p>
+            <p class="sub">当前为 Password-Only 模式，仅支持账号密码登录。</p>
 
             <div class="tabs">
-                <button id="tabSms" class="tab-btn active" type="button">手机号登录</button>
-                <button id="tabPwd" class="tab-btn" type="button">账号密码登录</button>
+                <button id="tabSms" class="tab-btn" type="button">手机号登录（暂不可用）</button>
+                <button id="tabPwd" class="tab-btn active" type="button">账号密码登录</button>
             </div>
 
-            <div id="smsPanel">
+            <div id="smsPanel" class="hidden">
                 <label class="field-label" for="phoneInput">手机号</label>
                 <input id="phoneInput" type="tel" maxlength="11" placeholder="请输入11位手机号">
 
@@ -30,11 +30,11 @@
                 </div>
 
                 <div class="actions single">
-                    <button id="submitSmsBtn" type="button">手机号登录</button>
+                    <button id="submitSmsBtn" type="button">手机号登录（暂不可用）</button>
                 </div>
             </div>
 
-            <div id="pwdPanel" class="hidden">
+            <div id="pwdPanel">
                 <label class="field-label" for="accountInput">账号</label>
                 <input id="accountInput" type="text" maxlength="24" placeholder="请输入账号（例如 JIYI-AB12CD34）">
 
@@ -47,9 +47,10 @@
             </div>
 
             <p id="statusText" class="status"></p>
-            <p class="hint"><a href="/forgot-password">忘记密码？</a></p>
-            <p class="hint">还没有账号？<a href="/register">去注册</a></p>
-            <p class="hint">验证码默认通过短信发送；测试环境若开启调试模式，会显示 debug_code。</p>
+            <p class="hint">忘记密码请联系管理员重置。</p>
+            <p class="hint">还没有账号？请联系管理员开通。</p>
+            <p class="hint">管理员微信：Duo_Duo-zoe</p>
+            <p class="hint">短信登录/注册/找回密码暂未开放。</p>
         </section>
     </main>
 
