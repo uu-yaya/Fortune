@@ -133,3 +133,20 @@ bash scripts/password_only_acceptance.sh
 ```
 
 完整手册见：`docs/31-password-only-ecs-runbook-2026-02-28.md`
+
+## 一键巡检
+```bash
+chmod +x /opt/fortune-telling/scripts/daily_check.sh
+/opt/fortune-telling/scripts/daily_check.sh
+```
+
+## ECS更新上线
+```bash
+cd /opt/fortune-telling && \
+git pull --ff-only origin main && \
+docker compose up -d --build && \
+docker compose ps && \
+curl -sS -o /dev/null -w "login=%{http_code}\n" http://127.0.0.1:8001/login && \
+curl -sS -o /dev/null -w "docs=%{http_code}\n" http://127.0.0.1:8001/docs && \
+docker compose logs --tail=80 numerology
+```
