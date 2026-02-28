@@ -94,3 +94,42 @@ docker compose -f docker-compose.tunnel.named.yml logs -f cloudflared
 ```bash
 docker compose -f docker-compose.tunnel.named.yml down
 ```
+
+## 9. Password-Only（无短信首发）
+
+1. 使用环境模板并确认核心开关：
+
+```bash
+cp deploy/env/.env.password-only.example .env
+```
+
+必须保持：
+
+- `SMS_PROVIDER=mock`
+- `SMS_DEBUG_CODE_ENABLED=false`
+
+2. 启动服务：
+
+```bash
+docker compose -p zhipo-numerology up -d --build
+```
+
+3. 部署 Nginx password-only 模板：
+
+- 配置文件：`deploy/nginx/password-only.conf.example`
+
+4. 预置账号（容器内）：
+
+```bash
+docker compose exec -T numerology python scripts/bootstrap_password_only_accounts.py \
+  --entry 13800138000:TempA123
+```
+
+5. 一键验收：
+
+```bash
+BASE_URL=https://你的域名 ACCOUNT=你的账号 PASSWORD=你的密码 \
+bash scripts/password_only_acceptance.sh
+```
+
+完整手册见：`docs/31-password-only-ecs-runbook-2026-02-28.md`

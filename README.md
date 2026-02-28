@@ -138,6 +138,44 @@ docker compose -p zhipo-numerology up -d --build
 docker compose -p zhipo-numerology down
 ```
 
+### 4.3 Password-Only 首发（无短信）
+
+当短信通道未开通时，可先上线“账号密码登录 + 聊天”模式：
+
+1. 使用环境模板：
+
+```bash
+cp deploy/env/.env.password-only.example .env
+```
+
+2. 保持以下配置：
+
+- `SMS_PROVIDER=mock`
+- `SMS_DEBUG_CODE_ENABLED=false`
+
+3. 配置 Nginx password-only 网关模板：
+
+- `deploy/nginx/password-only.conf.example`
+
+4. 批量预置账号（容器内执行）：
+
+```bash
+docker compose exec -T numerology python scripts/bootstrap_password_only_accounts.py \
+  --entry 13800138000:TempA123 \
+  --entry 13900139000:TempB123
+```
+
+5. 验收脚本：
+
+```bash
+BASE_URL=https://你的域名 ACCOUNT=你的账号 PASSWORD=你的密码 \
+bash scripts/password_only_acceptance.sh
+```
+
+完整上线流程见：
+
+- `docs/31-password-only-ecs-runbook-2026-02-28.md`
+
 ## 5. 测试与质量门禁
 
 1. 命理回归
@@ -167,6 +205,7 @@ python3 scripts/quality_gate.py --base-url http://127.0.0.1:8001 --days 1
 
 - 生产环境必须关闭 `SMS_DEBUG_CODE_ENABLED`，避免回传验证码。
 - 生产环境请设置 `SMS_PROVIDER=aliyun`，并配置阿里云短信签名、模板与密钥。
+- 若采用 password-only 首发，需在网关层禁用短信/注册/找回密码入口。
 - 建议在 HTTPS 场景下启用更严格 Cookie 策略（如 `Secure`）。
 - 对外部模型/工具依赖做好降级与熔断策略。
 - `.env` 中包含敏感信息，不应提交到仓库。
