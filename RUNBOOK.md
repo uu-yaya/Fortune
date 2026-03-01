@@ -207,3 +207,37 @@ chmod +x /opt/fortune-telling/scripts/tail_chat_by_uuid.sh && \
 ```bash
 /opt/fortune-telling/scripts/tail_chat_by_uuid.sh 9bed834ed4f8482bb406ba772a02eec1
 ```
+
+## 生成新用户
+```bash
+cd /opt/fortune-telling
+docker compose exec -T numerology python - <<'PY'
+from server import _get_user_by_phone, _create_user_by_phone
+
+seed = [
+    ("13800138101", "TempA101"),
+    ("13800138102", "TempA102"),
+    ("13800138103", "TempA103"),
+    ("13800138104", "TempA104"),
+    ("13800138105", "TempA105"),
+    ("13800138106", "TempA106"),
+    ("13800138107", "TempA107"),
+    ("13800138108", "TempA108"),
+    ("13800138109", "TempA109"),
+    ("13800138110", "TempA110"),
+]
+
+print("phone,account,init_password")
+for phone, pwd in seed:
+    u = _get_user_by_phone(phone)
+    if not u:
+        _create_user_by_phone(phone, pwd)
+        u = _get_user_by_phone(phone)
+    print(f"{phone},{u['account']},{pwd}")
+PY
+```
+
+## 监控所有用户
+```bash 
+/opt/fortune-telling/scripts/tail_chat_multi.sh --all
+```

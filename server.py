@@ -2253,9 +2253,69 @@ def extract_profile_from_history(chat_message_history) -> dict[str, str]:
     return profile
 
 
-def _append_chat_history(chat_message_history, query: str, output: str) -> None:
-    """在非 Agent 早返回分支补记会话，避免历史缺失。"""
+def _append_chat_audit_to_db(
+    user_id: int,
+    session_id: str,
+    query: str,
+    output: str,
+    question_type: str = "",
+    route_path: str = "",
+) -> None:
+    """写入 MySQL 审计表，确保历史可长期留存（不受 Redis TTL 影响）。"""
+    uid = int(user_id or 0)
+    sid = str(session_id or "").strip()
+    q = str(query or "").strip()
+    out = str(output or "").strip()
+    if uid <= 0 or not sid or not q or not out:
+        return
+    meta_obj = {
+        "source": "chat_api",
+        "question_type": str(question_type or ""),
+        "route_path": str(route_path or ""),
+    }
+    meta_json = None
+    try:
+        meta_json = json.dumps(meta_obj, ensure_ascii=False)
+    except Exception:
+        meta_json = None
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO chat_messages (user_id, session_id, role, content, meta_json)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (uid, sid, "user", q, meta_json),
+                        (uid, sid, "assistant", out, meta_json),
+                    ],
+                )
+    except Exception as e:
+        # 审计写入失败不能阻断主流程；仅告警。
+        logger.warning(f"写入 MySQL 聊天审计失败: {e}")
+
+
+def _append_chat_history(
+    chat_message_history,
+    query: str,
+    output: str,
+    user_id: int = 0,
+    session_id: str = "",
+    question_type: str = "",
+    route_path: str = "",
+) -> None:
+    """在非 Agent 早返回分支补记会话，避免历史缺失；同时落 MySQL 审计。"""
     if chat_message_history is None:
+        # 即便 Redis 历史不可用，仍尝试审计落库。
+        _append_chat_audit_to_db(
+            user_id=user_id,
+            session_id=session_id,
+            query=query,
+            output=output,
+            question_type=question_type,
+            route_path=route_path,
+        )
         return
     q = str(query or "").strip()
     out = str(output or "").strip()
@@ -2266,6 +2326,14 @@ def _append_chat_history(chat_message_history, query: str, output: str) -> None:
         chat_message_history.add_ai_message(out)
     except Exception as e:
         logger.warning(f"写入会话历史失败: {e}")
+    _append_chat_audit_to_db(
+        user_id=user_id,
+        session_id=session_id,
+        query=q,
+        output=out,
+        question_type=question_type,
+        route_path=route_path,
+    )
 
 
 def detect_emotion_level(query: str) -> str:
@@ -4105,6 +4173,7 @@ async def chat(request: Request, payload: ChatRequest):
         "preferred_name_confidence": "none",
     }
     session_id = ""
+    user_id = 0
     time_anchor = build_time_anchor()
     flag_snapshot = dict(V2_FLAG_DEFAULTS)
     flag_reason_code = "none"
@@ -4138,6 +4207,7 @@ async def chat(request: Request, payload: ChatRequest):
         user = _get_user_by_phone(phone) or {}
         if not user:
             return JSONResponse({"output": "登录信息异常，请重新登录后再试。"}, status_code=401)
+        user_id = int(user.get("id") or 0)
         # 会话ID绑定用户UUID，避免依赖前端localStorage导致“清理后数据丢失”
         session_id = str(user.get("uuid") or f"phone_{phone}" or str(uuid.uuid4().hex))
         # 先读历史，再提取本轮资料，最后合并，避免“明明给过又丢失”
@@ -4182,7 +4252,15 @@ async def chat(request: Request, payload: ChatRequest):
                 response_data = {"session_id": session_id, "output": safe_fast_reply}
             else:
                 response_data["output"] = safe_fast_reply
-            _append_chat_history(chat_message_history, query, safe_fast_reply)
+            _append_chat_history(
+                chat_message_history,
+                query,
+                safe_fast_reply,
+                user_id=user_id,
+                session_id=session_id,
+                question_type=question_type,
+                route_path="fast_reply",
+            )
             track_output_quality(
                 session_id,
                 response_data.get("output", ""),
@@ -4203,8 +4281,16 @@ async def chat(request: Request, payload: ChatRequest):
             out = _postprocess_output(dream_reply)
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
             out = _enforce_min_answer_contract(out, query=query, question_type="dream")
-            _append_chat_history(chat_message_history, query, out)
             d_qtype = str(((dream_meta or {}).get("question_type") if isinstance(dream_meta, dict) else "") or "dream")
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type=d_qtype,
+                route_path="dream_pipeline",
+            )
             track_output_quality(
                 session_id,
                 out,
@@ -4228,10 +4314,23 @@ async def chat(request: Request, payload: ChatRequest):
             if is_fortune_intent:
                 _metric_incr("fortune_route_hit_total")
             z_qtype = str(((zodiac_meta or {}).get("question_type") if isinstance(zodiac_meta, dict) else "") or question_type)
+            z_reason = flag_reason_code
+            z_route = "zodiac_pipeline"
+            if isinstance(zodiac_meta, dict) and str(zodiac_meta.get("source") or "") == "zodiac_clarify":
+                z_reason = "zodiac_sign_missing"
+                z_route = "zodiac_clarify"
             out = _postprocess_output(zodiac_reply, qtype=z_qtype)
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
             out = _enforce_min_answer_contract(out, query=query, question_type=z_qtype)
-            _append_chat_history(chat_message_history, query, out)
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type=z_qtype,
+                route_path=z_route,
+            )
             track_output_quality(
                 session_id,
                 out,
@@ -4239,11 +4338,6 @@ async def chat(request: Request, payload: ChatRequest):
                 query=query,
                 question_type=z_qtype,
             )
-            z_reason = flag_reason_code
-            z_route = "zodiac_pipeline"
-            if isinstance(zodiac_meta, dict) and str(zodiac_meta.get("source") or "") == "zodiac_clarify":
-                z_reason = "zodiac_sign_missing"
-                z_route = "zodiac_clarify"
             _log_route_observability(
                 route_path=z_route,
                 reason_code=z_reason,
@@ -4278,8 +4372,16 @@ async def chat(request: Request, payload: ChatRequest):
                     }
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
             out = _enforce_min_answer_contract(out, query=query, question_type=fortune_qtype)
-            _append_chat_history(chat_message_history, query, out)
             qtype_for_metrics = str((fortune_payload or {}).get("question_type") or fortune_qtype)
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type=qtype_for_metrics,
+                route_path="fortune_pipeline",
+            )
             track_output_quality(
                 session_id,
                 out,
@@ -4356,6 +4458,14 @@ async def chat(request: Request, payload: ChatRequest):
             query=query,
             question_type=question_type,
         )
+        _append_chat_audit_to_db(
+            user_id=user_id,
+            session_id=session_id,
+            query=query,
+            output=response_data.get("output", ""),
+            question_type=question_type,
+            route_path="agent_fallback",
+        )
         _log_route_observability(
             route_path="agent_fallback",
             reason_code=flag_reason_code,
@@ -4389,6 +4499,15 @@ async def chat(request: Request, payload: ChatRequest):
                 profile=profile,
                 query=str(getattr(payload, "query", "") or ""),
                 question_type=question_type,
+            )
+        if session_id and user_id > 0:
+            _append_chat_audit_to_db(
+                user_id=user_id,
+                session_id=session_id,
+                query=str(getattr(payload, "query", "") or ""),
+                output=response_data.get("output", ""),
+                question_type=question_type,
+                route_path="error",
             )
         _log_route_observability(
             route_path="error",
