@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import difflib
 import base64
+import threading
 from datetime import datetime
 from datetime import timedelta
 from typing import Optional
@@ -33,6 +34,16 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from config import (
+    DIFY_API_KEY,
+    DIFY_BASE_URL,
+    DIFY_WORKFLOW_APP_ID,
+    MEDIA_INTENT_LLM_FALLBACK,
+    MEDIA_INTENT_NEGATION_GUARD,
+    MEDIA_INTENT_ROUTER_V2,
+    MEDIA_INTENT_ROUTER_V3,
+    MEDIA_GEN_ENABLED,
+    MEDIA_POLL_INTERVAL_SECONDS,
+    MEDIA_TIMEOUT_SECONDS,
     MYSQL_DB,
     MYSQL_HOST,
     MYSQL_PASSWORD,
@@ -54,7 +65,10 @@ from config import (
     VECTOR_COLLECTION_NAME,
     VECTOR_DB_PATH,
 )
+from dify_media_client import DifyMediaClient
 from logger import setup_logger
+from media_intent import build_media_prompt, check_media_safety, detect_media_intent, route_media_intent
+from media_service import create_media_task, get_media_task, media_task_to_api, refresh_media_task, submit_media_task
 from models import get_lc_ali_embeddings, get_lc_ali_model_client
 from mytools import (
     bazi_cesuan,
@@ -75,8 +89,30 @@ CODE_TTL_SECONDS = 300
 RESEND_COOLDOWN_SECONDS = 60
 AUTH_TTL_DAYS = 30
 PREFERRED_NAME_PROMPT_TTL_SECONDS = 24 * 3600
+MEDIA_PREF_PROMPT_TTL_SECONDS = 30 * 60
 NAME_CONFIDENCE_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
+GENDER_VALUES = {"unknown", "male", "female"}
+PARTNER_PREFERENCE_VALUES = {"unknown", "male", "female", "any"}
+DIFY_PROMPT_MAX_CHARS = 256
+MEDIA_SCENARIO_LABELS = {
+    "destined_portrait": "正缘写实画像",
+    "destined_video": "正缘视频",
+    "encounter_story_video": "正缘相遇剧情片段",
+    "healing_sleep_video": "命理治愈视频",
+    "general_image": "专属图片",
+    "general_video": "专属视频",
+}
 _REDIS_CLIENT = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+_DIFY_MEDIA_CLIENT = (
+    DifyMediaClient(
+        base_url=DIFY_BASE_URL,
+        api_key=DIFY_API_KEY,
+        workflow_app_id=DIFY_WORKFLOW_APP_ID or "",
+        timeout_seconds=MEDIA_TIMEOUT_SECONDS,
+    )
+    if DIFY_API_KEY
+    else None
+)
 
 
 class SendCodeRequest(BaseModel):
@@ -110,6 +146,23 @@ class PasswordResetRequest(BaseModel):
 class ChatRequest(BaseModel):
     query: Optional[str] = Field(default=None, description="聊天问题", examples=["我想看下最近事业运"])
     session_id: Optional[str] = Field(default=None, description="兼容字段，后端按用户UUID维护会话", examples=["optional-client-id"])
+
+
+class MediaTaskCreateRequest(BaseModel):
+    query: Optional[str] = Field(default=None, description="媒体生成需求", examples=["帮我生成正缘写实画像"])
+    scenario: Optional[str] = Field(
+        default=None,
+        description="可选：直接指定媒体场景",
+        examples=[
+            "destined_portrait",
+            "destined_video",
+            "encounter_story_video",
+            "healing_sleep_video",
+            "general_image",
+            "general_video",
+        ],
+    )
+    session_id: Optional[str] = Field(default=None, description="可选会话ID")
 
 # 挂载静态文件
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -165,6 +218,16 @@ def _session_key(token: str) -> str:
 def _preferred_name_prompt_key(session_id: str) -> str:
     sid = str(session_id or "").strip()
     return f"chat:preferred_name_prompt:{sid}"
+
+
+def _media_pref_prompt_context_key(session_id: str) -> str:
+    sid = str(session_id or "").strip()
+    return f"chat:media_pref_prompt_ctx:{sid}"
+
+
+def _last_media_context_key(session_id: str) -> str:
+    sid = str(session_id or "").strip()
+    return f"chat:last_media_ctx:{sid}"
 
 
 def _pwd_reset_verified_key(phone: str) -> str:
@@ -229,6 +292,40 @@ def _get_user_by_uuid(user_uuid: str) -> dict | None:
                 (user_uuid,),
             )
             return cur.fetchone()
+
+
+def _mask_phone_for_ui(phone: str) -> str:
+    p = str(phone or "").strip()
+    if re.fullmatch(r"1\d{10}", p):
+        return f"{p[:3]}****{p[-4:]}"
+    return ""
+
+
+def _resolve_user_from_auth(auth: dict | None) -> tuple[dict, str, str]:
+    auth_obj = auth if isinstance(auth, dict) else {}
+    phone = str(auth_obj.get("phone") or "").strip()
+    user_uuid = str(auth_obj.get("user_uuid") or "").strip()
+    user = _get_user_by_phone(phone) if phone else None
+    if not user and user_uuid:
+        user = _get_user_by_uuid(user_uuid)
+    user_obj = user or {}
+    resolved_phone = str(user_obj.get("phone") or phone).strip()
+    resolved_uuid = str(user_obj.get("uuid") or user_uuid).strip()
+    return user_obj, resolved_phone, resolved_uuid
+
+
+def _build_user_short_account(user: dict | None, phone: str = "", user_uuid: str = "") -> str:
+    user_obj = user if isinstance(user, dict) else {}
+    account = str(user_obj.get("account") or "").strip()
+    if account:
+        return account
+    masked_phone = _mask_phone_for_ui(phone)
+    if masked_phone:
+        return masked_phone
+    uuid_part = str(user_uuid or user_obj.get("uuid") or "").strip()
+    if uuid_part:
+        return f"JIYI-{uuid_part[:8].upper()}"
+    return "JIYI-USER"
 
 
 def _password_valid(password: str) -> bool:
@@ -319,10 +416,36 @@ def _confidence_ge(left: str, right: str) -> bool:
     return l >= r
 
 
+def _normalize_gender(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"male", "m", "man", "boy", "男", "男生", "男性", "男的"}:
+        return "male"
+    if raw in {"female", "f", "woman", "girl", "女", "女生", "女性", "女的"}:
+        return "female"
+    if raw in GENDER_VALUES:
+        return raw
+    return "unknown"
+
+
+def _normalize_partner_gender_preference(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"female", "woman", "women", "girl", "女生", "女性", "女", "女的", "女孩子", "女孩"}:
+        return "female"
+    if raw in {"male", "man", "men", "boy", "男生", "男性", "男", "男的", "男孩子", "男孩"}:
+        return "male"
+    if raw in {"any", "all", "both", "不限", "都可以", "都行", "男女都可", "男女都行", "男女都可以"}:
+        return "any"
+    if raw in PARTNER_PREFERENCE_VALUES:
+        return raw
+    return "unknown"
+
+
 def _dump_profile_json(
     preferred_name: str = "",
     name_confidence: str = "",
     preferred_name_confidence: str = "",
+    gender: str = "",
+    partner_gender_preference: str = "",
 ) -> str | None:
     payload: dict[str, str] = {}
     call_name = str(preferred_name or "").strip()
@@ -334,6 +457,12 @@ def _dump_profile_json(
         payload["name_confidence"] = n_conf
     if p_conf != "none":
         payload["preferred_name_confidence"] = p_conf
+    normalized_gender = _normalize_gender(gender)
+    if normalized_gender in {"male", "female"}:
+        payload["gender"] = normalized_gender
+    normalized_partner_pref = _normalize_partner_gender_preference(partner_gender_preference)
+    if normalized_partner_pref in {"male", "female", "any"}:
+        payload["partner_gender_preference"] = normalized_partner_pref
     if not payload:
         return None
     try:
@@ -372,17 +501,25 @@ def _get_profile_by_user_id(user_id: int) -> dict[str, str]:
                 birthtime = f"{int(m.group(1)):02d}:{m.group(2)}"
     ext = _load_profile_json(row.get("profile_json"))
     preferred_name = str(ext.get("preferred_name") or "").strip()
+    if preferred_name and not _is_valid_call_name(preferred_name):
+        preferred_name = ""
+    gender = _normalize_gender(str(ext.get("gender") or "unknown"))
+    partner_gender_preference = _normalize_partner_gender_preference(str(ext.get("partner_gender_preference") or "unknown"))
     name_confidence = _normalize_name_confidence(str(ext.get("name_confidence") or ""))
     preferred_name_confidence = _normalize_name_confidence(str(ext.get("preferred_name_confidence") or ""))
     if (row.get("name") or "").strip() and name_confidence == "none":
         name_confidence = "high"
     if preferred_name and preferred_name_confidence == "none":
         preferred_name_confidence = "high"
+    if not preferred_name:
+        preferred_name_confidence = "none"
     return {
         "name": row.get("name") or "",
         "birthdate": birthdate,
         "birthtime": birthtime,
         "preferred_name": preferred_name,
+        "gender": gender,
+        "partner_gender_preference": partner_gender_preference,
         "name_confidence": name_confidence,
         "preferred_name_confidence": preferred_name_confidence,
     }
@@ -417,26 +554,43 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
     if current.get("birthtime") and not merged.get("birthtime"):
         merged["birthtime"] = current["birthtime"]
         changed = True
+    incoming_gender = _normalize_gender(str(current.get("gender") or "unknown"))
+    merged_gender = _normalize_gender(str(merged.get("gender") or "unknown"))
+    if incoming_gender in {"male", "female"} and incoming_gender != merged_gender:
+        merged["gender"] = incoming_gender
+        changed = True
+    incoming_partner_pref = _normalize_partner_gender_preference(str(current.get("partner_gender_preference") or "unknown"))
+    merged_partner_pref = _normalize_partner_gender_preference(str(merged.get("partner_gender_preference") or "unknown"))
+    if incoming_partner_pref in {"male", "female", "any"} and incoming_partner_pref != merged_partner_pref:
+        merged["partner_gender_preference"] = incoming_partner_pref
+        changed = True
     incoming_preferred_name = str(current.get("preferred_name") or "").strip()
     if incoming_preferred_name:
-        _metric_incr("name_write_total")
-        if _confidence_ge(incoming_pref_conf, "medium"):
-            if _confidence_ge(incoming_pref_conf, merged_pref_conf):
-                if incoming_preferred_name != str(merged.get("preferred_name") or "").strip():
-                    merged["preferred_name"] = incoming_preferred_name
-                    changed = True
-                if merged_pref_conf != incoming_pref_conf:
-                    merged["preferred_name_confidence"] = incoming_pref_conf
-                    changed = True
-            if _confidence_ge(incoming_pref_conf, "high"):
-                _metric_incr("name_write_high_confidence_total")
-        else:
+        if not _is_valid_call_name(incoming_preferred_name):
             _metric_incr("name_slot_pollution")
+            incoming_preferred_name = ""
+        else:
+            _metric_incr("name_write_total")
+        if incoming_preferred_name:
+            if _confidence_ge(incoming_pref_conf, "medium"):
+                if _confidence_ge(incoming_pref_conf, merged_pref_conf):
+                    if incoming_preferred_name != str(merged.get("preferred_name") or "").strip():
+                        merged["preferred_name"] = incoming_preferred_name
+                        changed = True
+                    if merged_pref_conf != incoming_pref_conf:
+                        merged["preferred_name_confidence"] = incoming_pref_conf
+                        changed = True
+                if _confidence_ge(incoming_pref_conf, "high"):
+                    _metric_incr("name_write_high_confidence_total")
+            else:
+                _metric_incr("name_slot_pollution")
     if changed:
         profile_json = _dump_profile_json(
             preferred_name=str(merged.get("preferred_name") or "").strip(),
             name_confidence=str(merged.get("name_confidence") or "none"),
             preferred_name_confidence=str(merged.get("preferred_name_confidence") or "none"),
+            gender=str(merged.get("gender") or "unknown"),
+            partner_gender_preference=str(merged.get("partner_gender_preference") or "unknown"),
         )
         with _db_conn() as conn:
             with conn.cursor() as cur:
@@ -1885,10 +2039,19 @@ def get_fast_reply(query: str, time_anchor: dict | None = None, profile: dict | 
         call_name = str(p.get("preferred_name") or "").strip()
         legal_name = str(p.get("name") or "").strip()
         if _is_valid_call_name(call_name):
-            return f"我记得你喜欢我叫你{call_name}。"
+            return f"呀哈～本鼠鼠记得呀，我喜欢叫你{call_name}。"
         if _is_valid_name(legal_name):
-            return f"我记得你叫{legal_name}。"
-        return "我这边还没有你的姓名记录。你可以直接告诉我“我叫XXX”。"
+            return f"呀哈～我记得你叫{legal_name}。"
+        return "呜啦～我这边还没有你的姓名记录。你可以直接告诉我“我叫XXX”，我就会记住啦。"
+
+    if _is_asking_own_gender(raw_text):
+        p = profile or {}
+        gender = _normalize_gender(str(p.get("gender") or "unknown"))
+        if gender == "male":
+            return "呀哈～你是男生，本鼠鼠记住啦。"
+        if gender == "female":
+            return "呀哈～你是女生，本鼠鼠记住啦。"
+        return "呜啦～你还没告诉我性别呢。你可以说“我是男生”或“我是女生”，我会记住并用中性称呼兜底。"
 
     # 时间/日期类问题：使用系统实时时间，避免大模型产生日期幻觉
     time_keywords = re.compile(
@@ -1937,6 +2100,76 @@ def _normalize_birthtime(text: str) -> str:
     return ""
 
 
+def _extract_gender_with_confidence(query: str) -> tuple[str, str]:
+    source = str(query or "").strip()
+    if not source:
+        return "unknown", "none"
+    if re.search(r"[？?]", source):
+        return "unknown", "none"
+    if re.search(r"(不是|并非|不算)\s*(男|女)", source):
+        return "unknown", "none"
+    compact = re.sub(r"\s+", "", source)
+    male_tokens = {"男", "男生", "男的", "男性"}
+    female_tokens = {"女", "女生", "女的", "女性"}
+    if compact in male_tokens:
+        return "male", "high"
+    if compact in female_tokens:
+        return "female", "high"
+    male_patterns = [
+        r"(?:我是|本人是|本人|我的性别是|我的性别为|性别是|性别为|性别[:：])\s*(?:一)?(?:个)?\s*(男生|男的|男性|男)",
+    ]
+    female_patterns = [
+        r"(?:我是|本人是|本人|我的性别是|我的性别为|性别是|性别为|性别[:：])\s*(?:一)?(?:个)?\s*(女生|女的|女性|女)",
+    ]
+    for pattern in male_patterns:
+        if re.search(pattern, source):
+            return "male", "high"
+    for pattern in female_patterns:
+        if re.search(pattern, source):
+            return "female", "high"
+    return "unknown", "none"
+
+
+def _extract_partner_gender_preference_with_confidence(query: str, allow_bare_reply: bool = False) -> tuple[str, str]:
+    source = str(query or "").strip()
+    if not source:
+        return "unknown", "none"
+    if re.search(r"[？?]", source):
+        return "unknown", "none"
+    if re.search(r"(不是|并非|不喜欢)\s*(男生|女生|男性|女性|男的|女的)", source):
+        return "unknown", "none"
+
+    compact = re.sub(r"[\s，。！？,.!?；;:：]", "", source)
+    if allow_bare_reply:
+        if compact in {"女生", "女性", "女", "女的", "女孩子", "女孩"}:
+            return "female", "high"
+        if compact in {"男生", "男性", "男", "男的", "男孩子", "男孩"}:
+            return "male", "high"
+        if compact in {"不限", "都可以", "都行", "男女都可", "男女都行", "男女都可以"}:
+            return "any", "high"
+    if re.fullmatch(r"我喜欢(女生|女性|女孩子|女孩|女的)", compact):
+        return "female", "high"
+    if re.fullmatch(r"我喜欢(男生|男性|男孩子|男孩|男的)", compact):
+        return "male", "high"
+    if re.search(r"^我喜欢.*(女生|女性|女孩子|女孩|女的)", compact):
+        return "female", "high"
+    if re.search(r"^我喜欢.*(男生|男性|男孩子|男孩|男的)", compact):
+        return "male", "high"
+    if re.search(r"(我|本人).{0,2}(男女都可以|男女都行|都可以|都行|不限)", source):
+        return "any", "high"
+
+    romance_ctx = bool(re.search(r"(正缘|对象|另一半|恋爱|感情|取向|性取向|桃花)", source))
+    if romance_ctx:
+        if re.search(r"(喜欢|偏好|取向|希望|想要).{0,4}(女生|女性|女孩子|女孩|女的)", source):
+            return "female", "high"
+        if re.search(r"(喜欢|偏好|取向|希望|想要).{0,4}(男生|男性|男孩子|男孩|男的)", source):
+            return "male", "high"
+        if re.search(r"(都可以|都行|不限|男女都)", source):
+            return "any", "high"
+
+    return "unknown", "none"
+
+
 def _is_valid_name(name: str) -> bool:
     n = (name or "").strip()
     if not n:
@@ -1959,10 +2192,14 @@ def _is_valid_call_name(name: str) -> bool:
     invalid_tokens = {
         "你", "我", "他", "她", "它", "自己", "名字", "姓名", "昵称", "称呼", "随便", "都行", "都可以", "无所谓",
         "不知道", "不告诉你",
+        "学业", "事业", "感情", "财运", "运势", "工作", "学习",
     }
     if n in invalid_tokens:
         return False
     if re.search(r"(怎么|什么|谁|吗|呢|呀|啊|\?|？|!|！|,|，|。)", n):
+        return False
+    # 拦截明显语义短句/身份描述，避免把“我是男生”等写成昵称
+    if re.search(r"(我是|我叫|叫我|性别|男生|女生|男性|女性|先生|小姐|女士|男士|不是|并非|不算)", n):
         return False
     return True
 
@@ -2036,7 +2273,7 @@ def _extract_preferred_name_with_confidence(query: str, allow_soft: bool = False
         if not m:
             continue
         candidate = str(m.group(1) or "").strip()
-        candidate = re.sub(r"(吧|呀|啦|哦|喔|呢)$", "", candidate).strip()
+        candidate = re.sub(r"(吧|呀|啦|哦|喔|呢|吗|嘛|么|？|\?)$", "", candidate).strip()
         if not _is_valid_call_name(candidate):
             _metric_incr("name_slot_total")
             _metric_incr("name_slot_pollution")
@@ -2048,9 +2285,27 @@ def _extract_preferred_name_with_confidence(query: str, allow_soft: bool = False
         _metric_incr("name_slot_total")
         return candidate, "high"
     if allow_soft:
+        # 仅在“待确认称呼”场景下兜底接收简短昵称，避免把整句自我描述误写入别称
+        if re.search(r"(我是|我是个|我是一个|本人|我属于|我这个)", source):
+            _metric_incr("name_slot_total")
+            _metric_incr("name_slot_pollution")
+            return "", "none"
         normalized = re.sub(r"[\s，。！？,.!？、；;:：]", "", source)
         normalized = re.sub(r"^(那就|就|那|嗯|啊|呀|呜啦|呀哈)", "", normalized).strip()
-        normalized = re.sub(r"(吧|呀|啦|哦|喔|呢|就行|即可)$", "", normalized).strip()
+        normalized = re.sub(r"(吧|呀|啦|哦|喔|呢|吗|嘛|么|就行|即可)$", "", normalized).strip()
+        # 只接受“短且像称呼”的独立词，不接受“男生/很好的人/我是XX”这类描述句
+        if re.search(r"(男生|女生|的人|一个人|很好|不错|普通|学生|老师|打工人|社畜|i人|e人)", normalized):
+            _metric_incr("name_slot_total")
+            _metric_incr("name_slot_pollution")
+            return "", "none"
+        if re.search(r"^(学业|事业|感情|财运|运势|工作|学习)$", normalized):
+            _metric_incr("name_slot_total")
+            _metric_incr("name_slot_pollution")
+            return "", "none"
+        if not re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9]{1,6}", normalized):
+            _metric_incr("name_slot_total")
+            _metric_incr("name_slot_pollution")
+            return "", "none"
         if 1 <= len(normalized) <= 6 and _is_valid_call_name(normalized) and not _looks_like_time_or_date_fragment(normalized):
             _metric_incr("name_slot_total")
             return normalized, "medium"
@@ -2065,6 +2320,26 @@ def _extract_preferred_name_from_query(query: str) -> str:
     return preferred_name
 
 
+def _is_soft_preferred_name_reply(query: str) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    # 软提取只接受“短独立词”回复，避免把正常对话句子误识别为昵称
+    if len(q) > 6:
+        return False
+    if re.search(r"[，。！？,.!?；;:：\s]", q):
+        return False
+    if re.search(r"(我|你|他|她|它|是|有|在|要|会|想|觉得|知道|告诉|因为|所以|但是|然后)", q):
+        return False
+    if re.search(r"(今天|明天|后天|工作|学习|感情|运势|视频|图片|生成|帮我|可以|怎么|为什么|吗|呢|呀|啊|吧)", q):
+        return False
+    if re.search(r"^(学业|事业|感情|财运|运势|工作|学习)$", q):
+        return False
+    if _looks_like_time_or_date_fragment(q):
+        return False
+    return bool(re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9]{1,6}", q))
+
+
 def _is_asking_own_name(query: str) -> bool:
     q = str(query or "").strip()
     if not q:
@@ -2074,11 +2349,22 @@ def _is_asking_own_name(query: str) -> bool:
     )
 
 
+def _is_asking_own_gender(query: str) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    return bool(
+        re.search(r"(我的性别|我是什么性别|我是男生还是女生|我是男的还是女的|我男还是女|你知道我的性别)", q)
+    )
+
+
 def _is_identity_fact_query(query: str) -> bool:
     q = str(query or "").strip()
     if not q:
         return False
     if _is_asking_own_name(q):
+        return True
+    if _is_asking_own_gender(q):
         return True
     return bool(re.search(r"(你记得我吗|你记得我是谁吗|我是谁你还记得吗)", q))
 
@@ -2166,6 +2452,122 @@ def _is_preferred_name_prompt_pending(session_id: str) -> bool:
         return False
 
 
+def _set_media_pref_prompt_context(session_id: str, query: str, scenario: str) -> None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    key = _media_pref_prompt_context_key(sid)
+    payload = {
+        "query": str(query or "").strip(),
+        "scenario": str(scenario or "").strip(),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        _REDIS_CLIENT.setex(key, MEDIA_PREF_PROMPT_TTL_SECONDS, json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        return
+
+
+def _get_media_pref_prompt_context(session_id: str) -> dict[str, str] | None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    key = _media_pref_prompt_context_key(sid)
+    try:
+        raw = _REDIS_CLIENT.get(key)
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        obj = json.loads(str(raw))
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return {
+        "query": str(obj.get("query") or "").strip(),
+        "scenario": str(obj.get("scenario") or "").strip(),
+        "created_at": str(obj.get("created_at") or "").strip(),
+    }
+
+
+def _clear_media_pref_prompt_context(session_id: str) -> None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    key = _media_pref_prompt_context_key(sid)
+    try:
+        _REDIS_CLIENT.delete(key)
+    except Exception:
+        return
+
+
+def _set_last_media_context(session_id: str, *, task_id: str, scenario: str, query: str, status: str) -> None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    payload = {
+        "task_id": str(task_id or "").strip(),
+        "scenario": str(scenario or "").strip(),
+        "query": str(query or "").strip(),
+        "status": str(status or "").strip(),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        _REDIS_CLIENT.setex(
+            _last_media_context_key(sid),
+            SESSION_TTL_SECONDS,
+            json.dumps(payload, ensure_ascii=False),
+        )
+    except Exception:
+        return
+
+
+def _get_last_media_context(session_id: str) -> dict[str, str] | None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    try:
+        raw = _REDIS_CLIENT.get(_last_media_context_key(sid))
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        obj = json.loads(str(raw))
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return {
+        "task_id": str(obj.get("task_id") or "").strip(),
+        "scenario": str(obj.get("scenario") or "").strip(),
+        "query": str(obj.get("query") or "").strip(),
+        "status": str(obj.get("status") or "").strip(),
+        "created_at": str(obj.get("created_at") or "").strip(),
+    }
+
+
+def _scenario_requires_partner_preference(scenario: str) -> bool:
+    return str(scenario or "").strip() in {"destined_portrait", "destined_video", "encounter_story_video"}
+
+
+def _scenario_requires_profile_for_media(scenario: str) -> bool:
+    return str(scenario or "").strip() in {"destined_portrait", "destined_video", "encounter_story_video"}
+
+
+def _partner_preference_cn(value: str) -> str:
+    normalized = _normalize_partner_gender_preference(value)
+    if normalized == "female":
+        return "女生"
+    if normalized == "male":
+        return "男生"
+    if normalized == "any":
+        return "不限"
+    return ""
+
+
 def extract_profile_from_query(query: str) -> dict[str, str]:
     source = (query or "").strip()
     profile: dict[str, str] = {}
@@ -2183,6 +2585,12 @@ def extract_profile_from_query(query: str) -> dict[str, str]:
     if preferred_name:
         profile["preferred_name"] = preferred_name
         profile["preferred_name_confidence"] = preferred_conf
+    gender, gender_conf = _extract_gender_with_confidence(source)
+    if gender in {"male", "female"} and gender_conf == "high":
+        profile["gender"] = gender
+    partner_pref, partner_pref_conf = _extract_partner_gender_preference_with_confidence(source)
+    if partner_pref in {"male", "female", "any"} and partner_pref_conf == "high":
+        profile["partner_gender_preference"] = partner_pref
     return profile
 
 
@@ -2195,6 +2603,8 @@ def merge_session_profile(session_id: str, current: dict[str, str]) -> dict[str,
             "birthdate": "",
             "birthtime": "",
             "preferred_name": "",
+            "gender": "unknown",
+            "partner_gender_preference": "unknown",
             "name_confidence": "none",
             "preferred_name_confidence": "none",
         }
@@ -2213,10 +2623,26 @@ def build_profile_context(profile: dict[str, str]) -> str:
         parts.append(f"出生日期：{profile['birthdate']}")
     if profile.get("birthtime"):
         parts.append(f"出生时间：{profile['birthtime']}")
+    gender = _normalize_gender(str(profile.get("gender") or "unknown"))
+    partner_pref = _normalize_partner_gender_preference(str(profile.get("partner_gender_preference") or "unknown"))
+    if gender == "male":
+        parts.append("性别：男")
+    elif gender == "female":
+        parts.append("性别：女")
+    if partner_pref == "male":
+        parts.append("情感对象偏好：男性")
+    elif partner_pref == "female":
+        parts.append("情感对象偏好：女性")
+    elif partner_pref == "any":
+        parts.append("情感对象偏好：不限性别")
     if not parts:
-        return "暂无用户资料。"
+        return "暂无用户资料。未提供性别时，只能使用中性称呼（你/同学），不得猜测用户性别。"
     profile_line = "；".join(parts)
-    return f"{profile_line}。可自然使用用户偏好的称呼；不要逐字回显完整生日和时辰。"
+    if gender == "unknown":
+        gender_rule = "未提供性别时，只能使用中性称呼（你/同学），不得猜测用户是小姐/先生。"
+    else:
+        gender_rule = "可参考已提供的性别信息，但不要臆测和扩展其他性别线索。"
+    return f"{profile_line}。可自然使用用户偏好的称呼；{gender_rule}不要逐字回显完整生日和时辰。"
 
 
 def extract_profile_from_history(chat_message_history) -> dict[str, str]:
@@ -2246,7 +2672,22 @@ def extract_profile_from_history(chat_message_history) -> dict[str, str]:
                 profile["birthdate"] = piece["birthdate"]
             if piece.get("birthtime") and not profile.get("birthtime"):
                 profile["birthtime"] = piece["birthtime"]
-            if profile.get("name") and profile.get("birthdate") and profile.get("birthtime"):
+            if piece.get("gender") and _normalize_gender(str(profile.get("gender") or "unknown")) == "unknown":
+                profile["gender"] = _normalize_gender(str(piece.get("gender") or "unknown"))
+            if (
+                piece.get("partner_gender_preference")
+                and _normalize_partner_gender_preference(str(profile.get("partner_gender_preference") or "unknown")) == "unknown"
+            ):
+                profile["partner_gender_preference"] = _normalize_partner_gender_preference(
+                    str(piece.get("partner_gender_preference") or "unknown")
+                )
+            # 不能仅凭姓名/生日/时辰提前结束扫描；性别可能在后续轮次才出现。
+            if (
+                profile.get("name")
+                and profile.get("birthdate")
+                and profile.get("birthtime")
+                and _normalize_gender(str(profile.get("gender") or "unknown")) != "unknown"
+            ):
                 break
     except Exception:
         return profile
@@ -2260,6 +2701,7 @@ def _append_chat_audit_to_db(
     output: str,
     question_type: str = "",
     route_path: str = "",
+    extra_meta: dict | None = None,
 ) -> None:
     """写入 MySQL 审计表，确保历史可长期留存（不受 Redis TTL 影响）。"""
     uid = int(user_id or 0)
@@ -2273,6 +2715,9 @@ def _append_chat_audit_to_db(
         "question_type": str(question_type or ""),
         "route_path": str(route_path or ""),
     }
+    if isinstance(extra_meta, dict):
+        for k, v in extra_meta.items():
+            meta_obj[str(k)] = v
     meta_json = None
     try:
         meta_json = json.dumps(meta_obj, ensure_ascii=False)
@@ -2304,6 +2749,7 @@ def _append_chat_history(
     session_id: str = "",
     question_type: str = "",
     route_path: str = "",
+    extra_meta: dict | None = None,
 ) -> None:
     """在非 Agent 早返回分支补记会话，避免历史缺失；同时落 MySQL 审计。"""
     if chat_message_history is None:
@@ -2315,6 +2761,7 @@ def _append_chat_history(
             output=output,
             question_type=question_type,
             route_path=route_path,
+            extra_meta=extra_meta,
         )
         return
     q = str(query or "").strip()
@@ -2333,7 +2780,507 @@ def _append_chat_history(
         output=out,
         question_type=question_type,
         route_path=route_path,
+        extra_meta=extra_meta,
     )
+
+
+def _media_ready() -> bool:
+    return bool(MEDIA_GEN_ENABLED and _DIFY_MEDIA_CLIENT and DIFY_WORKFLOW_APP_ID)
+
+
+def _build_media_task_response(session_id: str, task: dict | None) -> dict:
+    payload = media_task_to_api(task or {})
+    return {
+        "session_id": str(session_id or ""),
+        "output": str(payload.get("output") or ""),
+        "message_type": str(payload.get("message_type") or "media_failed"),
+        "media_task_id": str(payload.get("task_id") or ""),
+        "media": payload.get("media") if isinstance(payload.get("media"), list) else [],
+        "poll_interval_seconds": int(max(1, MEDIA_POLL_INTERVAL_SECONDS)),
+        "extra": payload.get("extra") if isinstance(payload.get("extra"), dict) else {},
+    }
+
+
+def _default_media_destiny_hint(profile: dict[str, str], scenario: str) -> str:
+    if scenario == "healing_sleep_video":
+        return (
+            "近期命理节奏以稳为先，适合低刺激、慢节奏、自然光和柔和色调的治愈表达；"
+            "暗示语以安定、放松、恢复能量为主。"
+        )
+    partner_pref = _partner_preference_cn(str(profile.get("partner_gender_preference") or "unknown"))
+    base = "桃花节奏偏慢热，正缘更看重真诚沟通、情绪稳定与长期陪伴。"
+    if scenario == "encounter_story_video":
+        base += "相遇场景宜放在日常但有仪式感的空间，比如书店、咖啡馆或傍晚街角。"
+    if partner_pref:
+        base += f"对象形象偏向{partner_pref}。"
+    return base
+
+
+def _build_media_destiny_hint(query: str, profile: dict[str, str], scenario: str) -> str:
+    scenario_name = str(scenario or "").strip()
+    if scenario_name not in {"destined_portrait", "destined_video", "encounter_story_video", "healing_sleep_video"}:
+        return ""
+    topic = "daily" if scenario_name == "healing_sleep_video" else "love"
+    name = str(profile.get("name") or "").strip()
+    birthdate = str(profile.get("birthdate") or "").strip()
+    if not name or not birthdate:
+        return _default_media_destiny_hint(profile, scenario_name)
+    birthtime = str(profile.get("birthtime") or "").strip() or "未知"
+    gender = _normalize_gender(str(profile.get("gender") or "unknown"))
+    gender_cn = "男" if gender == "male" else "女" if gender == "female" else "未知"
+    partner_pref_cn = _partner_preference_cn(str(profile.get("partner_gender_preference") or "unknown")) or "未说明"
+    anchor = build_time_anchor()
+    focus_clause = (
+        "重点输出近期身心能量节律、适配的画面元素与节奏、以及治愈暗示语方向。"
+        if scenario_name == "healing_sleep_video"
+        else "重点输出桃花趋势、正缘气质、相遇场景线索。"
+    )
+    tool_query = (
+        f"请按结构化JSON返回{topic}命理结果。"
+        f"姓名：{name}；出生日期：{birthdate}；出生时间：{birthtime}；性别：{gender_cn}；"
+        f"情感对象偏好：{partner_pref_cn}；用户媒体需求：{str(query or '').strip()}。"
+        f"当前时间锚点：{anchor.get('today_cn')}（{anchor.get('weekday_cn')}，{anchor.get('tz_name')}，{anchor.get('utc_offset')}）。"
+        f"{focus_clause}"
+    )
+    raw = ""
+    try:
+        raw = bazi_cesuan.invoke(tool_query)
+    except Exception:
+        try:
+            raw = bazi_cesuan.run(tool_query)
+        except Exception:
+            raw = {}
+    payload = _normalize_structured_fortune_payload(raw, topic)
+    error = payload.get("error")
+    if isinstance(error, dict) and str(error.get("code") or "").strip():
+        return _default_media_destiny_hint(profile, scenario_name)
+    parts: list[str] = []
+    signal_topic = "love" if topic == "love" else "daily"
+    signal = _signal_for_topic(payload, signal_topic)
+    if signal:
+        parts.append(signal)
+    basis = _basis_line(payload)
+    if basis:
+        parts.append(f"命盘依据：{basis}")
+    if scenario_name == "healing_sleep_video":
+        strength = str(payload.get("strength") or "balanced")
+        strength_text = {
+            "strong": "能量较强，适合明亮通透且有呼吸感的治愈节奏",
+            "weak": "能量偏弱，适合更慢、更柔和、包裹感更强的治愈节奏",
+            "balanced": "能量平衡，适合稳定舒缓、自然过渡的治愈节奏",
+        }.get(strength, "能量平衡，适合稳定舒缓、自然过渡的治愈节奏")
+        parts.append(f"节奏建议：{strength_text}")
+        advice = _resolve_fortune_advice(payload, "daily", strength)
+        if advice:
+            parts.append(f"疗愈重点：{str(advice[0]).strip()}")
+    for key, prefix in [
+        ("opportunity_points", "机会"),
+        ("risk_points", "风险"),
+        ("time_hints", "时间"),
+    ]:
+        values = payload.get(key) or []
+        if isinstance(values, list):
+            first = next((str(v).strip() for v in values if str(v).strip()), "")
+            if first:
+                parts.append(f"{prefix}：{first}")
+    hint = "；".join(parts).strip("； ")
+    if not hint:
+        return _default_media_destiny_hint(profile, scenario_name)
+    return hint[:220]
+
+
+def _compress_prompt_with_model(prompt: str, max_chars: int = DIFY_PROMPT_MAX_CHARS) -> str:
+    raw = re.sub(r"\s+", " ", str(prompt or "")).strip()
+    if not raw:
+        return ""
+    if len(raw) <= max_chars:
+        return raw
+    tpl = ChatPromptTemplate.from_template(
+        """你是“提示词压缩器”。
+请把下面媒体生成提示词压缩到不超过 {max_chars} 个中文字符，必须保留原意与关键约束：
+1) 主体对象与场景
+2) 风格/镜头/光影氛围
+3) 用户关键偏好（如性别偏好、命理线索）
+4) 安全限制（如不露骨、不未成年人、不仿真人）
+
+只输出压缩后的单行提示词，不要解释，不要加引号。
+原提示词：{prompt}
+"""
+    )
+    try:
+        chain = tpl | get_lc_ali_model_client(temperature=0.1, streaming=False) | StrOutputParser()
+        out = str(chain.invoke({"max_chars": int(max_chars), "prompt": raw}) or "").strip()
+        out = re.sub(r"\s+", " ", out)
+        out = out.strip("`\"' ")
+        if not out:
+            return raw[:max_chars]
+        if len(out) > max_chars:
+            out = out[:max_chars]
+        return out
+    except Exception as e:
+        logger.warning(f"提示词压缩失败，使用截断兜底: {e}")
+        return raw[:max_chars]
+
+
+def _intent_extra_payload(intent_decision: dict | None) -> dict[str, str]:
+    src = intent_decision if isinstance(intent_decision, dict) else {}
+    route = str(src.get("route") or "chat").strip() or "chat"
+    confidence = str(src.get("confidence") or "low").strip() or "low"
+    reason_code = str(src.get("reason_code") or "none").strip() or "none"
+    intent_version = str(src.get("intent_version") or "v3").strip() or "v3"
+    decision_source = str(src.get("decision_source") or "rule").strip() or "rule"
+    score_create = str(int(max(0, int(src.get("create_score") or 0))))
+    score_feedback = str(int(max(0, int(src.get("feedback_score") or 0))))
+    return {
+        "intent_route": route,
+        "intent_confidence": confidence,
+        "intent_reason": reason_code,
+        "intent_version": intent_version,
+        "intent_source": decision_source,
+        "intent_score_create": score_create,
+        "intent_score_feedback": score_feedback,
+    }
+
+
+def _attach_intent_extra(response_data: dict, intent_decision: dict | None) -> dict:
+    if not isinstance(response_data, dict):
+        return response_data
+    extra = response_data.get("extra")
+    if not isinstance(extra, dict):
+        extra = {}
+    extra.update(_intent_extra_payload(intent_decision))
+    response_data["extra"] = extra
+    return response_data
+
+
+def _task_input_query(task: dict | None) -> str:
+    data = task if isinstance(task, dict) else {}
+    input_json = data.get("input_json")
+    if not isinstance(input_json, dict):
+        return ""
+    return str(input_json.get("query") or "").strip()
+
+
+def _fallback_media_scenario_by_query(query: str) -> str:
+    q = str(query or "")
+    if not q:
+        return ""
+    if re.search(r"(视频|短片|剧情|片段|mv|动画|片子|成片|动图)", q):
+        return "general_video"
+    if re.search(r"(图|图片|图像|画像|照片|海报|壁纸|插画|写真|头像|一幅画|一张画|画出来|配图|插图|绘图|封面图|卡面|视觉稿)", q):
+        return "general_image"
+    return ""
+
+
+def _parse_json_object(raw_text: str) -> dict:
+    text = str(raw_text or "").strip()
+    if not text:
+        return {}
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return {}
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _classify_media_route_with_model(query: str, rule_probe: dict | None, recent_media: dict | None = None) -> dict:
+    q = str(query or "").strip()
+    if not q:
+        return {}
+    probe = rule_probe if isinstance(rule_probe, dict) else {}
+    recent = recent_media if isinstance(recent_media, dict) else {}
+    default_scenario = str(probe.get("scenario") or "").strip() or str(recent.get("scenario") or "").strip()
+    prompt = ChatPromptTemplate.from_template(
+        """你是“媒体意图路由器”。请判断下面这句是否在发起新的媒体生成任务。
+只允许输出一个 JSON 对象，不要解释，不要 markdown：
+{{
+  "route": "media_create" | "media_feedback" | "media_followup" | "media_clarify" | "chat",
+  "confidence": "high" | "medium" | "low",
+  "reason_code": "简短英文下划线"
+}}
+
+判定原则：
+1) 明确命令“帮我生成/再生成/重新生成/来一个”且有图或视频对象 => media_create
+2) “再来一版/同风格再来/按上一个来”且有最近作品上下文 => media_followup
+3) 跟做图相关但缺上下文 => media_clarify
+4) 对“已生成内容”的评价、回顾、感叹 => media_feedback
+5) 若用户明确说“不是要生成/先别生成/只是聊聊”，必须 route=chat
+6) 不确定时优先 chat，不要误触发生成
+
+用户输入：{query}
+规则探测：{probe}
+最近媒体上下文：{recent}
+"""
+    )
+    try:
+        chain = prompt | get_lc_ali_model_client(temperature=0.1, streaming=False) | StrOutputParser()
+        raw = str(chain.invoke({"query": q, "probe": json.dumps(probe, ensure_ascii=False), "recent": json.dumps(recent, ensure_ascii=False)}) or "").strip()
+        parsed = _parse_json_object(raw)
+        route = str(parsed.get("route") or "").strip().lower()
+        confidence = str(parsed.get("confidence") or "").strip().lower()
+        reason_code = str(parsed.get("reason_code") or "").strip() or "llm_classifier"
+        if route not in {"media_create", "media_feedback", "media_followup", "media_clarify", "chat"}:
+            return {}
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "medium"
+        if bool(probe.get("negation_guard_hit")) and route == "media_create":
+            route = "chat"
+            reason_code = "llm_guarded_by_negation"
+        blocked, blocked_reason = check_media_safety(q)
+        scenario = default_scenario if route in {"media_create", "media_followup"} else ""
+        if route in {"media_create", "media_followup"} and not scenario:
+            scenario = _fallback_media_scenario_by_query(q)
+        return {
+            "route": route,
+            "scenario": scenario,
+            "scenario_label": MEDIA_SCENARIO_LABELS.get(scenario, scenario),
+            "confidence": confidence,
+            "reason_code": reason_code,
+            "blocked": bool(blocked and route in {"media_create", "media_followup"}),
+            "blocked_reason": str(blocked_reason or "") if bool(blocked and route in {"media_create", "media_followup"}) else "",
+            "media_like": bool(probe.get("media_like") or False),
+            "needs_llm": False,
+            "intent_version": "v3",
+            "decision_source": "llm",
+            "create_score": int(max(0, int(probe.get("create_score") or 0))),
+            "feedback_score": int(max(0, int(probe.get("feedback_score") or 0))),
+            "negation_guard_hit": bool(probe.get("negation_guard_hit") or False),
+            "conflict": False,
+        }
+    except Exception as e:
+        logger.warning(f"媒体二阶判别失败，降级chat: {e}")
+        return {}
+
+
+def _resolve_media_intent(query: str, session_id: str) -> tuple[dict, dict]:
+    recent_media = _get_last_media_context(session_id) or {}
+    if not MEDIA_INTENT_ROUTER_V2:
+        legacy = detect_media_intent(
+            query,
+            recent_media=recent_media,
+            router_version="v2",
+            negation_guard_enabled=False,
+        )
+        decision = {
+            "route": "media_create" if bool(legacy.get("hit")) else "chat",
+            "scenario": str(legacy.get("scenario") or ""),
+            "scenario_label": str(legacy.get("scenario_label") or ""),
+            "confidence": "high" if bool(legacy.get("hit")) else "low",
+            "reason_code": "router_v2_disabled",
+            "blocked": bool(legacy.get("blocked") or False),
+            "blocked_reason": str(legacy.get("blocked_reason") or ""),
+            "media_like": bool(legacy.get("hit") or False),
+            "needs_llm": False,
+            "intent_version": "v2",
+            "decision_source": "rule",
+            "create_score": int(max(0, int(legacy.get("create_score") or 0))),
+            "feedback_score": int(max(0, int(legacy.get("feedback_score") or 0))),
+            "negation_guard_hit": bool(legacy.get("negation_guard_hit") or False),
+            "conflict": bool(legacy.get("conflict") or False),
+        }
+        _metric_incr(f"media_intent_route_total__{decision['route']}")
+        return legacy, decision
+
+    router_version = "v3" if MEDIA_INTENT_ROUTER_V3 else "v2"
+    decision = route_media_intent(
+        query,
+        recent_media=recent_media,
+        router_version=router_version,
+        negation_guard_enabled=bool(MEDIA_INTENT_NEGATION_GUARD),
+    )
+    route_name = str(decision.get("route") or "chat")
+    _metric_incr(f"media_intent_route_total__{route_name}")
+    if bool(decision.get("negation_guard_hit") or False):
+        _metric_incr("media_intent_negation_guard_total")
+    if route_name == "media_followup":
+        _metric_incr("media_intent_followup_total")
+    if bool(decision.get("conflict") or False):
+        _metric_incr("media_intent_conflict_total")
+
+    needs_fallback = bool(
+        MEDIA_INTENT_LLM_FALLBACK
+        and str(decision.get("route") or "") == "chat"
+        and bool(decision.get("media_like") or False)
+        and (
+            bool(decision.get("needs_llm"))
+            or str(decision.get("reason_code") or "") == "intent_conflict"
+        )
+    )
+    if needs_fallback:
+        _metric_incr("media_intent_llm_fallback_total")
+        llm_decision = _classify_media_route_with_model(query, decision, recent_media=recent_media)
+        if llm_decision:
+            decision = llm_decision
+            route_name = str(decision.get("route") or "chat")
+            _metric_incr(f"media_intent_route_total__{route_name}")
+        else:
+            _metric_incr("media_intent_force_chat_total")
+            decision = {
+                "route": "chat",
+                "scenario": "",
+                "scenario_label": "",
+                "confidence": "low",
+                "reason_code": "llm_fallback_failed_chat",
+                "blocked": False,
+                "blocked_reason": "",
+                "media_like": bool(decision.get("media_like") or False),
+                "needs_llm": False,
+                "intent_version": str(decision.get("intent_version") or router_version),
+                "decision_source": "rule",
+                "create_score": int(max(0, int(decision.get("create_score") or 0))),
+                "feedback_score": int(max(0, int(decision.get("feedback_score") or 0))),
+                "negation_guard_hit": bool(decision.get("negation_guard_hit") or False),
+                "conflict": bool(decision.get("conflict") or False),
+            }
+
+    route_name = str(decision.get("route") or "chat")
+    hit = route_name in {"media_create", "media_followup"}
+    scenario = str(decision.get("scenario") or "")
+    if hit and not scenario:
+        scenario = _fallback_media_scenario_by_query(query)
+        decision["scenario"] = scenario
+        decision["scenario_label"] = MEDIA_SCENARIO_LABELS.get(scenario, scenario)
+    legacy = {
+        "hit": hit and bool(scenario),
+        "scenario": scenario if hit else "",
+        "scenario_label": MEDIA_SCENARIO_LABELS.get(scenario, scenario) if hit else "",
+        "blocked": bool(decision.get("blocked") or False),
+        "blocked_reason": str(decision.get("blocked_reason") or ""),
+        "route": route_name,
+        "confidence": str(decision.get("confidence") or "low"),
+        "reason_code": str(decision.get("reason_code") or "none"),
+        "needs_llm": bool(decision.get("needs_llm") or False),
+        "media_like": bool(decision.get("media_like") or False),
+        "intent_version": str(decision.get("intent_version") or router_version),
+        "decision_source": str(decision.get("decision_source") or "rule"),
+        "create_score": int(max(0, int(decision.get("create_score") or 0))),
+        "feedback_score": int(max(0, int(decision.get("feedback_score") or 0))),
+        "negation_guard_hit": bool(decision.get("negation_guard_hit") or False),
+        "conflict": bool(decision.get("conflict") or False),
+    }
+    return legacy, decision
+
+
+def _create_and_submit_media_task(
+    *,
+    user_id: int,
+    session_id: str,
+    query: str,
+    scenario: str,
+    profile: dict[str, str],
+    user_identity: str,
+) -> tuple[dict | None, str]:
+    if not _media_ready():
+        return None, "MEDIA_DISABLED"
+    # 先用基础提示创建任务并立即返回，避免主请求被外部链路阻塞；
+    # 命理增强与 Dify 提交在后台完成。
+    prompt_bundle = build_media_prompt(
+        scenario=scenario,
+        query=query,
+        profile=profile,
+        destiny_hint="",
+    )
+    task = create_media_task(
+        _db_conn,
+        user_id=user_id,
+        session_id=session_id,
+        scenario=scenario,
+        query=query,
+        prompt_bundle=prompt_bundle,
+    )
+    task_id = str(task.get("task_id") or "")
+    if not task_id:
+        return None, "TASK_CREATE_FAILED"
+    _set_last_media_context(
+        session_id,
+        task_id=task_id,
+        scenario=str(scenario or ""),
+        query=str(query or ""),
+        status=str(task.get("status") or "pending"),
+    )
+    try:
+        worker = threading.Thread(
+            target=_submit_media_task_background,
+            kwargs={
+                "task_id": task_id,
+                "query": query,
+                "scenario": scenario,
+                "profile": profile,
+                "user_identity": user_identity,
+            },
+            daemon=True,
+            name=f"media-submit-{task_id[:8]}",
+        )
+        worker.start()
+    except Exception as e:
+        logger.error(f"启动媒体提交后台线程失败: {e}")
+        _mark_media_task_failed(task_id, "MEDIA_SUBMIT_THREAD_FAILED", "媒体任务提交失败，请稍后重试")
+        task = get_media_task(_db_conn, task_id, user_id=int(user_id or 0))
+        return task, "MEDIA_SUBMIT_THREAD_FAILED"
+    return task, ""
+
+
+def _submit_media_task_background(
+    *,
+    task_id: str,
+    query: str,
+    scenario: str,
+    profile: dict,
+    user_identity: str,
+) -> None:
+    try:
+        destiny_hint = _build_media_destiny_hint(str(query or ""), profile if isinstance(profile, dict) else {}, str(scenario or ""))
+        prompt_bundle = build_media_prompt(
+            scenario=str(scenario or ""),
+            query=str(query or ""),
+            profile=profile if isinstance(profile, dict) else {},
+            destiny_hint=destiny_hint,
+        )
+        prompt_raw = str((prompt_bundle or {}).get("prompt") or "")
+        if prompt_raw:
+            prompt_bundle["prompt"] = _compress_prompt_with_model(prompt_raw, max_chars=DIFY_PROMPT_MAX_CHARS)
+        submit_media_task(
+            _db_conn,
+            _DIFY_MEDIA_CLIENT,
+            task_id=str(task_id or ""),
+            scenario=str(scenario or ""),
+            prompt_bundle=prompt_bundle if isinstance(prompt_bundle, dict) else {},
+            user_identity=str(user_identity or ""),
+        )
+    except Exception as e:
+        logger.error(f"后台提交媒体任务失败 task_id={task_id}: {e}\n{traceback.format_exc()}")
+        _mark_media_task_failed(str(task_id or ""), "MEDIA_SUBMIT_FAILED", "媒体任务提交失败，请稍后重试")
+
+
+def _mark_media_task_failed(task_id: str, error_code: str, error_message: str) -> None:
+    tid = str(task_id or "").strip()
+    if not tid:
+        return
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE media_tasks
+                    SET status = 'failed',
+                        error_code = %s,
+                        error_message = %s,
+                        finished_at = NOW(),
+                        updated_at = NOW()
+                    WHERE task_id = %s AND status IN ('pending', 'running')
+                    """,
+                    (str(error_code or "MEDIA_SUBMIT_FAILED"), str(error_message or "媒体任务提交失败"), tid),
+                )
+    except Exception as e:
+        logger.error(f"写入媒体失败状态异常 task_id={tid}: {e}")
 
 
 def detect_emotion_level(query: str) -> str:
@@ -2700,6 +3647,8 @@ def _missing_profile_fields_for_fortune(profile: dict[str, str]) -> list[str]:
         missing.append("name")
     if not str(profile.get("birthdate") or "").strip():
         missing.append("birthdate")
+    if _normalize_gender(str(profile.get("gender") or "unknown")) == "unknown":
+        missing.append("gender")
     return missing
 
 
@@ -2709,6 +3658,51 @@ def build_fortune_missing_reply(missing: list[str]) -> str:
     if missing == ["birthdate"]:
         return "呀哈～我还需要你的出生年月日（例如 2001-08-15），这样命理判断才更准。"
     return "呀哈～我先帮你把资料补齐：请告诉我姓名和出生年月日（例如 2001-08-15；知道时辰也可以一起说）。"
+
+
+def build_profile_gate_reply(missing: list[str]) -> str:
+    miss = set(missing or [])
+    if miss == {"name"}:
+        return "呀哈～先让本鼠鼠认识你一下：请先告诉我你的姓名（2-12个字）喔。"
+    if miss == {"birthdate"}:
+        return "呀哈～还差一个小资料：请告诉我你的出生年月日（例如 2001-08-15）喔。"
+    if miss == {"gender"}:
+        return "呀哈～还差一个小资料：请告诉我你的性别（男/女）喔。"
+    if miss == {"name", "birthdate"}:
+        return "呀哈～开始前先给我姓名和出生年月日（例如 2001-08-15）吧，资料齐了我就认真帮你看～"
+    if miss == {"name", "gender"}:
+        return "呀哈～还差两项资料：请告诉我姓名（2-12个字）和性别（男/女）喔。"
+    if miss == {"birthdate", "gender"}:
+        return "呀哈～还差两项资料：请告诉我出生年月日（例如 2001-08-15）和性别（男/女）喔。"
+    return "呀哈～开始前先给我姓名、出生年月日（例如 2001-08-15）和性别（男/女）吧，资料齐了我就认真帮你看～"
+
+
+def build_profile_ready_transition(profile: dict[str, str] | None = None) -> str:
+    p = profile or {}
+    call_name = str(p.get("preferred_name") or p.get("name") or "").strip()
+    head = f"呀哈～{call_name}，资料我都收好啦。" if call_name else "呀哈～资料我都收好啦。"
+    return (
+        f"{head}\n"
+        "姓名、生日和性别已经对齐，本鼠鼠先把小星盘和节气线索摆正一下～\n"
+        "你下一句直接告诉我想看的方向就行：比如“看事业”“看感情”“看今天运势”或“生成正缘画像”。"
+    )
+
+
+def build_media_missing_reply(missing: list[str]) -> str:
+    miss = set(missing or [])
+    if miss == {"name"}:
+        return "呀哈～生成正缘画像/视频前，我还需要你的姓名（2-12个字）来对齐命理信息。"
+    if miss == {"birthdate"}:
+        return "呀哈～生成前还差一个关键资料：你的出生年月日（例如 2001-08-15）。"
+    if miss == {"gender"}:
+        return "呀哈～生成前还差一个关键资料：你的性别（男/女）。"
+    if miss == {"name", "birthdate"}:
+        return "呀哈～想生成正缘画像/视频的话，请先告诉我姓名和出生年月日（例如 2001-08-15）喔。"
+    if miss == {"name", "gender"}:
+        return "呀哈～想生成正缘画像/视频的话，请先告诉我姓名（2-12个字）和性别（男/女）喔。"
+    if miss == {"birthdate", "gender"}:
+        return "呀哈～想生成正缘画像/视频的话，请先告诉我出生年月日（例如 2001-08-15）和性别（男/女）喔。"
+    return "呀哈～想生成正缘画像/视频的话，请先告诉我姓名、出生年月日（例如 2001-08-15）和性别（男/女）喔。"
 
 
 def _default_fortune_advice(topic: str, strength: str) -> list[str]:
@@ -3657,6 +4651,7 @@ def strip_profile_echo(text: str, profile: dict | None = None, user_query: str =
     p = profile or {}
     name = str(p.get("name") or "").strip()
     preferred_name = str(p.get("preferred_name") or "").strip()
+    gender = _normalize_gender(str(p.get("gender") or "unknown"))
     birthdate = str(p.get("birthdate") or "").strip()
     birthtime = str(p.get("birthtime") or "").strip()
 
@@ -3667,7 +4662,17 @@ def strip_profile_echo(text: str, profile: dict | None = None, user_query: str =
     else:
         replace_name = _pick_address_name(p, user_query=user_query)
     if name and len(name) >= 2:
+        # 先处理“姓名+敬称”，避免出现“你小姐/你先生”这类生硬替换。
+        # 若当前采用匿名称呼“你”，句首敬称直接移除（如“刘芷华小姐，欢迎...” -> “欢迎...”）。
+        honorific_pattern = rf"{re.escape(name)}\s*(?:小姐|先生|同学|老师|女士|男士)\s*[，,、]?"
+        honorific_repl = "" if replace_name == "你" else f"{replace_name}，"
+        out = re.sub(honorific_pattern, honorific_repl, out)
         out = out.replace(name, replace_name)
+        out = re.sub(r"^[，,、\s]+", "", out)
+    if gender == "unknown":
+        # 未提供性别时，统一中性称呼，避免模型猜测“小姐/先生”等。
+        out = re.sub(r"(小姐姐|小哥哥|小姐|先生|女士|男士)", "同学", out)
+        out = re.sub(r"(同学){2,}", "同学", out)
     if birthdate:
         out = out.replace(birthdate, "你的生日")
         out = out.replace(birthdate.replace("-", "年", 1).replace("-", "月") + "日", "你的生日")
@@ -3693,7 +4698,13 @@ def sanitize_output(text: str, user_query: str = "", profile: dict | None = None
     out = re.sub(r"[ \t]+\n", "\n", out)
     out = re.sub(r"^\s*你问[“\"].*?[”\"][，,:：]?\s*", "", out, flags=re.MULTILINE)
     out = re.sub(r"^\s*你刚才说[“\"].*?[”\"][，,:：]?\s*", "", out, flags=re.MULTILINE)
-    out = re.sub(r"^\s*[\u4e00-\u9fa5]{2,4}[～~][，,:：]?\s*", "", out, flags=re.MULTILINE)
+    # 保留吉伊口头禅（呀哈/呜啦/噗噜等），仅清理其它异常“XX～”前缀。
+    out = re.sub(
+        r"^\s*(?!(?:呀哈|呜啦|噗噜|哼|呀～哈)[～~])[\u4e00-\u9fa5]{2,4}[～~][，,:：]?\s*",
+        "",
+        out,
+        flags=re.MULTILINE,
+    )
     out = re.sub(r"\n{3,}", "\n\n", out)
 
     lines = [ln.rstrip() for ln in out.splitlines()]
@@ -3778,15 +4789,14 @@ async def read_root(request: Request):
     auth = _get_auth_session(token or "")
     if not auth:
         return RedirectResponse(url="/login", status_code=302)
-    phone = str(auth.get("phone", ""))
-    user = _get_user_by_phone(phone) or {}
+    user, phone, user_uuid = _resolve_user_from_auth(auth)
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "user_phone": phone,
-            "user_short_account": user.get("account", ""),
-            "user_uuid": user.get("uuid", ""),
+            "user_short_account": _build_user_short_account(user, phone=phone, user_uuid=user_uuid),
+            "user_uuid": user_uuid,
         },
     )
 
@@ -3832,21 +4842,30 @@ async def auth_me(request: Request):
     if not auth:
         return JSONResponse({"ok": False, "message": "未登录"}, status_code=401)
 
-    phone = str(auth.get("phone", ""))
-    user = _get_user_by_phone(phone) or {}
+    user, phone, user_uuid = _resolve_user_from_auth(auth)
     user_id = int(user["id"]) if user.get("id") else 0
-    profile = _get_profile_by_user_id(user_id) if user_id else {"name": "", "birthdate": "", "preferred_name": ""}
+    profile = _get_profile_by_user_id(user_id) if user_id else {
+        "name": "",
+        "birthdate": "",
+        "preferred_name": "",
+        "gender": "unknown",
+        "partner_gender_preference": "unknown",
+    }
     return {
         "ok": True,
         "user": {
             "phone": phone,
-            "user_id": str(user.get("uuid") or ""),
-            "short_account": str(user.get("account", "")),
+            "user_id": user_uuid,
+            "short_account": _build_user_short_account(user, phone=phone, user_uuid=user_uuid),
         },
         "profile": {
             "name": str((profile or {}).get("name", "")),
             "preferred_name": str((profile or {}).get("preferred_name", "")),
             "birthdate": str((profile or {}).get("birthdate", "")),
+            "gender": _normalize_gender(str((profile or {}).get("gender") or "unknown")),
+            "partner_gender_preference": _normalize_partner_gender_preference(
+                str((profile or {}).get("partner_gender_preference") or "unknown")
+            ),
         },
     }
 
@@ -4169,6 +5188,8 @@ async def chat(request: Request, payload: ChatRequest):
         "birthdate": "",
         "birthtime": "",
         "preferred_name": "",
+        "gender": "unknown",
+        "partner_gender_preference": "unknown",
         "name_confidence": "none",
         "preferred_name_confidence": "none",
     }
@@ -4180,11 +5201,21 @@ async def chat(request: Request, payload: ChatRequest):
     domain_intent = "general"
     question_type = "default"
     window_meta: dict | None = None
+    intent_decision: dict = {"route": "chat", "confidence": "low", "reason_code": "init"}
+
+    def _with_intent(payload_obj: dict) -> dict:
+        return _attach_intent_extra(payload_obj, intent_decision)
+
+    def _intent_meta(extra_meta: dict | None = None) -> dict:
+        merged = dict(extra_meta or {})
+        merged.update(_intent_extra_payload(intent_decision))
+        return merged
+
     try:
         query = payload.query
         if not query:
             response_data["output"] = "呀哈～先告诉吉伊大师你想问什么吧。"
-            return response_data
+            return _with_intent(response_data)
         _metric_incr("time_anchor_applied_total")
         raw_flags = get_v2_flags()
         flags, flag_reason_code = apply_v2_flag_policy(raw_flags)
@@ -4214,18 +5245,115 @@ async def chat(request: Request, payload: ChatRequest):
         chat_message_history = RedisChatMessageHistory(url=REDIS_URL, session_id=session_id, ttl=SESSION_TTL_SECONDS)
         history_profile = extract_profile_from_history(chat_message_history)
         profile = merge_session_profile(session_id, history_profile)
+        missing_profile_before = _missing_profile_fields_for_fortune(profile)
         pending_preferred_name_prompt = _is_preferred_name_prompt_pending(session_id)
         extracted = extract_profile_from_query(query)
         if pending_preferred_name_prompt and not str(extracted.get("preferred_name") or "").strip():
-            pending_name, pending_conf = _extract_preferred_name_with_confidence(query, allow_soft=True)
-            if pending_name:
-                extracted["preferred_name"] = pending_name
-                extracted["preferred_name_confidence"] = pending_conf
+            if _is_soft_preferred_name_reply(query):
+                pending_name, pending_conf = _extract_preferred_name_with_confidence(query, allow_soft=True)
+                if pending_name:
+                    extracted["preferred_name"] = pending_name
+                    extracted["preferred_name_confidence"] = pending_conf
+            else:
+                # 用户未按昵称回复时，立即结束本次追问状态，避免后续普通对话被软提取污染
+                _set_preferred_name_prompt_pending(session_id, False)
         profile = merge_session_profile(session_id, extracted)
         preferred_name_set_this_turn = bool(str(extracted.get("preferred_name") or "").strip())
         if preferred_name_set_this_turn:
             _set_preferred_name_prompt_pending(session_id, False)
         should_probe_preferred_name = _is_name_intro_query(query, extracted) and not str(profile.get("preferred_name") or "").strip()
+        missing_profile = _missing_profile_fields_for_fortune(profile)
+        media_intent_probe, intent_decision = _resolve_media_intent(query, session_id)
+        profile_gate_for_fortune = bool(
+            (not media_intent_probe.get("hit"))
+            and (
+                is_bazi_fortune_query(query)
+                or is_divination_query(query)
+                or is_zodiac_intent_query(query)
+            )
+        )
+        profile_fields_updated = any(
+            str(extracted.get(k) or "").strip() for k in ("name", "birthdate", "gender")
+        )
+        if missing_profile_before and not missing_profile and profile_fields_updated:
+            _clear_media_pref_prompt_context(session_id)
+            out = build_profile_ready_transition(profile)
+            response_data = {
+                "session_id": session_id,
+                "output": out,
+                "message_type": "text",
+                "media": [],
+                "extra": {
+                    "profile_completed": True,
+                },
+            }
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type="profile",
+                route_path="profile_completed",
+                extra_meta=_intent_meta({
+                    "profile_completed": True,
+                }),
+            )
+            _log_route_observability(
+                route_path="profile_completed",
+                reason_code="profile_completed_transition",
+                flag_snapshot=flag_snapshot,
+                domain_intent=domain_intent,
+                question_type="profile",
+            )
+            return _with_intent(response_data)
+        # 资料缺失仅拦截命理/运势类对话；普通闲聊、问候、时间类不受影响。
+        if missing_profile and profile_gate_for_fortune:
+            _clear_media_pref_prompt_context(session_id)
+            out = build_profile_gate_reply(missing_profile)
+            response_data = {
+                "session_id": session_id,
+                "output": out,
+                "message_type": "text",
+                "media": [],
+                "extra": {
+                    "profile_required": True,
+                    "missing_fields": missing_profile,
+                },
+            }
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type="profile",
+                route_path="profile_required",
+                extra_meta=_intent_meta({
+                    "profile_required": True,
+                    "missing_fields": ",".join(missing_profile),
+                }),
+            )
+            _log_route_observability(
+                route_path="profile_required",
+                reason_code="profile_required",
+                flag_snapshot=flag_snapshot,
+                domain_intent=domain_intent,
+                question_type="profile",
+            )
+            return _with_intent(response_data)
+        resumed_media_ctx = None
+        pending_media_pref_ctx = _get_media_pref_prompt_context(session_id)
+        if pending_media_pref_ctx:
+            pending_pref, pending_pref_conf = _extract_partner_gender_preference_with_confidence(
+                query,
+                allow_bare_reply=True,
+            )
+            if pending_pref in {"male", "female", "any"} and pending_pref_conf == "high":
+                profile = merge_session_profile(session_id, {"partner_gender_preference": pending_pref})
+                resumed_media_ctx = pending_media_pref_ctx
+            # 若用户未按预期回复，结束本次追问，避免上下文污染。
+            _clear_media_pref_prompt_context(session_id)
 
         def _postprocess_output(raw_output: str, qtype: str = question_type) -> str:
             out = sanitize_output(raw_output, user_query=query, profile=profile)
@@ -4239,6 +5367,331 @@ async def chat(request: Request, payload: ChatRequest):
             )
             out = _enforce_min_answer_contract(out, query=query, question_type=qtype)
             return out
+
+        media_query_for_generation = query
+        media_intent = media_intent_probe
+        if resumed_media_ctx:
+            resumed_query = str((resumed_media_ctx or {}).get("query") or "").strip()
+            resumed_scenario = str((resumed_media_ctx or {}).get("scenario") or "").strip()
+            if resumed_query and resumed_scenario:
+                resumed_blocked, resumed_blocked_reason = check_media_safety(resumed_query)
+                media_query_for_generation = resumed_query
+                media_intent = {
+                    "hit": True,
+                    "scenario": resumed_scenario,
+                    "scenario_label": MEDIA_SCENARIO_LABELS.get(resumed_scenario, resumed_scenario),
+                    "blocked": resumed_blocked,
+                    "blocked_reason": resumed_blocked_reason,
+                }
+                intent_decision = {
+                    "route": "media_followup",
+                    "scenario": resumed_scenario,
+                    "scenario_label": MEDIA_SCENARIO_LABELS.get(resumed_scenario, resumed_scenario),
+                    "confidence": "high",
+                    "reason_code": "resume_after_preference",
+                    "blocked": resumed_blocked,
+                    "blocked_reason": resumed_blocked_reason,
+                }
+        if media_intent.get("hit"):
+            _metric_incr("media_intent_total")
+            media_scenario = str(media_intent.get("scenario") or "")
+            if _scenario_requires_profile_for_media(media_scenario):
+                missing_profile = _missing_profile_fields_for_fortune(profile)
+                if missing_profile:
+                    _clear_media_pref_prompt_context(session_id)
+                    out = _postprocess_output(build_media_missing_reply(missing_profile), qtype="media")
+                    response_data = {
+                        "session_id": session_id,
+                        "output": out,
+                        "message_type": "text",
+                        "media": [],
+                        "extra": {
+                            "media_profile_missing": True,
+                            "missing_fields": missing_profile,
+                            "media_scenario": media_scenario,
+                        },
+                    }
+                    _append_chat_history(
+                        chat_message_history,
+                        query,
+                        out,
+                        user_id=user_id,
+                        session_id=session_id,
+                        question_type="media",
+                        route_path="media_profile_missing",
+                        extra_meta=_intent_meta({
+                            "media_status": "missing_profile",
+                            "media_scenario": media_scenario,
+                            "missing_fields": ",".join(missing_profile),
+                        }),
+                    )
+                    _log_route_observability(
+                        route_path="media_profile_missing",
+                        reason_code="media_profile_missing",
+                        flag_snapshot=flag_snapshot,
+                        domain_intent="media",
+                        question_type="media",
+                    )
+                    return _with_intent(response_data)
+            partner_pref = _normalize_partner_gender_preference(str(profile.get("partner_gender_preference") or "unknown"))
+            if _scenario_requires_partner_preference(media_scenario) and partner_pref == "unknown":
+                _set_media_pref_prompt_context(
+                    session_id=session_id,
+                    query=media_query_for_generation,
+                    scenario=media_scenario,
+                )
+                out = _postprocess_output(
+                    "呀哈～开工前先确认一下呀：你希望正缘形象偏向女生、男生，还是不限呢？你回我“女生 / 男生 / 不限”就行～",
+                    qtype="media",
+                )
+                response_data = {
+                    "session_id": session_id,
+                    "output": out,
+                    "message_type": "text",
+                    "media": [],
+                    "extra": {
+                        "awaiting_partner_preference": True,
+                        "media_scenario": media_scenario,
+                        "choice_buttons": [
+                            {"text": "女生", "send_text": "女生"},
+                            {"text": "男生", "send_text": "男生"},
+                            {"text": "不限", "send_text": "不限"},
+                        ],
+                    },
+                }
+                _append_chat_history(
+                    chat_message_history,
+                    query,
+                    out,
+                    user_id=user_id,
+                    session_id=session_id,
+                    question_type="media",
+                    route_path="media_pref_prompt",
+                    extra_meta=_intent_meta({
+                        "media_status": "awaiting_preference",
+                        "media_scenario": media_scenario,
+                    }),
+                )
+                _log_route_observability(
+                    route_path="media_pref_prompt",
+                    reason_code="media_partner_preference_missing",
+                    flag_snapshot=flag_snapshot,
+                    domain_intent="media",
+                    question_type="media",
+                )
+                return _with_intent(response_data)
+            if bool(media_intent.get("blocked")):
+                blocked_reason = str(media_intent.get("blocked_reason") or "内容不符合生成要求")
+                out = _postprocess_output(
+                    f"这条内容我不能直接生成媒体：{blocked_reason}。你可以换一个更安全的描述，我继续帮你生成。",
+                    qtype="media",
+                )
+                response_data = {
+                    "session_id": session_id,
+                    "output": out,
+                    "message_type": "text",
+                    "media": [],
+                    "extra": {"media_blocked": True, "blocked_reason": blocked_reason},
+                }
+                _append_chat_history(
+                    chat_message_history,
+                    query,
+                    out,
+                    user_id=user_id,
+                    session_id=session_id,
+                    question_type="media",
+                    route_path="media_blocked",
+                    extra_meta=_intent_meta({
+                        "media_status": "blocked",
+                        "media_scenario": media_scenario,
+                        "blocked_reason": blocked_reason,
+                    }),
+                )
+                _log_route_observability(
+                    route_path="media_blocked",
+                    reason_code="media_safety_blocked",
+                    flag_snapshot=flag_snapshot,
+                    domain_intent="media",
+                    question_type="media",
+                )
+                return _with_intent(response_data)
+
+            task, err_code = _create_and_submit_media_task(
+                user_id=user_id,
+                session_id=session_id,
+                query=media_query_for_generation,
+                scenario=media_scenario,
+                profile=profile,
+                user_identity=session_id,
+            )
+            if not task:
+                _metric_incr("media_failed_total")
+                out = _postprocess_output(
+                    "文生图/视频功能暂未开启，请稍后再试，或先告诉我你想要的风格与场景，我先给你文案草图。",
+                    qtype="media",
+                )
+                response_data = {
+                    "session_id": session_id,
+                    "output": out,
+                    "message_type": "media_failed",
+                    "media": [],
+                    "extra": {"reason_code": err_code or "media_unavailable"},
+                }
+                _append_chat_history(
+                    chat_message_history,
+                    query,
+                    out,
+                    user_id=user_id,
+                    session_id=session_id,
+                    question_type="media",
+                    route_path="media_unavailable",
+                    extra_meta=_intent_meta({
+                        "media_status": "failed",
+                        "media_scenario": media_scenario,
+                        "media_error_code": err_code or "media_unavailable",
+                    }),
+                )
+                _log_route_observability(
+                    route_path="media_unavailable",
+                    reason_code=err_code or "media_unavailable",
+                    flag_snapshot=flag_snapshot,
+                    domain_intent="media",
+                    question_type="media",
+                )
+                return _with_intent(response_data)
+
+            task_api = _build_media_task_response(session_id, task)
+            media_output = str(task_api.get("output") or "")
+            if resumed_media_ctx:
+                pref_cn = _partner_preference_cn(str(profile.get("partner_gender_preference") or "unknown"))
+                if pref_cn:
+                    media_output = f"呀哈～收到啦，这次按你偏好的{pref_cn}来生成。\n{media_output}"
+            task_api["output"] = _postprocess_output(media_output, qtype="media")
+            response_data = task_api
+            task_status = str(task.get("status") or "")
+            if task_status in {"pending", "running"}:
+                _metric_incr("media_pending_total")
+            elif task_status == "succeeded":
+                _metric_incr("media_success_total")
+            else:
+                _metric_incr("media_failed_total")
+            _append_chat_history(
+                chat_message_history,
+                query,
+                str(response_data.get("output") or ""),
+                user_id=user_id,
+                session_id=session_id,
+                question_type="media",
+                route_path="media_pipeline",
+                extra_meta=_intent_meta({
+                    "media_status": task_status,
+                    "media_scenario": media_scenario,
+                    "media_task_id": str(task.get("task_id") or ""),
+                    "media_message_type": str(response_data.get("message_type") or ""),
+                    "media_resumed_after_preference": bool(resumed_media_ctx),
+                }),
+            )
+            _log_route_observability(
+                route_path="media_pipeline",
+                reason_code=f"media_{task_status or 'unknown'}",
+                flag_snapshot=flag_snapshot,
+                domain_intent="media",
+                question_type="media",
+            )
+            return _with_intent(response_data)
+
+        if str(intent_decision.get("route") or "") == "media_feedback":
+            out = _postprocess_output(
+                "呀哈～你这句更像是在聊刚才的作品反馈，我收到啦。要是你想再来一版，可以直接说“再来一版/同风格再来”，也可以说“我想要一张xx图”。",
+                qtype="media",
+            )
+            response_data = {
+                "session_id": session_id,
+                "output": out,
+                "message_type": "text",
+                "media": [],
+            }
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type="media",
+                route_path="media_feedback_chat",
+                extra_meta=_intent_meta({"media_status": "feedback"}),
+            )
+            _log_route_observability(
+                route_path="media_feedback_chat",
+                reason_code=str(intent_decision.get("reason_code") or "media_feedback"),
+                flag_snapshot=flag_snapshot,
+                domain_intent="media",
+                question_type="media",
+            )
+            return _with_intent(response_data)
+
+        if str(intent_decision.get("route") or "") == "media_clarify":
+            out = _postprocess_output(
+                "呜啦～我还没拿到可复用的上一条作品。你可以直接说“按上一个风格生成”或“我想要一张/一段 + 内容”，我就马上开工～",
+                qtype="media",
+            )
+            response_data = {
+                "session_id": session_id,
+                "output": out,
+                "message_type": "text",
+                "media": [],
+            }
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type="media",
+                route_path="media_clarify_chat",
+                extra_meta=_intent_meta({"media_status": "clarify"}),
+            )
+            _log_route_observability(
+                route_path="media_clarify_chat",
+                reason_code=str(intent_decision.get("reason_code") or "media_clarify"),
+                flag_snapshot=flag_snapshot,
+                domain_intent="media",
+                question_type="media",
+            )
+            return _with_intent(response_data)
+
+        if (
+            str(intent_decision.get("route") or "") == "chat"
+            and str(intent_decision.get("reason_code") or "") == "media_mention_no_command"
+        ):
+            out = _postprocess_output(
+                "呀哈～如果你要我现在开生成，直接说“我想要一张/一段 + 内容”就行；如果你想聊刚才那条作品感受，我也在听呀～",
+                qtype="media",
+            )
+            response_data = {
+                "session_id": session_id,
+                "output": out,
+                "message_type": "text",
+                "media": [],
+            }
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type="media",
+                route_path="media_chat_hint",
+                extra_meta=_intent_meta({"media_status": "chat_hint"}),
+            )
+            _log_route_observability(
+                route_path="media_chat_hint",
+                reason_code="media_mention_no_command",
+                flag_snapshot=flag_snapshot,
+                domain_intent="media",
+                question_type="media",
+            )
+            return _with_intent(response_data)
 
         emotion_level = detect_emotion_level(query)
         is_fortune_intent = domain_intent in {"fortune", "zodiac", "divination"}
@@ -4260,6 +5713,7 @@ async def chat(request: Request, payload: ChatRequest):
                 session_id=session_id,
                 question_type=question_type,
                 route_path="fast_reply",
+                extra_meta=_intent_meta(),
             )
             track_output_quality(
                 session_id,
@@ -4275,7 +5729,7 @@ async def chat(request: Request, payload: ChatRequest):
                 domain_intent=domain_intent,
                 question_type=question_type,
             )
-            return response_data
+            return _with_intent(response_data)
         dream_reply, dream_meta = route_dream_pipeline(query)
         if dream_reply is not None:
             out = _postprocess_output(dream_reply)
@@ -4290,6 +5744,7 @@ async def chat(request: Request, payload: ChatRequest):
                 session_id=session_id,
                 question_type=d_qtype,
                 route_path="dream_pipeline",
+                extra_meta=_intent_meta(),
             )
             track_output_quality(
                 session_id,
@@ -4305,10 +5760,10 @@ async def chat(request: Request, payload: ChatRequest):
                 domain_intent="dream",
                 question_type=d_qtype,
             )
-            return {
+            return _with_intent({
                 "session_id": session_id,
                 "output": out,
-            }
+            })
         zodiac_reply, zodiac_meta = route_zodiac_pipeline(query, allow_clarify=bool(flags.get("clarify_v2")))
         if zodiac_reply is not None:
             if is_fortune_intent:
@@ -4330,6 +5785,7 @@ async def chat(request: Request, payload: ChatRequest):
                 session_id=session_id,
                 question_type=z_qtype,
                 route_path=z_route,
+                extra_meta=_intent_meta(),
             )
             track_output_quality(
                 session_id,
@@ -4345,10 +5801,10 @@ async def chat(request: Request, payload: ChatRequest):
                 domain_intent="zodiac",
                 question_type=z_qtype,
             )
-            return {
+            return _with_intent({
                 "session_id": session_id,
                 "output": out,
-            }
+            })
         # P0: 命理强路由，命中后直接返回，不回落通用Agent重写。
         fortune_qtype = question_type if flags.get("intent_v2") else "default"
         fortune_reply, fortune_payload = route_fortune_pipeline(
@@ -4381,6 +5837,7 @@ async def chat(request: Request, payload: ChatRequest):
                 session_id=session_id,
                 question_type=qtype_for_metrics,
                 route_path="fortune_pipeline",
+                extra_meta=_intent_meta(),
             )
             track_output_quality(
                 session_id,
@@ -4399,10 +5856,10 @@ async def chat(request: Request, payload: ChatRequest):
                 domain_intent="fortune",
                 question_type=qtype_for_metrics,
             )
-            return {
+            return _with_intent({
                 "session_id": session_id,
                 "output": out,
-            }
+            })
         time_sensitive = is_time_sensitive_query(query)
         if time_sensitive:
             _metric_incr("time_sensitive_history_isolation_total")
@@ -4465,6 +5922,7 @@ async def chat(request: Request, payload: ChatRequest):
             output=response_data.get("output", ""),
             question_type=question_type,
             route_path="agent_fallback",
+            extra_meta=_intent_meta(),
         )
         _log_route_observability(
             route_path="agent_fallback",
@@ -4473,6 +5931,7 @@ async def chat(request: Request, payload: ChatRequest):
             domain_intent=domain_intent,
             question_type=question_type,
         )
+        return _with_intent(response_data)
     except Exception as e:
         error_id = uuid.uuid4().hex[:8]
         logger.error(f"服务处理异常 error_id={error_id}: {e}\n{traceback.format_exc()}")
@@ -4508,6 +5967,7 @@ async def chat(request: Request, payload: ChatRequest):
                 output=response_data.get("output", ""),
                 question_type=question_type,
                 route_path="error",
+                extra_meta=_intent_meta(),
             )
         _log_route_observability(
             route_path="error",
@@ -4516,7 +5976,154 @@ async def chat(request: Request, payload: ChatRequest):
             domain_intent=domain_intent,
             question_type=question_type,
         )
-    return response_data
+        return _with_intent(response_data)
+
+
+@app.post("/media/tasks", summary="创建媒体生成任务", tags=["Media"], responses={401: {"description": "未登录"}})
+async def create_media_task_api(request: Request, payload: MediaTaskCreateRequest):
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    auth = _get_auth_session(token or "")
+    if not auth:
+        return JSONResponse({"output": "请先登录后再继续聊天。"}, status_code=401)
+
+    query = str(payload.query or "").strip()
+    if not query:
+        return JSONResponse({"ok": False, "message": "query 不能为空"}, status_code=400)
+
+    phone = str(auth.get("phone", ""))
+    user = _get_user_by_phone(phone) or {}
+    if not user:
+        return JSONResponse({"output": "登录信息异常，请重新登录后再试。"}, status_code=401)
+
+    user_id = int(user.get("id") or 0)
+    # 安全要求：会话ID必须绑定当前登录用户，不能信任客户端传入的 session_id。
+    session_id = str(user.get("uuid") or f"phone_{phone}" or str(uuid.uuid4().hex))
+    profile = merge_session_profile(
+        session_id,
+        extract_profile_from_query(query),
+    )
+
+    scenario = str(payload.scenario or "").strip()
+    allowed_scenarios = {
+        "destined_portrait",
+        "destined_video",
+        "encounter_story_video",
+        "healing_sleep_video",
+        "general_image",
+        "general_video",
+    }
+    intent_decision: dict = {}
+    if scenario:
+        if scenario not in allowed_scenarios:
+            return JSONResponse({"ok": False, "message": "scenario 不合法"}, status_code=400)
+        blocked, blocked_reason = check_media_safety(query)
+        media_intent = {"hit": True, "scenario": scenario, "blocked": blocked, "blocked_reason": blocked_reason}
+        intent_decision = {
+            "route": "media_create",
+            "scenario": scenario,
+            "confidence": "high",
+            "reason_code": "api_explicit_scenario",
+            "blocked": bool(blocked),
+            "blocked_reason": str(blocked_reason or ""),
+            "media_like": True,
+            "needs_llm": False,
+            "intent_version": "v3",
+            "decision_source": "rule",
+            "create_score": 2,
+            "feedback_score": 0,
+            "negation_guard_hit": False,
+            "conflict": False,
+        }
+    else:
+        media_intent, intent_decision = _resolve_media_intent(query, session_id)
+    if not media_intent.get("hit"):
+        return JSONResponse({"ok": False, "message": "当前输入未命中媒体生成意图"}, status_code=400)
+    if bool(media_intent.get("blocked")):
+        return JSONResponse(
+            {
+                "ok": False,
+                "message": f"当前输入不支持生成：{str(media_intent.get('blocked_reason') or '内容不安全')}",
+            },
+            status_code=400,
+        )
+
+    media_scenario = str(media_intent.get("scenario") or "")
+    if _scenario_requires_profile_for_media(media_scenario):
+        missing_profile = _missing_profile_fields_for_fortune(profile)
+        if missing_profile:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "message": build_media_missing_reply(missing_profile),
+                    "missing_fields": missing_profile,
+                },
+                status_code=400,
+            )
+    task, err_code = _create_and_submit_media_task(
+        user_id=user_id,
+        session_id=session_id,
+        query=query,
+        scenario=media_scenario,
+        profile=profile,
+        user_identity=session_id,
+    )
+    if not task:
+        return JSONResponse(
+            {
+                "ok": False,
+                "message": "媒体能力不可用，请稍后重试",
+                "error_code": err_code or "media_unavailable",
+            },
+            status_code=503,
+        )
+    task_resp = _build_media_task_response(session_id, task)
+    task_resp["status"] = str(task.get("status") or "")
+    extra = task_resp.get("extra") if isinstance(task_resp.get("extra"), dict) else {}
+    extra.update(_intent_extra_payload(intent_decision))
+    task_resp["extra"] = extra
+    return task_resp
+
+
+@app.get("/media/tasks/{task_id}", summary="查询媒体任务状态", tags=["Media"], responses={401: {"description": "未登录"}})
+async def get_media_task_api(request: Request, task_id: str):
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    auth = _get_auth_session(token or "")
+    if not auth:
+        return JSONResponse({"output": "请先登录后再继续聊天。"}, status_code=401)
+
+    phone = str(auth.get("phone", ""))
+    user = _get_user_by_phone(phone) or {}
+    if not user:
+        return JSONResponse({"output": "登录信息异常，请重新登录后再试。"}, status_code=401)
+
+    user_id = int(user.get("id") or 0)
+    task = get_media_task(_db_conn, str(task_id or ""), user_id=user_id)
+    if not task:
+        return JSONResponse({"ok": False, "message": "任务不存在"}, status_code=404)
+    task_session_id = str(task.get("session_id") or "")
+    if _DIFY_MEDIA_CLIENT:
+        task = refresh_media_task(
+            _db_conn,
+            _DIFY_MEDIA_CLIENT,
+            task_id=str(task_id or ""),
+            user_id=user_id,
+            user_identity=task_session_id,
+            timeout_seconds=MEDIA_TIMEOUT_SECONDS,
+        )
+    if not task:
+        return JSONResponse({"ok": False, "message": "任务不存在"}, status_code=404)
+    _set_last_media_context(
+        str(task.get("session_id") or task_session_id),
+        task_id=str(task.get("task_id") or task_id),
+        scenario=str(task.get("scenario") or ""),
+        query=_task_input_query(task),
+        status=str(task.get("status") or ""),
+    )
+    task_resp = _build_media_task_response(str(task.get("session_id") or task_session_id), task)
+    task_resp["status"] = str(task.get("status") or "")
+    task_resp["poll_interval_seconds"] = int(max(1, MEDIA_POLL_INTERVAL_SECONDS))
+    return task_resp
+
 
 @app.post("/add_urls", summary="新增URL知识到向量库", tags=["Knowledge"])
 async def add_urls(

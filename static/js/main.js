@@ -14,8 +14,26 @@ const logoutBtn = document.getElementById('logoutBtn');
 // 已改为占位气泡提示，禁用全屏蒙层加载效果
 const loadingOverlay = null;
 const TYPING_INTERVAL_MS = 16;
+const MEDIA_POLL_INTERVAL_MS = 4000;
+const MEDIA_POLL_MAX_ATTEMPTS = 45;
+const MEDIA_PROGRESS_HINTS_IMAGE = [
+    '我在帮你调光线和构图，先把氛围感捏出来。',
+    '正在细修人物气质和五官细节，马上就更像了。',
+    '最后一轮润色中，清晰度和质感正在拉满。'
+];
+const MEDIA_PROGRESS_HINTS_VIDEO = [
+    '我在给镜头配节奏，先把开场氛围铺好。',
+    '正在渲染关键画面，动作和光影都在对齐。',
+    '最后合成中，片段马上就能看啦。'
+];
+const MEDIA_PROGRESS_HINTS_GENERIC = [
+    '我在盯着生成进度，尽量给你更顺眼的结果。',
+    '细节还在打磨中，给我一点点时间。',
+    '马上收尾，准备把成片交给你。'
+];
 const SUGGESTION_STATE_KEY = 'jiyi_suggestion_state_v2';
 const SUGGESTION_RECENT_KEY = 'jiyi_suggestion_recent_v1';
+const MEDIA_PREVIEW_MODAL_ID = 'mediaPreviewModal';
 const DEEP_EMOTION_KEYWORDS = /(撑不住|难过|放弃|崩溃|委屈|压抑|痛苦|绝望|失眠|焦虑|不想活|活不下去|没意义)/;
 const SUGGESTION_LIBRARY_POSITIVE = {
     emotion: {
@@ -378,6 +396,337 @@ function withProfileHintIfMissing(text) {
     return String(text || "");
 }
 
+function escapeHtml(raw) {
+    return String(raw ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function safeHttpUrl(rawUrl) {
+    const text = String(rawUrl || '').trim();
+    if (!text) return '';
+    try {
+        const parsed = new URL(text);
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+            return parsed.toString();
+        }
+    } catch (e) {
+        return '';
+    }
+    return '';
+}
+
+function normalizeMediaList(data) {
+    const list = Array.isArray(data?.media) ? data.media : [];
+    return list
+        .map((item) => {
+            const kind = String(item?.kind || '').toLowerCase();
+            const url = safeHttpUrl(item?.url);
+            const cover = safeHttpUrl(item?.cover_url);
+            const duration = Number(item?.duration_sec || 0);
+            const prompt = String(item?.prompt_used || '');
+            if (!url) return null;
+            return {
+                kind: kind === 'video' ? 'video' : 'image',
+                url,
+                cover,
+                durationSec: Number.isFinite(duration) && duration > 0 ? duration : 0,
+                prompt,
+            };
+        })
+        .filter(Boolean);
+}
+
+function updateMessageBubbleText(messageEl, text) {
+    if (!messageEl) return;
+    const safe = escapeHtml(String(text || '')).replace(/\n/g, '<br>');
+    messageEl.innerHTML = safe;
+    if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function buildMediaProgressText(scenarioLabel, attempt, elapsedSec) {
+    const label = String(scenarioLabel || '媒体内容');
+    const isVideo = /视频|剧情|片段/.test(label);
+    const isImage = /画像|图片|图像|写真/.test(label);
+    const hints = isVideo
+        ? MEDIA_PROGRESS_HINTS_VIDEO
+        : isImage
+            ? MEDIA_PROGRESS_HINTS_IMAGE
+            : MEDIA_PROGRESS_HINTS_GENERIC;
+    const phase = attempt <= 1 ? '起稿中' : attempt <= 3 ? '细化中' : '收尾中';
+    const hint = hints[attempt % hints.length];
+    const wait = elapsedSec > 0 ? `（已等待约${elapsedSec}秒）` : '';
+    return `呀哈～${label}${phase}。\n${hint}${wait}`;
+}
+
+function buildMediaProgressPercent(attempt, elapsedSec, status = 'running') {
+    if (status === 'succeeded') return 100;
+    if (status === 'failed' || status === 'timeout') return 100;
+    const byAttempt = 14 + attempt * 11;
+    const byTime = Math.min(72, Math.round(elapsedSec * 1.4));
+    const percent = Math.max(byAttempt, byTime);
+    return Math.max(8, Math.min(94, percent));
+}
+
+function ensureMediaProgressUI(messageEl, scenarioLabel = '') {
+    if (!messageEl) return null;
+    messageEl.classList.add('media-progress-message');
+    const label = String(scenarioLabel || '媒体内容');
+    messageEl.innerHTML = `
+        <div class="media-progress-card is-running">
+            <div class="media-progress-head">
+                <strong class="media-progress-title">${escapeHtml(label)}生成中</strong>
+                <span class="media-progress-percent">0%</span>
+            </div>
+            <div class="media-progress-track">
+                <span class="media-progress-fill" style="width:0%"></span>
+            </div>
+            <p class="media-progress-status">正在准备素材与风格参数…</p>
+        </div>
+    `;
+    if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+    return messageEl;
+}
+
+function setMediaProgressState(messageEl, payload = {}) {
+    if (!messageEl) return;
+    const card = messageEl.querySelector('.media-progress-card');
+    if (!card) return;
+    const titleEl = card.querySelector('.media-progress-title');
+    const percentEl = card.querySelector('.media-progress-percent');
+    const fillEl = card.querySelector('.media-progress-fill');
+    const statusEl = card.querySelector('.media-progress-status');
+
+    const label = String(payload.scenarioLabel || '媒体内容');
+    const attempt = Number(payload.attempt || 1);
+    const elapsedSec = Number(payload.elapsedSec || 0);
+    const status = String(payload.status || 'running');
+    const customText = String(payload.customText || '').trim();
+    const percent = Number.isFinite(payload.percent)
+        ? Number(payload.percent)
+        : buildMediaProgressPercent(attempt, elapsedSec, status);
+    const phaseText = customText || buildMediaProgressText(label, attempt, elapsedSec);
+
+    card.classList.remove('is-running', 'is-done', 'is-failed');
+    if (status === 'succeeded') {
+        card.classList.add('is-done');
+    } else if (status === 'failed' || status === 'timeout') {
+        card.classList.add('is-failed');
+    } else {
+        card.classList.add('is-running');
+    }
+
+    if (titleEl) {
+        titleEl.textContent = status === 'succeeded'
+            ? `${label}已完成`
+            : status === 'failed' || status === 'timeout'
+                ? `${label}生成失败`
+                : `${label}生成中`;
+    }
+    if (percentEl) {
+        percentEl.textContent = `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
+    }
+    if (fillEl) {
+        fillEl.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+    }
+    if (statusEl) {
+        statusEl.innerHTML = escapeHtml(phaseText).replace(/\n/g, '<br>');
+    }
+    if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function appendMediaCards(mediaItems) {
+    if (!chatMessages || !Array.isArray(mediaItems) || mediaItems.length === 0) return null;
+    let lastWrap = null;
+    mediaItems.slice(0, 4).forEach((item, idx) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'message bot-message media-message media-single-message';
+
+        const card = document.createElement('article');
+        card.className = 'media-card media-card-plain';
+        const preview = document.createElement('div');
+        preview.className = 'media-preview media-preview-plain';
+
+        if (item.kind === 'video') {
+            const video = document.createElement('video');
+            video.controls = true;
+            video.preload = 'metadata';
+            video.playsInline = true;
+            if (item.cover) video.poster = item.cover;
+            const source = document.createElement('source');
+            source.src = item.url;
+            video.appendChild(source);
+            preview.appendChild(video);
+        } else {
+            const imgBtn = document.createElement('button');
+            imgBtn.type = 'button';
+            imgBtn.className = 'media-image-btn';
+            imgBtn.setAttribute('aria-label', `查看图片 ${idx + 1}`);
+            const img = document.createElement('img');
+            img.src = item.url;
+            img.alt = `图片 ${idx + 1}`;
+            img.loading = 'lazy';
+            imgBtn.appendChild(img);
+            imgBtn.addEventListener('click', () => openImagePreview(item.url, img.alt));
+            preview.appendChild(imgBtn);
+        }
+
+        card.appendChild(preview);
+        wrap.appendChild(card);
+        chatMessages.appendChild(wrap);
+        lastWrap = wrap;
+    });
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return lastWrap;
+}
+
+function ensureImagePreviewModal() {
+    let modal = document.getElementById(MEDIA_PREVIEW_MODAL_ID);
+    if (modal) return modal;
+    modal = document.createElement('div');
+    modal.id = MEDIA_PREVIEW_MODAL_ID;
+    modal.className = 'media-preview-modal hidden';
+    modal.innerHTML = `
+        <div class="media-preview-backdrop" data-role="backdrop"></div>
+        <div class="media-preview-dialog" role="dialog" aria-modal="true" aria-label="图片预览">
+            <button type="button" class="media-preview-close" aria-label="关闭预览">×</button>
+            <img class="media-preview-image" alt="预览图片">
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    const close = () => {
+        modal.classList.add('hidden');
+        document.body.classList.remove('media-preview-open');
+        const img = modal.querySelector('.media-preview-image');
+        if (img) img.setAttribute('src', '');
+    };
+    modal.querySelector('.media-preview-close')?.addEventListener('click', close);
+    modal.querySelector('[data-role="backdrop"]')?.addEventListener('click', close);
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !modal.classList.contains('hidden')) {
+            close();
+        }
+    });
+    return modal;
+}
+
+function openImagePreview(url, altText = '预览图片') {
+    const safeUrl = safeHttpUrl(url);
+    if (!safeUrl) return;
+    const modal = ensureImagePreviewModal();
+    const img = modal.querySelector('.media-preview-image');
+    if (!img) return;
+    img.setAttribute('src', safeUrl);
+    img.setAttribute('alt', String(altText || '预览图片'));
+    modal.classList.remove('hidden');
+    document.body.classList.add('media-preview-open');
+}
+
+async function pollMediaTask(mediaTaskId, initialPollIntervalSeconds = 0, pendingMessageEl = null, scenarioLabel = '') {
+    const taskId = String(mediaTaskId || '').trim();
+    if (!taskId) return;
+    let activeScenarioLabel = String(scenarioLabel || '');
+    const startedAt = Date.now();
+    const initialSeconds = Number(initialPollIntervalSeconds || 0);
+    let nextPollIntervalMs = Number.isFinite(initialSeconds) && initialSeconds > 0
+        ? Math.max(1000, Math.round(initialSeconds * 1000))
+        : MEDIA_POLL_INTERVAL_MS;
+    for (let attempt = 0; attempt < MEDIA_POLL_MAX_ATTEMPTS; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, nextPollIntervalMs));
+        try {
+            const response = await fetch(`/media/tasks/${encodeURIComponent(taskId)}`, {
+                method: 'GET',
+                credentials: 'same-origin',
+            });
+            if (response.status === 401) {
+                addMessage('登录状态已过期，请重新登录后再查看生成结果。', 'bot');
+                return;
+            }
+            if (!response.ok) {
+                const isRetryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
+                if (isRetryable) {
+                    continue;
+                }
+                let errMessage = '媒体任务状态获取失败，请重新发起生成。';
+                try {
+                    const errData = await parseJsonSafely(response);
+                    errMessage = String(errData?.message || errData?.output || '').trim() || errMessage;
+                } catch (e) {
+                    // ignore parse error and use fallback
+                }
+                addMessage(errMessage, 'bot');
+                return;
+            }
+            const data = await parseJsonSafely(response);
+            const status = String(data?.status || '').toLowerCase();
+            const messageType = String(data?.message_type || '');
+            const mediaItems = normalizeMediaList(data);
+            const fetchedLabel = String(data?.extra?.scenario_label || '').trim();
+            if (!activeScenarioLabel && fetchedLabel) {
+                activeScenarioLabel = fetchedLabel;
+            }
+            const pollIntervalSeconds = Number(data?.poll_interval_seconds || 0);
+            if (Number.isFinite(pollIntervalSeconds) && pollIntervalSeconds > 0) {
+                nextPollIntervalMs = Math.max(1000, Math.round(pollIntervalSeconds * 1000));
+            }
+
+            if (status === 'pending' || status === 'running' || messageType === 'media_pending') {
+                const elapsedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+                setMediaProgressState(pendingMessageEl, {
+                    scenarioLabel: activeScenarioLabel,
+                    attempt: attempt + 1,
+                    elapsedSec,
+                    status: 'running',
+                });
+            }
+
+            if (status === 'failed' || status === 'timeout' || messageType === 'media_failed') {
+                setMediaProgressState(pendingMessageEl, {
+                    scenarioLabel: activeScenarioLabel,
+                    attempt: attempt + 1,
+                    elapsedSec: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+                    status: status === 'timeout' ? 'timeout' : 'failed',
+                    customText: getChatOutput(data) || '这次媒体生成失败了，请稍后再试。',
+                    percent: 100,
+                });
+                addMessage(getChatOutput(data) || '这次媒体生成失败了，请稍后再试。', 'bot');
+                return;
+            }
+            if (messageType === 'media_result' || (status === 'succeeded' && mediaItems.length > 0)) {
+                setMediaProgressState(pendingMessageEl, {
+                    scenarioLabel: activeScenarioLabel,
+                    attempt: attempt + 1,
+                    elapsedSec: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+                    status: 'succeeded',
+                    customText: '渲染完成，正在为你展开作品卡片。',
+                    percent: 100,
+                });
+                const out = getChatOutput(data);
+                if (out && !/已开始为你生成/.test(out)) {
+                    addMessage(out, 'bot');
+                }
+                appendMediaCards(mediaItems);
+                return;
+            }
+        } catch (e) {
+            console.error('poll media task error:', e);
+        }
+    }
+    setMediaProgressState(pendingMessageEl, {
+        scenarioLabel: activeScenarioLabel,
+        attempt: MEDIA_POLL_MAX_ATTEMPTS,
+        elapsedSec: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+        status: 'timeout',
+        customText: '这次生成时间有点久，先帮你收起任务啦。你稍后可以让我继续查看上次结果。',
+        percent: 100,
+    });
+    addMessage('这次生成时间有点久，你可以稍后再问我“继续查看上次生成结果”。', 'bot');
+}
+
 function appendSuggestionButtons(anchorMessageEl, suggestions) {
     if (!chatMessages || !anchorMessageEl || !Array.isArray(suggestions) || suggestions.length === 0) return;
 
@@ -404,6 +753,47 @@ function appendSuggestionButtons(anchorMessageEl, suggestions) {
 
     anchorMessageEl.insertAdjacentElement('afterend', wrap);
     chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function normalizeChoiceButtons(data) {
+    const raw = Array.isArray(data?.extra?.choice_buttons) ? data.extra.choice_buttons : [];
+    return raw
+        .map((item) => {
+            const text = String(item?.text || '').trim();
+            const sendText = String(item?.send_text || text).trim();
+            if (!text || !sendText) return null;
+            return { text, sendText };
+        })
+        .filter(Boolean)
+        .slice(0, 4);
+}
+
+function appendChoiceButtons(anchorMessageEl, choices) {
+    if (!chatMessages || !anchorMessageEl || !Array.isArray(choices) || choices.length === 0) return false;
+    const wrap = document.createElement('div');
+    wrap.className = 'quick-suggestions quick-choice-suggestions';
+
+    choices.forEach((item) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'quick-suggestion-btn';
+        btn.textContent = item.text;
+        btn.addEventListener('click', async () => {
+            if (!userInput || isSending) return;
+            const allBtns = wrap.querySelectorAll('button');
+            allBtns.forEach((node) => {
+                node.disabled = true;
+            });
+            userInput.value = item.sendText;
+            await sendMessage();
+            wrap.remove();
+        });
+        wrap.appendChild(btn);
+    });
+
+    anchorMessageEl.insertAdjacentElement('afterend', wrap);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return true;
 }
 
 function playHeartEffect(button) {
@@ -495,10 +885,42 @@ async function sendMessage() {
             throw new Error(`HTTP_${response.status}:${bodyText.slice(0, 120)}`);
         }
         const data = await parseJsonSafely(response);
+        const messageType = String(data?.message_type || 'text');
         const botResponse = getChatOutput(data);
+        const choiceButtons = normalizeChoiceButtons(data);
 
         await replaceWithTypingEffect(thinkingMessage, withProfileHintIfMissing(botResponse));
-        appendSuggestionButtons(thinkingMessage, buildFollowupSuggestions(message, { deepTriggered }));
+        if (messageType === 'media_result') {
+            appendMediaCards(normalizeMediaList(data));
+        } else if (messageType === 'media_pending') {
+            const mediaTaskId = String(data?.media_task_id || '');
+            const mediaItems = normalizeMediaList(data);
+            const scenarioLabel = String(data?.extra?.scenario_label || '');
+            const progressEl = ensureMediaProgressUI(thinkingMessage, scenarioLabel);
+            setMediaProgressState(progressEl, {
+                scenarioLabel,
+                attempt: 1,
+                elapsedSec: 1,
+                status: 'running',
+                customText: botResponse || '',
+                percent: 8,
+            });
+            if (mediaItems.length > 0) {
+                appendMediaCards(mediaItems);
+            }
+            if (mediaTaskId) {
+                pollMediaTask(
+                    mediaTaskId,
+                    Number(data?.poll_interval_seconds || 0),
+                    progressEl,
+                    scenarioLabel
+                );
+            }
+        }
+        const hasChoiceButtons = appendChoiceButtons(thinkingMessage, choiceButtons);
+        if (!hasChoiceButtons) {
+            appendSuggestionButtons(thinkingMessage, buildFollowupSuggestions(message, { deepTriggered }));
+        }
     } catch (error) {
         console.error('Error:', error);
         await replaceWithTypingEffect(thinkingMessage, '呜啦…网络刚刚有点抖，本鼠鼠还在这儿。请再发一次试试呀。');
