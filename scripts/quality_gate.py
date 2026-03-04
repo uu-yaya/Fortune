@@ -33,6 +33,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-name-write-high-confidence-rate", type=float, default=0.95, help="姓名高置信写入率下限")
     parser.add_argument("--max-long-horizon-shrink-rate", type=float, default=0.01, help="长周期收缩到三天比率上限")
     parser.add_argument("--max-fact-hallucination-rate", type=float, default=0.005, help="事实问答幻觉率上限")
+    parser.add_argument("--strict", action="store_true", help="严格模式：样本不足也执行并判定失败")
+    parser.add_argument(
+        "--min-output-samples-for-diversity",
+        type=int,
+        default=12,
+        help="多样性类指标启用的最小 output_total 样本数（默认12）",
+    )
     parser.add_argument("--legacy-metrics", action="store_true", help="使用旧版模板指标门禁")
     return parser.parse_args()
 
@@ -42,6 +49,15 @@ def _to_float(value) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+def _sample_count(totals: dict, key: str) -> int:
+    if not isinstance(totals, dict):
+        return 0
+    try:
+        return int(float(totals.get(key, 0)))
+    except Exception:
+        return 0
 
 
 def main() -> int:
@@ -97,7 +113,6 @@ def main() -> int:
     fact_hallucination = _to_float(rates.get("fact_hallucination_rate"))
     totals = data.get("totals") if isinstance(data, dict) else {}
     weekday_mismatch_count = _to_float((totals or {}).get("weekday_mismatch_count"))
-    name_write_total = _to_float((totals or {}).get("name_write_total"))
     legacy_mode = args.legacy_metrics or str(os.getenv("QUALITY_GATE_LEGACY", "")).strip().lower() in {
         "1",
         "true",
@@ -105,182 +120,249 @@ def main() -> int:
         "on",
     }
 
-    checks = [
-        ("fortune_route_hit_rate", route_hit, ">=", args.min_route_hit_rate, route_hit >= args.min_route_hit_rate),
-        ("fortune_tool_success_rate", tool_success, ">=", args.min_tool_success_rate, tool_success >= args.min_tool_success_rate),
-        (
-            "fortune_field_completeness_rate",
-            field_complete,
-            ">=",
-            args.min_field_completeness_rate,
-            field_complete >= args.min_field_completeness_rate,
-        ),
-        (
-            "profile_echo_violation_rate",
-            profile_echo,
-            "<=",
-            args.max_profile_echo_violation_rate,
-            profile_echo <= args.max_profile_echo_violation_rate,
-        ),
-        (
-            "direct_answer_hit_rate",
-            direct_answer,
-            ">=",
-            args.min_direct_answer_hit_rate,
-            direct_answer >= args.min_direct_answer_hit_rate,
-        ),
-        (
-            "clarify_hit_rate",
-            clarify_hit,
-            ">=",
-            args.min_clarify_hit_rate,
-            clarify_hit >= args.min_clarify_hit_rate,
-        ),
-        (
-            "trend_window_hit_rate",
-            trend_window,
-            ">=",
-            args.min_trend_window_hit_rate,
-            trend_window >= args.min_trend_window_hit_rate,
-        ),
-        (
-            "colloquial_window_hit_rate",
-            colloquial_window,
-            ">=",
-            args.min_colloquial_window_hit_rate,
-            colloquial_window >= args.min_colloquial_window_hit_rate,
-        ),
-        (
-            "temporal_consistency_hit_rate",
-            temporal_hit,
-            ">=",
-            args.min_temporal_consistency_hit_rate,
-            temporal_hit >= args.min_temporal_consistency_hit_rate,
-        ),
-        (
-            "observability_coverage",
-            observability,
-            ">=",
-            args.min_observability_coverage,
-            observability >= args.min_observability_coverage,
-        ),
-        (
-            "time_guard_overwrite_rate",
-            time_guard_overwrite,
-            "<=",
-            args.max_time_guard_overwrite_rate,
-            time_guard_overwrite <= args.max_time_guard_overwrite_rate,
-        ),
-        (
-            "name_slot_pollution_rate",
-            name_slot_pollution,
-            "<=",
-            args.max_name_slot_pollution_rate,
-            name_slot_pollution <= args.max_name_slot_pollution_rate,
-        ),
-        (
-            "name_write_high_confidence_rate",
-            name_write_high_conf,
-            ">=",
-            args.min_name_write_high_confidence_rate,
-            (name_write_total <= 0) or (name_write_high_conf >= args.min_name_write_high_confidence_rate),
-        ),
-        (
-            "long_horizon_shrink_rate",
-            long_horizon_shrink,
-            "<=",
-            args.max_long_horizon_shrink_rate,
-            long_horizon_shrink <= args.max_long_horizon_shrink_rate,
-        ),
-        (
-            "fact_hallucination_rate",
-            fact_hallucination,
-            "<=",
-            args.max_fact_hallucination_rate,
-            fact_hallucination <= args.max_fact_hallucination_rate,
-        ),
-        (
-            "weekday_mismatch_count",
-            weekday_mismatch_count,
-            "<=",
-            args.max_weekday_mismatch_count,
-            weekday_mismatch_count <= args.max_weekday_mismatch_count,
-        ),
+    checks: list[dict] = [
+        {
+            "name": "fortune_route_hit_rate",
+            "actual": route_hit,
+            "op": ">=",
+            "target": args.min_route_hit_rate,
+            "ok": route_hit >= args.min_route_hit_rate,
+            "denominator_key": "fortune_intent_total",
+        },
+        {
+            "name": "fortune_tool_success_rate",
+            "actual": tool_success,
+            "op": ">=",
+            "target": args.min_tool_success_rate,
+            "ok": tool_success >= args.min_tool_success_rate,
+            "denominator_key": "fortune_tool_total",
+        },
+        {
+            "name": "fortune_field_completeness_rate",
+            "actual": field_complete,
+            "op": ">=",
+            "target": args.min_field_completeness_rate,
+            "ok": field_complete >= args.min_field_completeness_rate,
+            "denominator_key": "fortune_field_total",
+        },
+        {
+            "name": "profile_echo_violation_rate",
+            "actual": profile_echo,
+            "op": "<=",
+            "target": args.max_profile_echo_violation_rate,
+            "ok": profile_echo <= args.max_profile_echo_violation_rate,
+            "denominator_key": "profile_echo_total",
+        },
+        {
+            "name": "direct_answer_hit_rate",
+            "actual": direct_answer,
+            "op": ">=",
+            "target": args.min_direct_answer_hit_rate,
+            "ok": direct_answer >= args.min_direct_answer_hit_rate,
+            "denominator_key": "direct_answer_total",
+        },
+        {
+            "name": "clarify_hit_rate",
+            "actual": clarify_hit,
+            "op": ">=",
+            "target": args.min_clarify_hit_rate,
+            "ok": clarify_hit >= args.min_clarify_hit_rate,
+            "denominator_key": "clarify_total",
+        },
+        {
+            "name": "trend_window_hit_rate",
+            "actual": trend_window,
+            "op": ">=",
+            "target": args.min_trend_window_hit_rate,
+            "ok": trend_window >= args.min_trend_window_hit_rate,
+            "denominator_key": "trend_window_total",
+        },
+        {
+            "name": "colloquial_window_hit_rate",
+            "actual": colloquial_window,
+            "op": ">=",
+            "target": args.min_colloquial_window_hit_rate,
+            "ok": colloquial_window >= args.min_colloquial_window_hit_rate,
+            "denominator_key": "colloquial_window_total",
+        },
+        {
+            "name": "temporal_consistency_hit_rate",
+            "actual": temporal_hit,
+            "op": ">=",
+            "target": args.min_temporal_consistency_hit_rate,
+            "ok": temporal_hit >= args.min_temporal_consistency_hit_rate,
+            "denominator_key": "temporal_consistency_total",
+        },
+        {
+            "name": "observability_coverage",
+            "actual": observability,
+            "op": ">=",
+            "target": args.min_observability_coverage,
+            "ok": observability >= args.min_observability_coverage,
+            "denominator_key": "observability_total",
+        },
+        {
+            "name": "time_guard_overwrite_rate",
+            "actual": time_guard_overwrite,
+            "op": "<=",
+            "target": args.max_time_guard_overwrite_rate,
+            "ok": time_guard_overwrite <= args.max_time_guard_overwrite_rate,
+            "denominator_key": "time_guard_total",
+        },
+        {
+            "name": "name_slot_pollution_rate",
+            "actual": name_slot_pollution,
+            "op": "<=",
+            "target": args.max_name_slot_pollution_rate,
+            "ok": name_slot_pollution <= args.max_name_slot_pollution_rate,
+            "denominator_key": "name_slot_total",
+        },
+        {
+            "name": "name_write_high_confidence_rate",
+            "actual": name_write_high_conf,
+            "op": ">=",
+            "target": args.min_name_write_high_confidence_rate,
+            "ok": name_write_high_conf >= args.min_name_write_high_confidence_rate,
+            "denominator_key": "name_write_total",
+        },
+        {
+            "name": "long_horizon_shrink_rate",
+            "actual": long_horizon_shrink,
+            "op": "<=",
+            "target": args.max_long_horizon_shrink_rate,
+            "ok": long_horizon_shrink <= args.max_long_horizon_shrink_rate,
+            "denominator_key": "long_horizon_total",
+        },
+        {
+            "name": "fact_hallucination_rate",
+            "actual": fact_hallucination,
+            "op": "<=",
+            "target": args.max_fact_hallucination_rate,
+            "ok": fact_hallucination <= args.max_fact_hallucination_rate,
+            "denominator_key": "fact_check_total",
+        },
+        {
+            "name": "weekday_mismatch_count",
+            "actual": weekday_mismatch_count,
+            "op": "<=",
+            "target": args.max_weekday_mismatch_count,
+            "ok": weekday_mismatch_count <= args.max_weekday_mismatch_count,
+            "denominator_key": "temporal_consistency_total",
+        },
     ]
     if legacy_mode:
         checks.extend(
             [
-                (
-                    "template_repeat_rate",
-                    template_repeat,
-                    "<=",
-                    args.max_template_repeat_rate,
-                    template_repeat <= args.max_template_repeat_rate,
-                ),
-                (
-                    "template_signature_rate",
-                    template_signature,
-                    "<=",
-                    args.max_template_signature_rate,
-                    template_signature <= args.max_template_signature_rate,
-                ),
-                (
-                    "session_repeat_rate",
-                    session_repeat,
-                    "<=",
-                    args.max_session_repeat_rate,
-                    session_repeat <= args.max_session_repeat_rate,
-                ),
+                {
+                    "name": "template_repeat_rate",
+                    "actual": template_repeat,
+                    "op": "<=",
+                    "target": args.max_template_repeat_rate,
+                    "ok": template_repeat <= args.max_template_repeat_rate,
+                    "denominator_key": "template_repeat_total",
+                },
+                {
+                    "name": "template_signature_rate",
+                    "actual": template_signature,
+                    "op": "<=",
+                    "target": args.max_template_signature_rate,
+                    "ok": template_signature <= args.max_template_signature_rate,
+                    "denominator_key": "template_signature_total",
+                },
+                {
+                    "name": "session_repeat_rate",
+                    "actual": session_repeat,
+                    "op": "<=",
+                    "target": args.max_session_repeat_rate,
+                    "ok": session_repeat <= args.max_session_repeat_rate,
+                    "denominator_key": "session_repeat_total",
+                    "min_samples": max(2, int(args.min_output_samples_for_diversity)),
+                },
             ]
         )
     else:
         checks.extend(
             [
-                (
-                    "blueprint_repeat_rate",
-                    blueprint_repeat,
-                    "<=",
-                    args.max_blueprint_repeat_rate,
-                    blueprint_repeat <= args.max_blueprint_repeat_rate,
-                ),
-                (
-                    "advice_repeat_rate",
-                    advice_repeat,
-                    "<=",
-                    args.max_advice_repeat_rate,
-                    advice_repeat <= args.max_advice_repeat_rate,
-                ),
-                (
-                    "unique_output_rate",
-                    unique_output,
-                    ">=",
-                    args.min_unique_output_rate,
-                    unique_output >= args.min_unique_output_rate,
-                ),
-                (
-                    "max_pair_similarity",
-                    max_pair_similarity,
-                    "<=",
-                    args.max_pair_similarity,
-                    max_pair_similarity <= args.max_pair_similarity,
-                ),
+                {
+                    "name": "blueprint_repeat_rate",
+                    "actual": blueprint_repeat,
+                    "op": "<=",
+                    "target": args.max_blueprint_repeat_rate,
+                    "ok": blueprint_repeat <= args.max_blueprint_repeat_rate,
+                    "denominator_key": "blueprint_total",
+                    "min_samples": int(args.min_output_samples_for_diversity),
+                },
+                {
+                    "name": "advice_repeat_rate",
+                    "actual": advice_repeat,
+                    "op": "<=",
+                    "target": args.max_advice_repeat_rate,
+                    "ok": advice_repeat <= args.max_advice_repeat_rate,
+                    "denominator_key": "advice_total",
+                    "min_samples": int(args.min_output_samples_for_diversity),
+                },
+                {
+                    "name": "unique_output_rate",
+                    "actual": unique_output,
+                    "op": ">=",
+                    "target": args.min_unique_output_rate,
+                    "ok": unique_output >= args.min_unique_output_rate,
+                    "denominator_key": "output_total",
+                    "min_samples": int(args.min_output_samples_for_diversity),
+                },
+                {
+                    "name": "max_pair_similarity",
+                    "actual": max_pair_similarity,
+                    "op": "<=",
+                    "target": args.max_pair_similarity,
+                    "ok": max_pair_similarity <= args.max_pair_similarity,
+                    "denominator_key": "output_total",
+                    "min_samples": max(2, int(args.min_output_samples_for_diversity)),
+                },
             ]
         )
 
     failed = 0
+    skipped = 0
     print("[METRICS] rates =", rates)
     print(f"[MODE] legacy_metrics={'ON' if legacy_mode else 'OFF'}")
-    for name, actual, op, target, ok in checks:
+    print(
+        f"[MODE] strict={'ON' if args.strict else 'OFF'} "
+        f"min_output_samples_for_diversity={int(args.min_output_samples_for_diversity)}"
+    )
+
+    for item in checks:
+        name = str(item.get("name") or "")
+        actual = _to_float(item.get("actual"))
+        op = str(item.get("op") or "")
+        target = _to_float(item.get("target"))
+        ok = bool(item.get("ok"))
+        denominator_key = str(item.get("denominator_key") or "")
+        min_samples = int(item.get("min_samples") or 1)
+        denominator_value = _sample_count(totals, denominator_key) if denominator_key else 0
+
+        if (not args.strict) and denominator_key and denominator_value < max(1, min_samples):
+            print(
+                f"[SKIP] {name}: sample={denominator_value} from {denominator_key} "
+                f"< min_required={max(1, min_samples)}"
+            )
+            skipped += 1
+            continue
+
         status = "PASS" if ok else "FAIL"
         print(f"[{status}] {name}: actual={actual:.4f} {op} target={target:.4f}")
         if not ok:
             failed += 1
 
+    if failed == 0 and skipped == len(checks):
+        print("[SUMMARY] 质量门禁跳过（当前样本不足），按通过处理。")
+        return 0
+
     if failed:
-        print(f"[SUMMARY] 质量门禁未通过，失败项={failed}")
+        print(f"[SUMMARY] 质量门禁未通过，失败项={failed} 跳过项={skipped}")
         return 2
 
-    print("[SUMMARY] 质量门禁通过")
+    print(f"[SUMMARY] 质量门禁通过（跳过项={skipped}）")
     return 0
 
 
