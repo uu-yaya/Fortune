@@ -76,10 +76,15 @@ def asks_for_profile(text: str) -> bool:
         return False
     if "资料补齐" in out:
         return True
+    if "资料齐了我就" in out:
+        return True
     patterns = [
         r"(请|先)?告诉我.*(姓名|名字|出生|生日|出生年月日|出生日期|时辰|生辰)",
         r"(请|先)?提供.*(姓名|名字|出生|生日|出生年月日|出生日期|时辰|生辰)",
         r"(还需要|我还需要|需要你补充|请补充).*(姓名|名字|出生|生日|出生年月日|出生日期|时辰|生辰)",
+        r"(请|先)?告诉我.*(性别|男/女|男女)",
+        r"(还差|缺).{0,12}(小资料|资料|信息).{0,12}(性别|男/女|男女)",
+        r"(还需要|我还需要|需要你补充|请补充).{0,12}(性别|男/女|男女)",
     ]
     return any(has_pattern(out, p) for p in patterns)
 
@@ -249,6 +254,11 @@ def main() -> int:
     parser.add_argument("--password", default="abc12345", help="注册密码")
     parser.add_argument("--timeout", type=int, default=60, help="请求超时秒数")
     parser.add_argument("--max-cases", type=int, default=24, help="最多执行的用例数")
+    parser.add_argument(
+        "--seed-profile-query",
+        default="我叫测试甲，2002-03-14出生，我是女生。",
+        help="回归预热画像注入语句（不计入用例统计）",
+    )
     parser.add_argument("--min-unique-output-rate", type=float, default=0.45, help="最小输出唯一率")
     parser.add_argument("--max-pair-similarity", type=float, default=0.92, help="最大两两相似度")
     parser.add_argument("--max-first-sentence-repeat-rate", type=float, default=0.60, help="首句重复率上限")
@@ -288,30 +298,35 @@ def main() -> int:
 
     profile_name = "测试甲"
     profile_birthdate = "2002-03-14"
-    cases = build_cases()[: max(1, args.max_cases)]
+    all_cases = build_cases()[: max(1, args.max_cases)]
+    pre_seed_cases = [case for case in all_cases if case.cid == "FORTUNE-001"]
+    post_seed_cases = [case for case in all_cases if case.cid != "FORTUNE-001"]
+
     passed = 0
     failed = 0
     outputs: list[str] = []
     first_sentences: list[str] = []
 
-    print(f"[INFO] base={base} phone={phone} total_cases={len(cases)}")
-    for case in cases:
+    print(f"[INFO] base={base} phone={phone} total_cases={len(all_cases)}")
+
+    def run_case(case: Case) -> None:
+        nonlocal passed, failed
         try:
             resp = post_json(session, f"{base}/chat", {"query": case.query}, timeout=args.timeout)
         except Exception as e:
             failed += 1
             print(f"[FAIL] {case.cid} 请求异常: {e}")
-            continue
+            return
         if resp.status_code != 200:
             failed += 1
             print(f"[FAIL] {case.cid} HTTP={resp.status_code} body={resp.text[:240]}")
-            continue
+            return
         try:
             data = resp.json()
         except Exception:
             failed += 1
             print(f"[FAIL] {case.cid} 非JSON响应: {resp.text[:240]}")
-            continue
+            return
         output = str(data.get("output") or "")
         outputs.append(output)
         head = first_sentence(output)
@@ -324,6 +339,36 @@ def main() -> int:
         else:
             failed += 1
             print(f"[FAIL] {case.cid} {reason} | output={output[:220]}")
+
+    for case in pre_seed_cases:
+        run_case(case)
+
+    if post_seed_cases:
+        seed_query = str(args.seed_profile_query or "").strip()
+        if not seed_query:
+            print("[FATAL] seed_profile_query 为空")
+            return 1
+        try:
+            seed_resp = post_json(session, f"{base}/chat", {"query": seed_query}, timeout=args.timeout)
+        except Exception as e:
+            print(f"[FATAL] 画像预热请求异常: {e}")
+            return 1
+        if seed_resp.status_code != 200:
+            print(f"[FATAL] 画像预热失败 HTTP={seed_resp.status_code} body={seed_resp.text[:240]}")
+            return 1
+        try:
+            seed_data = seed_resp.json()
+        except Exception:
+            print(f"[FATAL] 画像预热返回非JSON: {seed_resp.text[:240]}")
+            return 1
+        seed_output = str(seed_data.get("output") or "").strip()
+        if not seed_output:
+            print(f"[FATAL] 画像预热返回空输出: {seed_resp.text[:240]}")
+            return 1
+        print("[INFO] profile seed injected")
+
+    for case in post_seed_cases:
+        run_case(case)
 
     normalized_outputs = []
     for item in outputs:
@@ -358,7 +403,7 @@ def main() -> int:
             f"[PASS] anti_template.first_sentence_repeat_rate actual={first_sentence_repeat_rate:.4f} <= target={args.max_first_sentence_repeat_rate:.4f}"
         )
     print(
-        f"[SUMMARY] passed={passed} failed={failed} pass_rate={passed / max(1, len(cases)):.2%} "
+        f"[SUMMARY] passed={passed} failed={failed} pass_rate={passed / max(1, len(all_cases)):.2%} "
         f"unique_output_rate={unique_output_rate:.2%} max_pair_similarity={pair_similarity:.4f} "
         f"first_sentence_repeat_rate={first_sentence_repeat_rate:.2%}"
     )
