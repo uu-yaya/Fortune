@@ -13,12 +13,16 @@ import os
 from langchain_openai import ChatOpenAI
 from langchain_community.embeddings import  DashScopeEmbeddings
 
+def _read_api_key(name: str) -> str:
+    # Tolerate trailing newlines/spaces in CI secrets.
+    return str(os.getenv(name) or "").strip()
+
 def get_lc_ali_model_client(temperature = 0,streaming = True):
     '''
     以OpenAI兼容的方式，通过LangChain获得阿里百炼大模型的客户端
     :return: 指定平台和模型的客户端，默认温度=0.0，流式输出
     '''
-    return ChatOpenAI(api_key=os.getenv(ALI_TONGYI_API_KEY_OS_VAR_NAME),
+    return ChatOpenAI(api_key=_read_api_key(ALI_TONGYI_API_KEY_OS_VAR_NAME),
                       base_url=ALI_TONGYI_URL,
                       model=ALI_TONGYI_PLUS_MODEL,
                       temperature=temperature,
@@ -30,6 +34,6 @@ def get_lc_ali_embeddings():
     :return: 阿里通义千问嵌入模型的实例，目前为text-embedding-v3
     '''
     return DashScopeEmbeddings(
-        model=ALI_TONGYI_EMBEDDING_MODEL, dashscope_api_key=os.getenv(ALI_TONGYI_API_KEY_OS_VAR_NAME)
+        model=ALI_TONGYI_EMBEDDING_MODEL, dashscope_api_key=_read_api_key(ALI_TONGYI_API_KEY_OS_VAR_NAME)
 )
 
