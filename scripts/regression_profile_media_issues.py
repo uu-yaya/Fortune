@@ -15,6 +15,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import server
+import profile_concurrency_regression as profile_concurrency
+import provider_degradation_regression as provider_regression
 
 
 def _blank_profile() -> dict[str, str]:
@@ -278,6 +280,32 @@ def case_history_extract_keeps_gender_after_birthtime() -> dict[str, Any]:
     return {"profile": profile}
 
 
+def case_concurrent_partial_updates_preserve_fields() -> dict[str, Any]:
+    phone = profile_concurrency._make_phone()
+    user = profile_concurrency._ensure_test_user(phone)
+    user_id = int(user.get("id") or 0)
+    user_uuid = str(user.get("uuid") or "")
+    detail = profile_concurrency.case_partial_updates_preserved(user_uuid, user_id, iterations=2)
+    return {"phone": phone, **detail}
+
+
+def case_concurrent_confidence_rule_preserved() -> dict[str, Any]:
+    phone = profile_concurrency._make_phone()
+    user = profile_concurrency._ensure_test_user(phone)
+    user_id = int(user.get("id") or 0)
+    user_uuid = str(user.get("uuid") or "")
+    detail = profile_concurrency.case_confidence_rule_stable(user_uuid, user_id, iterations=2)
+    return {"phone": phone, **detail}
+
+
+def case_media_provider_degraded_response_stable() -> dict[str, Any]:
+    return provider_regression.case_media_provider_limit_fail_fast()
+
+
+def case_media_breaker_open_chat_stable() -> dict[str, Any]:
+    return provider_regression.case_media_breaker_open_chat_reply()
+
+
 def _run_case(case_id: str, title: str, fn) -> dict[str, Any]:
     try:
         detail = fn()
@@ -299,6 +327,10 @@ def main() -> int:
         ("REG-003", "聊天资料拦截只作用于命理路径", case_chat_profile_gate_only_for_fortune_paths),
         ("REG-004", "媒体缺失资料提示包含性别", case_media_missing_prompt_mentions_gender),
         ("REG-005", "历史资料提取不会漏掉后续性别", case_history_extract_keeps_gender_after_birthtime),
+        ("REG-006", "并发 partial update 不丢字段", case_concurrent_partial_updates_preserve_fields),
+        ("REG-007", "并发条件下昵称置信度规则稳定", case_concurrent_confidence_rule_preserved),
+        ("REG-PROV-001", "media provider degraded 返回稳定错误结构", case_media_provider_degraded_response_stable),
+        ("REG-PROV-002", "media breaker open 时 chat 返回稳定失败提示", case_media_breaker_open_chat_stable),
     ]
 
     results = [_run_case(cid, title, fn) for cid, title, fn in cases]

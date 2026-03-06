@@ -6,6 +6,13 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from provider_runtime import (
+    build_provider_failure,
+    provider_record_failure,
+    provider_record_success,
+    provider_should_short_circuit,
+)
+
 
 IMAGE_EXT_PATTERN = re.compile(r"\.(png|jpg|jpeg|webp|gif|bmp|svg)(\?.*)?$", re.IGNORECASE)
 VIDEO_EXT_PATTERN = re.compile(r"\.(mp4|mov|webm|m3u8|avi|mkv)(\?.*)?$", re.IGNORECASE)
@@ -227,9 +234,80 @@ def _apply_provider_text_error(normalized: dict[str, Any], payload_data: dict[st
             "status": "failed",
             "error_code": "DIFY_PROVIDER_LIMIT",
             "error_message": limit_msg,
+            "error_category": "quota",
+            "provider": "dify",
         }
     )
     return current
+
+
+def _normalize_dify_failure_from_response(resp: requests.Response, payload: dict[str, Any]) -> dict[str, Any] | None:
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if status <= 0:
+        return None
+    message = str(payload.get("message") or payload.get("error") or resp.text[:200] or "Dify 请求失败")
+    if status in {401, 403}:
+        return build_provider_failure(
+            provider="dify",
+            operation="media_submit",
+            category="auth",
+            error_code=f"DIFY_HTTP_{status}",
+            error_message=message,
+            retryable=False,
+            http_status=status,
+            raw_error=resp.text[:200],
+        )
+    if status == 429 or PROVIDER_LIMIT_PATTERN.search(message):
+        return build_provider_failure(
+            provider="dify",
+            operation="media_submit",
+            category="quota",
+            error_code="DIFY_PROVIDER_LIMIT" if PROVIDER_LIMIT_PATTERN.search(message) else "DIFY_HTTP_429",
+            error_message=message,
+            retryable=False,
+            http_status=status,
+            raw_error=resp.text[:200],
+        )
+    if status >= 500:
+        return build_provider_failure(
+            provider="dify",
+            operation="media_submit",
+            category="http_5xx",
+            error_code="DIFY_HTTP_5XX",
+            error_message=message,
+            http_status=status,
+            raw_error=resp.text[:200],
+        )
+    return build_provider_failure(
+        provider="dify",
+        operation="media_submit",
+        category="http_4xx",
+        error_code=f"DIFY_HTTP_{status}",
+        error_message=message,
+        retryable=False,
+        http_status=status,
+        raw_error=resp.text[:200],
+    )
+
+
+def _normalize_dify_failure_from_exception(exc: Exception, operation: str) -> dict[str, Any]:
+    if isinstance(exc, requests.Timeout):
+        return build_provider_failure(
+            provider="dify",
+            operation=operation,
+            category="timeout",
+            error_code="DIFY_TIMEOUT",
+            error_message="调用 Dify 超时" if operation == "media_submit" else "查询 Dify 任务超时",
+            raw_error=str(exc),
+        )
+    return build_provider_failure(
+        provider="dify",
+        operation=operation,
+        category="network",
+        error_code="DIFY_REQUEST_FAILED",
+        error_message=str(exc) or "Dify 请求失败",
+        raw_error=str(exc),
+    )
 
 
 @dataclass
@@ -285,6 +363,20 @@ class DifyMediaClient:
         return out
 
     def submit_workflow(self, *, scenario: str, prompt: str, user: str, inputs: dict[str, Any] | None = None) -> dict[str, Any]:
+        breaker = provider_should_short_circuit(None, "dify", "media_submit")
+        if breaker.get("short_circuit"):
+            return {
+                "ok": False,
+                "status": "failed",
+                "workflow_run_id": "",
+                "task_id": "",
+                "media": [],
+                "raw": {},
+                "error_code": "DIFY_BREAKER_OPEN",
+                "error_message": "媒体生成服务暂时不可用",
+                "error_category": str(breaker.get("last_category") or "unknown"),
+                "provider": "dify",
+            }
         url = f"{self.base_url.rstrip('/')}/workflows/run"
         payload_inputs = dict(inputs or {})
         payload_inputs.setdefault("scenario", str(scenario or ""))
@@ -305,7 +397,9 @@ class DifyMediaClient:
             )
             if resp.status_code >= 400:
                 error_payload = _safe_json(resp)
-                message = str(error_payload.get("message") or error_payload.get("error") or resp.text[:200] or "Dify 请求失败")
+                failure = _normalize_dify_failure_from_response(resp, error_payload)
+                if failure:
+                    provider_record_failure(None, failure)
                 return {
                     "ok": False,
                     "status": "failed",
@@ -313,14 +407,35 @@ class DifyMediaClient:
                     "task_id": "",
                     "media": [],
                     "raw": error_payload,
-                    "error_code": f"DIFY_HTTP_{resp.status_code}",
-                    "error_message": message,
+                    "error_code": str((failure or {}).get("error_code") or f"DIFY_HTTP_{resp.status_code}"),
+                    "error_message": str((failure or {}).get("error_message") or "Dify 请求失败"),
+                    "error_category": str((failure or {}).get("category") or "unknown"),
+                    "provider": "dify",
                 }
 
             payload_data = _safe_json(resp)
             normalized = self._normalize_payload(payload_data)
-            return _apply_provider_text_error(normalized, payload_data)
-        except requests.Timeout:
+            normalized = _apply_provider_text_error(normalized, payload_data)
+            if str(normalized.get("error_code") or "") == "DIFY_PROVIDER_LIMIT":
+                failure = build_provider_failure(
+                    provider="dify",
+                    operation="media_submit",
+                    category="quota",
+                    error_code="DIFY_PROVIDER_LIMIT",
+                    error_message=str(normalized.get("error_message") or "Dify 额度不足"),
+                    retryable=False,
+                    raw_error=str(payload_data)[:200],
+                )
+                provider_record_failure(None, failure)
+                normalized["error_category"] = "quota"
+                normalized["provider"] = "dify"
+                return normalized
+            provider_record_success(None, "dify", "media_submit")
+            normalized["provider"] = "dify"
+            return normalized
+        except requests.Timeout as exc:
+            failure = _normalize_dify_failure_from_exception(exc, "media_submit")
+            provider_record_failure(None, failure)
             return {
                 "ok": False,
                 "status": "timeout",
@@ -328,10 +443,14 @@ class DifyMediaClient:
                 "task_id": "",
                 "media": [],
                 "raw": {},
-                "error_code": "DIFY_TIMEOUT",
-                "error_message": "调用 Dify 超时",
+                "error_code": str(failure.get("error_code") or "DIFY_TIMEOUT"),
+                "error_message": str(failure.get("error_message") or "调用 Dify 超时"),
+                "error_category": str(failure.get("category") or "timeout"),
+                "provider": "dify",
             }
         except Exception as e:
+            failure = _normalize_dify_failure_from_exception(e, "media_submit")
+            provider_record_failure(None, failure)
             return {
                 "ok": False,
                 "status": "failed",
@@ -339,11 +458,27 @@ class DifyMediaClient:
                 "task_id": "",
                 "media": [],
                 "raw": {},
-                "error_code": "DIFY_REQUEST_FAILED",
-                "error_message": str(e),
+                "error_code": str(failure.get("error_code") or "DIFY_REQUEST_FAILED"),
+                "error_message": str(failure.get("error_message") or e),
+                "error_category": str(failure.get("category") or "network"),
+                "provider": "dify",
             }
 
     def get_workflow_status(self, workflow_run_id: str, *, user: str = "") -> dict[str, Any]:
+        breaker = provider_should_short_circuit(None, "dify", "media_poll")
+        if breaker.get("short_circuit"):
+            return {
+                "ok": False,
+                "status": "failed",
+                "workflow_run_id": str(workflow_run_id or "").strip(),
+                "task_id": "",
+                "media": [],
+                "raw": {},
+                "error_code": "DIFY_BREAKER_OPEN",
+                "error_message": "媒体生成服务暂时不可用",
+                "error_category": str(breaker.get("last_category") or "unknown"),
+                "provider": "dify",
+            }
         run_id = str(workflow_run_id or "").strip()
         if not run_id:
             return {
@@ -360,7 +495,9 @@ class DifyMediaClient:
         params = {"user": str(user or "anonymous")}
         try:
             resp = requests.get(url, headers=self._headers(), params=params, timeout=(8, self.timeout_seconds))
-        except requests.Timeout:
+        except requests.Timeout as exc:
+            failure = _normalize_dify_failure_from_exception(exc, "media_poll")
+            provider_record_failure(None, failure)
             return {
                 "ok": False,
                 "status": "timeout",
@@ -368,10 +505,14 @@ class DifyMediaClient:
                 "task_id": "",
                 "media": [],
                 "raw": {},
-                "error_code": "DIFY_TIMEOUT",
-                "error_message": "查询 Dify 任务超时",
+                "error_code": str(failure.get("error_code") or "DIFY_TIMEOUT"),
+                "error_message": str(failure.get("error_message") or "查询 Dify 任务超时"),
+                "error_category": str(failure.get("category") or "timeout"),
+                "provider": "dify",
             }
         except Exception as e:
+            failure = _normalize_dify_failure_from_exception(e, "media_poll")
+            provider_record_failure(None, failure)
             return {
                 "ok": False,
                 "status": "failed",
@@ -379,13 +520,18 @@ class DifyMediaClient:
                 "task_id": "",
                 "media": [],
                 "raw": {},
-                "error_code": "DIFY_REQUEST_FAILED",
-                "error_message": str(e),
+                "error_code": str(failure.get("error_code") or "DIFY_REQUEST_FAILED"),
+                "error_message": str(failure.get("error_message") or e),
+                "error_category": str(failure.get("category") or "network"),
+                "provider": "dify",
             }
 
         payload = _safe_json(resp)
         if resp.status_code >= 400:
-            message = str(payload.get("message") or payload.get("error") or resp.text[:200] or "Dify 查询失败")
+            failure = _normalize_dify_failure_from_response(resp, payload)
+            if failure:
+                failure["operation"] = "media_poll"
+                provider_record_failure(None, failure)
             return {
                 "ok": False,
                 "status": "failed",
@@ -393,11 +539,29 @@ class DifyMediaClient:
                 "task_id": "",
                 "media": [],
                 "raw": payload,
-                "error_code": f"DIFY_HTTP_{resp.status_code}",
-                "error_message": message,
+                "error_code": str((failure or {}).get("error_code") or f"DIFY_HTTP_{resp.status_code}"),
+                "error_message": str((failure or {}).get("error_message") or "Dify 查询失败"),
+                "error_category": str((failure or {}).get("category") or "unknown"),
+                "provider": "dify",
             }
         normalized = self._normalize_payload(payload)
         normalized = _apply_provider_text_error(normalized, payload)
+        if str(normalized.get("error_code") or "") == "DIFY_PROVIDER_LIMIT":
+            failure = build_provider_failure(
+                provider="dify",
+                operation="media_poll",
+                category="quota",
+                error_code="DIFY_PROVIDER_LIMIT",
+                error_message=str(normalized.get("error_message") or "Dify 额度不足"),
+                retryable=False,
+                raw_error=str(payload)[:200],
+            )
+            provider_record_failure(None, failure)
+            normalized["error_category"] = "quota"
+            normalized["provider"] = "dify"
+        else:
+            provider_record_success(None, "dify", "media_poll")
+            normalized["provider"] = "dify"
         if not normalized.get("workflow_run_id"):
             normalized["workflow_run_id"] = run_id
         return normalized
@@ -419,4 +583,6 @@ class DifyMediaClient:
             "raw": payload if isinstance(payload, dict) else {},
             "error_code": "",
             "error_message": "",
+            "error_category": "",
+            "provider": "dify",
         }

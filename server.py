@@ -1,6 +1,7 @@
 import os
 import re
 import secrets
+import time
 import traceback
 import uuid
 import json
@@ -77,6 +78,7 @@ from mytools import (
     serp_search,
     yaoyigua,
 )
+from provider_runtime import provider_extra_meta
 #langchain.debug = True
 
 app = FastAPI(
@@ -195,6 +197,19 @@ def _db_conn():
         database=MYSQL_DB,
         charset="utf8mb4",
         autocommit=True,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def _db_conn_txn():
+    return pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DB,
+        charset="utf8mb4",
+        autocommit=False,
         cursorclass=pymysql.cursors.DictCursor,
     )
 
@@ -474,11 +489,21 @@ def _dump_profile_json(
 def _get_profile_by_user_id(user_id: int) -> dict[str, str]:
     with _db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT name, birth_date, birth_time, profile_json FROM user_profile WHERE user_id = %s LIMIT 1",
-                (user_id,),
-            )
-            row = cur.fetchone() or {}
+            row = _fetch_profile_row(cur, user_id) or {}
+    return _profile_from_db_row(row)
+
+
+def _fetch_profile_row(cur, user_id: int, for_update: bool = False) -> dict:
+    sql = "SELECT name, birth_date, birth_time, profile_json FROM user_profile WHERE user_id = %s LIMIT 1"
+    if for_update:
+        sql = f"{sql} FOR UPDATE"
+    cur.execute(sql, (user_id,))
+    row = cur.fetchone() or {}
+    return row if isinstance(row, dict) else {}
+
+
+def _profile_from_db_row(row: dict | None) -> dict[str, str]:
+    row = row or {}
     birthdate = ""
     birthtime = ""
     if row.get("birth_date"):
@@ -525,8 +550,18 @@ def _get_profile_by_user_id(user_id: int) -> dict[str, str]:
     }
 
 
-def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str]:
-    profile = _get_profile_by_user_id(user_id)
+def _get_profile_by_user_id_for_update(cur, user_id: int) -> dict[str, str]:
+    row = _fetch_profile_row(cur, user_id, for_update=True)
+    if not row:
+        cur.execute(
+            "INSERT INTO user_profile (user_id) VALUES (%s) ON DUPLICATE KEY UPDATE user_id = user_id",
+            (user_id,),
+        )
+        row = _fetch_profile_row(cur, user_id, for_update=True)
+    return _profile_from_db_row(row)
+
+
+def _merge_profile_payload(profile: dict[str, str], current: dict[str, str]) -> tuple[dict[str, str], bool]:
     merged = profile.copy()
     changed = False
     merged_name_conf = _normalize_name_confidence(str(merged.get("name_confidence") or ""))
@@ -584,35 +619,79 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
                     _metric_incr("name_write_high_confidence_total")
             else:
                 _metric_incr("name_slot_pollution")
-    if changed:
-        profile_json = _dump_profile_json(
-            preferred_name=str(merged.get("preferred_name") or "").strip(),
-            name_confidence=str(merged.get("name_confidence") or "none"),
-            preferred_name_confidence=str(merged.get("preferred_name_confidence") or "none"),
-            gender=str(merged.get("gender") or "unknown"),
-            partner_gender_preference=str(merged.get("partner_gender_preference") or "unknown"),
-        )
-        with _db_conn() as conn:
+    return merged, changed
+
+
+def _write_profile_row(cur, user_id: int, merged: dict[str, str]) -> None:
+    profile_json = _dump_profile_json(
+        preferred_name=str(merged.get("preferred_name") or "").strip(),
+        name_confidence=str(merged.get("name_confidence") or "none"),
+        preferred_name_confidence=str(merged.get("preferred_name_confidence") or "none"),
+        gender=str(merged.get("gender") or "unknown"),
+        partner_gender_preference=str(merged.get("partner_gender_preference") or "unknown"),
+    )
+    cur.execute(
+        """
+        UPDATE user_profile
+        SET name = %s,
+            birth_date = %s,
+            birth_time = %s,
+            profile_json = %s,
+            updated_at = NOW()
+        WHERE user_id = %s
+        """,
+        (
+            merged.get("name") or None,
+            merged.get("birthdate") or None,
+            merged.get("birthtime") or None,
+            profile_json,
+            user_id,
+        ),
+    )
+
+
+def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str]:
+    retry_delays = (0.05, 0.1)
+    for attempt in range(len(retry_delays) + 1):
+        conn = None
+        try:
+            conn = _db_conn_txn()
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE user_profile
-                    SET name = %s,
-                        birth_date = %s,
-                        birth_time = %s,
-                        profile_json = %s,
-                        updated_at = NOW()
-                    WHERE user_id = %s
-                    """,
-                    (
-                        merged.get("name") or None,
-                        merged.get("birthdate") or None,
-                        merged.get("birthtime") or None,
-                        profile_json,
-                        user_id,
-                    ),
+                profile = _get_profile_by_user_id_for_update(cur, user_id)
+                merged, changed = _merge_profile_payload(profile, current)
+                if changed:
+                    _write_profile_row(cur, user_id, merged)
+            conn.commit()
+            return merged
+        except pymysql.MySQLError as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            mysql_errno = int(exc.args[0]) if getattr(exc, "args", None) else 0
+            if mysql_errno == 1213:
+                _metric_incr("profile_merge_deadlock_total")
+            elif mysql_errno == 1205:
+                _metric_incr("profile_merge_lock_timeout_total")
+            if mysql_errno in {1205, 1213} and attempt < len(retry_delays):
+                _metric_incr("profile_merge_retry_total")
+                logger.warning(
+                    "profile merge retry for user_id={} attempt={} mysql_errno={}",
+                    user_id,
+                    attempt + 1,
+                    mysql_errno,
                 )
-    return merged
+                time.sleep(retry_delays[attempt])
+                continue
+            raise
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise RuntimeError(f"profile merge exhausted retries for user_id={user_id}")
 
 
 def _set_auth_session(token: str, payload: dict):
@@ -773,6 +852,7 @@ def _log_route_observability(
     flag_snapshot: dict[str, bool],
     domain_intent: str,
     question_type: str,
+    extra_meta: dict | None = None,
 ):
     event = {
         "route_path": str(route_path or "unknown"),
@@ -781,6 +861,9 @@ def _log_route_observability(
         "domain_intent": str(domain_intent or "unknown"),
         "question_type": str(question_type or "default"),
     }
+    if isinstance(extra_meta, dict):
+        for key, value in extra_meta.items():
+            event[str(key)] = value
     _metric_incr("observability_total")
     if event["route_path"] and event["reason_code"] and event["domain_intent"] and event["question_type"]:
         _metric_incr("observability_hit")
@@ -925,6 +1008,44 @@ def _has_long_horizon_shrink(text: str) -> bool:
     if not out:
         return False
     return bool(re.search(r"(这三天|最近三天|未来三天|接下来三天|2月27日到3月1日)", out))
+
+
+def _rewrite_long_horizon_shrink(text: str, query: str, window_meta: dict | None = None) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return out
+    q = str(query or "")
+    window_label = str((window_meta or {}).get("label") or "")
+    long_window_labels = {
+        "this_month",
+        "next_30_days",
+        "coming_period",
+        "year_full",
+        "year_h1",
+        "year_h2",
+        "year_partial",
+        "one_year",
+        "multi_year",
+        "explicit_year",
+        "explicit_year_span",
+        "compare_year_span",
+        "relative_year_span",
+    }
+    if not (_is_long_horizon_query(q) or window_label in long_window_labels):
+        return out
+    patched = out
+    replacements = [
+        (r"接下来这三天", "这个时间范围内"),
+        (r"接下来三天", "这个时间范围内"),
+        (r"未来三天", "这个时间范围内"),
+        (r"最近三天", "这个时间范围内"),
+        (r"这三天", "这个时间范围内"),
+        (r"三天内", "这个阶段内"),
+        (r"2月27日到3月1日", "这个时间范围内"),
+    ]
+    for pattern, repl in replacements:
+        patched = re.sub(pattern, repl, patched)
+    return patched
 
 
 def _has_fact_hallucination(query: str, output: str, profile: dict | None = None) -> bool:
@@ -2176,6 +2297,7 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
     _metric_incr("temporal_consistency_total")
     _metric_incr("time_guard_total")
     out = _sanitize_time_tokens_before_validation(out, q, window_meta=window_meta)
+    out = _rewrite_long_horizon_shrink(out, q, window_meta=window_meta)
 
     allowed_dates = _collect_allowed_dates(time_anchor, window_meta=window_meta)
     patched, conflict_count, severe_mismatch, reason_flags = _patch_time_text_locally(
@@ -2200,6 +2322,7 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
         if not residual:
             residual = _extract_business_sentences(patched)
         if residual:
+            residual = _rewrite_long_horizon_shrink(residual, q, window_meta=window_meta)
             merged = f"{safe}\n\n{residual}".strip()
             return _ensure_time_window_contract(merged, q, time_anchor, window_meta=window_meta)
         _metric_incr("time_guard_overwrite_total")
@@ -2226,6 +2349,7 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
             severe_mismatch=False,
             reason_flags=reason_flags,
         )
+    patched = _rewrite_long_horizon_shrink(patched, q, window_meta=window_meta)
     return _ensure_time_window_contract(patched, q, time_anchor, window_meta=window_meta)
 
 
@@ -3001,6 +3125,42 @@ def _build_media_task_response(session_id: str, task: dict | None) -> dict:
     }
 
 
+def _provider_category_from_error_code(error_code: str) -> str:
+    code = str(error_code or "").strip().upper()
+    if not code:
+        return ""
+    if code in {"DIFY_PROVIDER_LIMIT", "DIFY_HTTP_429"}:
+        return "quota"
+    if code in {"DIFY_HTTP_401", "DIFY_HTTP_403"}:
+        return "auth"
+    if code == "DIFY_TIMEOUT":
+        return "timeout"
+    if code == "DIFY_REQUEST_FAILED":
+        return "network"
+    if code == "DIFY_HTTP_5XX":
+        return "http_5xx"
+    if code == "DIFY_INVALID_RESPONSE":
+        return "invalid_response"
+    if code == "DIFY_BREAKER_OPEN":
+        return "unknown"
+    return ""
+
+
+def _media_provider_failure_meta(task: dict | None) -> dict:
+    if not isinstance(task, dict):
+        return {}
+    payload = media_task_to_api(task)
+    provider = str(payload.get("provider") or "").strip()
+    provider_error_code = str(payload.get("provider_error_code") or "").strip()
+    if not provider or not provider_error_code:
+        return {}
+    return {
+        "provider": provider,
+        "category": _provider_category_from_error_code(provider_error_code),
+        "error_code": provider_error_code,
+    }
+
+
 def _default_media_destiny_hint(profile: dict[str, str], scenario: str) -> str:
     if scenario == "healing_sleep_video":
         return (
@@ -3380,8 +3540,6 @@ def _create_and_submit_media_task(
 ) -> tuple[dict | None, str]:
     if not _media_ready():
         return None, "MEDIA_DISABLED"
-    # 先用基础提示创建任务并立即返回，避免主请求被外部链路阻塞；
-    # 命理增强与 Dify 提交在后台完成。
     prompt_bundle = build_media_prompt(
         scenario=scenario,
         query=query,
@@ -3407,25 +3565,34 @@ def _create_and_submit_media_task(
         status=str(task.get("status") or "pending"),
     )
     try:
-        worker = threading.Thread(
-            target=_submit_media_task_background,
-            kwargs={
-                "task_id": task_id,
-                "query": query,
-                "scenario": scenario,
-                "profile": profile,
-                "user_identity": user_identity,
-            },
-            daemon=True,
-            name=f"media-submit-{task_id[:8]}",
+        destiny_hint = _build_media_destiny_hint(
+            str(query or ""),
+            profile if isinstance(profile, dict) else {},
+            str(scenario or ""),
         )
-        worker.start()
+        prompt_bundle = build_media_prompt(
+            scenario=str(scenario or ""),
+            query=str(query or ""),
+            profile=profile if isinstance(profile, dict) else {},
+            destiny_hint=destiny_hint,
+        )
+        prompt_raw = str((prompt_bundle or {}).get("prompt") or "")
+        if prompt_raw:
+            prompt_bundle["prompt"] = _compress_prompt_with_model(prompt_raw, max_chars=DIFY_PROMPT_MAX_CHARS)
+        task = submit_media_task(
+            _db_conn,
+            _DIFY_MEDIA_CLIENT,
+            task_id=str(task_id or ""),
+            scenario=str(scenario or ""),
+            prompt_bundle=prompt_bundle if isinstance(prompt_bundle, dict) else {},
+            user_identity=str(user_identity or ""),
+        )
     except Exception as e:
-        logger.error(f"启动媒体提交后台线程失败: {e}")
-        _mark_media_task_failed(task_id, "MEDIA_SUBMIT_THREAD_FAILED", "媒体任务提交失败，请稍后重试")
+        logger.error(f"提交媒体任务失败 task_id={task_id}: {e}\n{traceback.format_exc()}")
+        _mark_media_task_failed(task_id, "MEDIA_SUBMIT_FAILED", "媒体任务提交失败，请稍后重试")
         task = get_media_task(_db_conn, task_id, user_id=int(user_id or 0))
-        return task, "MEDIA_SUBMIT_THREAD_FAILED"
-    return task, ""
+        return task, "MEDIA_SUBMIT_FAILED"
+    return task, str((task or {}).get("error_code") or "")
 
 
 def _submit_media_task_background(
@@ -4042,6 +4209,10 @@ def _normalize_structured_fortune_payload(raw, topic: str) -> dict:
         base["error"] = {
             "code": str(raw_error.get("code") or ""),
             "message": str(raw_error.get("message") or ""),
+            "provider": str(raw_error.get("provider") or ""),
+            "provider_code": str(raw_error.get("provider_code") or ""),
+            "category": str(raw_error.get("category") or ""),
+            "degraded": bool(raw_error.get("degraded")),
         }
 
     if base["strength"] not in {"strong", "weak", "balanced"}:
@@ -4076,6 +4247,50 @@ def _signal_for_topic(payload: dict, topic: str) -> str:
         signal_text = str(signals.get(key) or "").strip()
     if not _evidence_advice_v1_enabled():
         return signal_text[:120]
+
+
+def _fortune_provider_failure(payload: dict | None) -> dict:
+    error = (payload or {}).get("error") if isinstance(payload, dict) else None
+    return error if isinstance(error, dict) else {}
+
+
+def _build_fortune_provider_safe_fallback(
+    payload: dict,
+    topic: str,
+    query: str,
+    question_type: str,
+    time_anchor: dict,
+    window_meta: dict | None,
+    session_id: str = "",
+) -> str:
+    topic_cn = _topic_cn(topic)
+    error = _fortune_provider_failure(payload)
+    provider_code = str(error.get("provider_code") or error.get("code") or "FORTUNE_PROVIDER_DEGRADED")
+    signal_line = str(error.get("message") or "命理服务暂时不可用，请先按保守策略处理。")
+    window_line = ""
+    if isinstance(window_meta, dict):
+        window_text = str(window_meta.get("window_text") or "").strip()
+        window_label = str(window_meta.get("label") or "").strip()
+        if window_text and _should_show_window_text(query, window_label, question_type=question_type):
+            window_line = f"时间窗口：{window_text}。"
+    advice = _resolve_fortune_advice(
+        payload,
+        topic,
+        "balanced",
+        query=str(query or ""),
+        question_type=str(question_type or "default"),
+        blueprint_id="provider_safe_fallback",
+        session_id=session_id,
+    )[:3] or _default_fortune_advice(topic, "balanced")[:3]
+    basis = "上游命理盘面暂时不可用，本次按用户问题、时间范围与保守策略给出不依赖外部盘面的建议"
+    return _render_fortune_with_blueprint(
+        blueprint_id="provider_safe_fallback",
+        conclusion_line=f"这次{topic_cn}先按保守策略解读（{provider_code}）",
+        window_line=window_line,
+        signal_line=signal_line,
+        basis_line=basis,
+        advice=advice,
+    )
 
     segments: list[str] = []
     if signal_text:
@@ -4648,6 +4863,16 @@ def render_user_fortune_reply_v2(
     topic_cn = _topic_cn(topic)
     error = payload.get("error")
     if isinstance(error, dict) and str(error.get("code") or ""):
+        if str(error.get("provider") or "") == "yuanfenju":
+            return _build_fortune_provider_safe_fallback(
+                payload,
+                topic,
+                query=query,
+                question_type=question_type,
+                time_anchor=build_time_anchor(),
+                window_meta=window_meta,
+                session_id=session_id,
+            )
         code = str(error.get("code") or "")
         msg = str(error.get("message") or "命理链路暂时不可用")
         fallback_advice = _resolve_fortune_advice(
@@ -4703,6 +4928,18 @@ def render_structured_fortune_reply(payload: dict, topic: str) -> str:
     topic_cn = _topic_cn(topic)
     error = payload.get("error")
     if isinstance(error, dict) and str(error.get("code") or ""):
+        if str(error.get("provider") or "") == "yuanfenju":
+            return _build_fortune_provider_safe_fallback(
+                payload,
+                topic,
+                query="",
+                question_type=str(payload.get("question_type") or "default"),
+                time_anchor=build_time_anchor(),
+                window_meta={
+                    "window_text": str(payload.get("window_text") or ""),
+                    "label": str(payload.get("window_label") or ""),
+                },
+            )
         code = str(error.get("code") or "")
         msg = str(error.get("message") or "命理链路暂时不可用")
         return (
@@ -4889,6 +5126,7 @@ def route_fortune_pipeline(
         payload["window_start"] = str(window_meta.get("window_start") or "")
         payload["window_end"] = str(window_meta.get("window_end") or "")
         payload["window_text"] = str(window_meta.get("window_text") or "")
+        payload["window_label"] = str(window_meta.get("label") or "")
     logger.info(
         "fortune_pipeline session_payload: "
         f"topic={payload.get('topic')} error={((payload.get('error') or {}).get('code') if isinstance(payload.get('error'), dict) else '')} "
@@ -5878,6 +6116,16 @@ async def chat(request: Request, payload: ChatRequest):
             )
             if not task:
                 _metric_incr("media_failed_total")
+                degraded_meta = {}
+                if str(err_code or "").startswith("DIFY_"):
+                    degraded_meta = provider_extra_meta(
+                        {
+                            "provider": "dify",
+                            "category": _provider_category_from_error_code(str(err_code or "")),
+                            "error_code": str(err_code or ""),
+                        },
+                        degraded=True,
+                    )
                 out = _postprocess_output(
                     "文生图/视频功能暂未开启，请稍后再试，或先告诉我你想要的风格与场景，我先给你文案草图。",
                     qtype="media",
@@ -5887,7 +6135,7 @@ async def chat(request: Request, payload: ChatRequest):
                     "output": out,
                     "message_type": "media_failed",
                     "media": [],
-                    "extra": {"reason_code": err_code or "media_unavailable"},
+                    "extra": {"reason_code": err_code or "media_unavailable", **degraded_meta},
                 }
                 _append_chat_history(
                     chat_message_history,
@@ -5901,6 +6149,7 @@ async def chat(request: Request, payload: ChatRequest):
                         "media_status": "failed",
                         "media_scenario": media_scenario,
                         "media_error_code": err_code or "media_unavailable",
+                        **degraded_meta,
                     }),
                 )
                 _log_route_observability(
@@ -5909,6 +6158,7 @@ async def chat(request: Request, payload: ChatRequest):
                     flag_snapshot=flag_snapshot,
                     domain_intent="media",
                     question_type="media",
+                    extra_meta=degraded_meta,
                 )
                 return _with_intent(response_data)
 
@@ -5919,6 +6169,13 @@ async def chat(request: Request, payload: ChatRequest):
                 if pref_cn:
                     media_output = f"呀哈～收到啦，这次按你偏好的{pref_cn}来生成。\n{media_output}"
             task_api["output"] = _postprocess_output(media_output, qtype="media")
+            media_failure_meta = provider_extra_meta(_media_provider_failure_meta(task), degraded=True)
+            if media_failure_meta.get("provider"):
+                extra_payload = task_api.get("extra") if isinstance(task_api.get("extra"), dict) else {}
+                extra_payload.update(media_failure_meta)
+                if str(task.get("status") or "") == "failed":
+                    extra_payload.setdefault("reason_code", "MEDIA_PROVIDER_DEGRADED")
+                task_api["extra"] = extra_payload
             response_data = task_api
             task_status = str(task.get("status") or "")
             if task_status in {"pending", "running"}:
@@ -5941,14 +6198,19 @@ async def chat(request: Request, payload: ChatRequest):
                     "media_task_id": str(task.get("task_id") or ""),
                     "media_message_type": str(response_data.get("message_type") or ""),
                     "media_resumed_after_preference": bool(resumed_media_ctx),
+                    **media_failure_meta,
                 }),
             )
+            media_reason_code = f"media_{task_status or 'unknown'}"
+            if media_failure_meta.get("provider") and task_status == "failed":
+                media_reason_code = str(media_failure_meta.get("provider_error_code") or "MEDIA_PROVIDER_DEGRADED")
             _log_route_observability(
                 route_path="media_pipeline",
-                reason_code=f"media_{task_status or 'unknown'}",
+                reason_code=media_reason_code,
                 flag_snapshot=flag_snapshot,
                 domain_intent="media",
                 question_type="media",
+                extra_meta=media_failure_meta,
             )
             return _with_intent(response_data)
 
@@ -6181,6 +6443,17 @@ async def chat(request: Request, payload: ChatRequest):
             out = validate_time_consistency(out, query, time_anchor, window_meta=window_meta)
             out = _enforce_min_answer_contract(out, query=query, question_type=fortune_qtype)
             qtype_for_metrics = str((fortune_payload or {}).get("question_type") or fortune_qtype)
+            fortune_failure = _fortune_provider_failure(fortune_payload)
+            fortune_failure_meta = (
+                {
+                    "provider": str(fortune_failure.get("provider") or ""),
+                    "category": str(fortune_failure.get("category") or ""),
+                    "error_code": str(fortune_failure.get("provider_code") or fortune_failure.get("code") or ""),
+                }
+                if fortune_failure.get("provider")
+                else None
+            )
+            fortune_meta = provider_extra_meta(fortune_failure_meta, degraded=bool(fortune_failure_meta))
             _append_chat_history(
                 chat_message_history,
                 query,
@@ -6188,8 +6461,8 @@ async def chat(request: Request, payload: ChatRequest):
                 user_id=user_id,
                 session_id=session_id,
                 question_type=qtype_for_metrics,
-                route_path="fortune_pipeline",
-                extra_meta=_intent_meta(),
+                route_path="fortune_provider_fallback" if fortune_failure.get("provider") else "fortune_pipeline",
+                extra_meta=_intent_meta(fortune_meta),
             )
             track_output_quality(
                 session_id,
@@ -6201,17 +6474,23 @@ async def chat(request: Request, payload: ChatRequest):
             )
             route_reason = str((fortune_payload or {}).get("route_reason_code") or "").strip()
             final_reason = route_reason if route_reason and route_reason != "none" else flag_reason_code
+            if fortune_failure.get("provider"):
+                final_reason = str(fortune_failure.get("provider_code") or fortune_failure.get("code") or final_reason)
             _log_route_observability(
-                route_path="fortune_pipeline",
+                route_path="fortune_provider_fallback" if fortune_failure.get("provider") else "fortune_pipeline",
                 reason_code=final_reason,
                 flag_snapshot=flag_snapshot,
                 domain_intent="fortune",
                 question_type=qtype_for_metrics,
+                extra_meta=fortune_meta,
             )
-            return _with_intent({
+            response_payload = {
                 "session_id": session_id,
                 "output": out,
-            })
+            }
+            if fortune_failure.get("provider"):
+                response_payload["extra"] = fortune_meta
+            return _with_intent(response_payload)
         time_sensitive = is_time_sensitive_query(query)
         if time_sensitive:
             _metric_incr("time_sensitive_history_isolation_total")
@@ -6420,16 +6699,35 @@ async def create_media_task_api(request: Request, payload: MediaTaskCreateReques
         user_identity=session_id,
     )
     if not task:
+        degraded_payload = {}
+        if str(err_code or "").startswith("DIFY_"):
+            degraded_payload = {
+                "provider": "dify",
+                "provider_error_code": str(err_code or ""),
+            }
         return JSONResponse(
             {
                 "ok": False,
-                "message": "媒体能力不可用，请稍后重试",
-                "error_code": err_code or "media_unavailable",
+                "message": "当前媒体生成能力暂不可用，请稍后重试" if degraded_payload else "媒体能力不可用，请稍后重试",
+                "error_code": "MEDIA_PROVIDER_DEGRADED" if degraded_payload else (err_code or "media_unavailable"),
+                **degraded_payload,
             },
             status_code=503,
         )
     task_resp = _build_media_task_response(session_id, task)
     task_resp["status"] = str(task.get("status") or "")
+    media_failure = _media_provider_failure_meta(task)
+    if media_failure:
+        return JSONResponse(
+            {
+                "ok": False,
+                "message": "当前媒体生成能力暂不可用，请稍后重试",
+                "error_code": "MEDIA_PROVIDER_DEGRADED",
+                "provider": str(media_failure.get("provider") or ""),
+                "provider_error_code": str(media_failure.get("error_code") or ""),
+            },
+            status_code=503,
+        )
     extra = task_resp.get("extra") if isinstance(task_resp.get("extra"), dict) else {}
     extra.update(_intent_extra_payload(intent_decision))
     task_resp["extra"] = extra

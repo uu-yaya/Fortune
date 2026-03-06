@@ -13,6 +13,12 @@ import os
 from pydantic import BaseModel, Field, ValidationError
 
 from config import SERPAPI_API_KEY, VECTOR_COLLECTION_NAME, VECTOR_DB_PATH, YUANFENJU_API_KEY
+from provider_runtime import (
+    build_provider_failure,
+    provider_record_failure,
+    provider_record_success,
+    provider_should_short_circuit,
+)
 
 if SERPAPI_API_KEY:
     os.environ["SERPAPI_API_KEY"] = SERPAPI_API_KEY
@@ -35,6 +41,13 @@ class FortuneSignals(BaseModel):
 class FortuneError(BaseModel):
     code: str = ""
     message: str = ""
+    provider: str = ""
+    provider_code: str = ""
+    category: str = ""
+    degraded: bool = False
+
+
+YUANFENJU_PROVIDER_LIMIT_PATTERN = re.compile(r"(quota|余额不足|剩余可调用次数不足|insufficient|limit)", re.IGNORECASE)
 
 
 class BaziToolOutput(BaseModel):
@@ -142,14 +155,46 @@ def _to_lines(raw, limit: int = 4, max_len: int = 80) -> list[str]:
     return out
 
 
-def _empty_bazi_output(topic: str, code: str, message: str) -> dict:
+def _empty_bazi_output(
+    topic: str,
+    code: str,
+    message: str,
+    *,
+    provider: str = "",
+    provider_code: str = "",
+    category: str = "",
+    degraded: bool = False,
+) -> dict:
     model = BaziToolOutput(
         topic=topic,
         advice=_build_advice(topic, "balanced"),
         confidence=0.2,
-        error=FortuneError(code=code, message=message),
+        error=FortuneError(
+            code=code,
+            message=message,
+            provider=provider,
+            provider_code=provider_code,
+            category=category,
+            degraded=degraded,
+        ),
     )
     return model.model_dump()
+
+
+def _fortune_failure_output(topic: str, code: str, message: str, failure: dict | None = None) -> str:
+    failure = failure or {}
+    return json.dumps(
+        _empty_bazi_output(
+            topic,
+            code,
+            message,
+            provider=str(failure.get("provider") or ""),
+            provider_code=str(failure.get("error_code") or ""),
+            category=str(failure.get("category") or ""),
+            degraded=bool(failure),
+        ),
+        ensure_ascii=False,
+    )
 
 
 def _build_confidence(model: BaziToolOutput) -> float:
@@ -300,10 +345,7 @@ def bazi_cesuan(query: str):
     如果缺少用户姓名和出生年月日时则不可用."""
     topic = _infer_topic(query)
     if YUANFENJU_API_KEY is None:
-        return json.dumps(
-            _empty_bazi_output(topic, "FORTUNE_API_KEY_MISSING", "未配置命理服务密钥"),
-            ensure_ascii=False,
-        )
+        return _fortune_failure_output(topic, "FORTUNE_API_KEY_MISSING", "未配置命理服务密钥")
     url = f"https://api.yuanfenju.com/index.php/v1/Bazi/cesuan"
     prompt = ChatPromptTemplate.from_template(
         """你是一个参数查询助手，根据用户输入内容找出相关的参数并按json格式返回。
@@ -324,53 +366,120 @@ def bazi_cesuan(query: str):
         data = chain.invoke({"query": query, "api_key": YUANFENJU_API_KEY})
     except Exception as e:
         logger.error(f"八字参数抽取失败: {e}")
-        return json.dumps(
-            _empty_bazi_output(topic, "FORTUNE_PARSE_FAILED", "参数抽取失败，请补充姓名和出生年月日时"),
-            ensure_ascii=False,
-        )
+        return _fortune_failure_output(topic, "FORTUNE_PARAM_EXTRACT_FAILED", "参数抽取失败，请补充姓名和出生年月日时")
 
     logger.info(f"大模型返回参数抽取结果: {data}")
     timeout_seconds = 3
     max_retries = 2
-    last_error = ("FORTUNE_UPSTREAM_HTTP", "命理服务暂时不可用")
+    breaker = provider_should_short_circuit(None, "yuanfenju", "fortune_submit")
+    if breaker.get("short_circuit"):
+        failure = build_provider_failure(
+            provider="yuanfenju",
+            operation="fortune_submit",
+            category=str(breaker.get("last_category") or "unknown"),
+            error_code="YUANFENJU_BREAKER_OPEN",
+            error_message="命理服务暂时降级中，请稍后重试",
+            retryable=False,
+            breaker_ttl_seconds=max(60, int((breaker.get("open_until") or 0) - time.time())),
+            raw_error=str(breaker),
+        )
+        return _fortune_failure_output(topic, "FORTUNE_PROVIDER_DEGRADED", "命理服务暂时降级中，请稍后重试", failure)
+    last_failure = build_provider_failure(
+        provider="yuanfenju",
+        operation="fortune_submit",
+        category="unknown",
+        error_code="YUANFENJU_HTTP_4XX",
+        error_message="命理服务暂时不可用",
+    )
     for attempt in range(max_retries + 1):
         try:
             result = requests.post(url, data=data, timeout=timeout_seconds)
             if result.status_code != 200:
-                code = "FORTUNE_UPSTREAM_5XX" if result.status_code >= 500 else "FORTUNE_UPSTREAM_HTTP"
-                last_error = (code, f"命理服务响应异常（HTTP {result.status_code}）")
-                raise requests.RequestException(last_error[1])
+                category = "http_5xx" if result.status_code >= 500 else "http_4xx"
+                last_failure = build_provider_failure(
+                    provider="yuanfenju",
+                    operation="fortune_submit",
+                    category=category,
+                    error_code="YUANFENJU_HTTP_5XX" if result.status_code >= 500 else "YUANFENJU_HTTP_4XX",
+                    error_message=f"命理服务响应异常（HTTP {result.status_code}）",
+                    http_status=result.status_code,
+                    raw_error=result.text[:200],
+                )
+                raise requests.RequestException(last_failure["error_message"])
             payload = result.json()
             logger.info(f"缘分居cesuan接口返回JSON: {payload}")
             if int(payload.get("errcode", 1)) != 0:
                 msg = str(payload.get("errmsg") or "命理服务返回错误")
-                return json.dumps(
-                    _empty_bazi_output(topic, "FORTUNE_UPSTREAM_HTTP", msg),
-                    ensure_ascii=False,
+                category = "quota" if YUANFENJU_PROVIDER_LIMIT_PATTERN.search(msg) else "http_4xx"
+                failure = build_provider_failure(
+                    provider="yuanfenju",
+                    operation="fortune_submit",
+                    category=category,
+                    error_code="YUANFENJU_PROVIDER_LIMIT" if category == "quota" else "YUANFENJU_HTTP_4XX",
+                    error_message=msg,
+                    http_status=200,
+                    raw_error=json.dumps(payload, ensure_ascii=False)[:200],
                 )
+                provider_record_failure(None, failure)
+                return _fortune_failure_output(topic, "FORTUNE_UPSTREAM_HTTP", msg, failure)
             model = _parse_bazi_payload(payload, topic)
             try:
                 validated = BaziToolOutput.model_validate(model.model_dump())
             except ValidationError as ve:
                 logger.error(f"八字结构化校验失败: {ve}")
-                return json.dumps(
-                    _empty_bazi_output(topic, "FORTUNE_PARSE_FAILED", "命理结果解析失败"),
-                    ensure_ascii=False,
+                failure = build_provider_failure(
+                    provider="yuanfenju",
+                    operation="fortune_submit",
+                    category="invalid_response",
+                    error_code="YUANFENJU_INVALID_RESPONSE",
+                    error_message="命理结果解析失败",
+                    raw_error=str(ve),
                 )
+                provider_record_failure(None, failure)
+                return _fortune_failure_output(topic, "FORTUNE_PARSE_FAILED", "命理结果解析失败", failure)
+            provider_record_success(None, "yuanfenju", "fortune_submit")
             return json.dumps(validated.model_dump(), ensure_ascii=False)
         except requests.Timeout:
-            last_error = ("FORTUNE_TIMEOUT", "命理服务超时，请稍后重试")
+            last_failure = build_provider_failure(
+                provider="yuanfenju",
+                operation="fortune_submit",
+                category="timeout",
+                error_code="YUANFENJU_TIMEOUT",
+                error_message="命理服务超时，请稍后重试",
+            )
         except (requests.RequestException, json.JSONDecodeError) as e:
             logger.warning(f"八字接口请求失败，attempt={attempt + 1}: {e}")
             if isinstance(e, json.JSONDecodeError):
-                last_error = ("FORTUNE_PARSE_FAILED", "命理结果解析失败")
+                last_failure = build_provider_failure(
+                    provider="yuanfenju",
+                    operation="fortune_submit",
+                    category="invalid_response",
+                    error_code="YUANFENJU_INVALID_RESPONSE",
+                    error_message="命理结果解析失败",
+                    raw_error=str(e),
+                )
+            elif last_failure.get("category") == "unknown":
+                last_failure = build_provider_failure(
+                    provider="yuanfenju",
+                    operation="fortune_submit",
+                    category="network",
+                    error_code="YUANFENJU_HTTP_4XX",
+                    error_message="命理服务暂时不可用",
+                    raw_error=str(e),
+                )
         if attempt < max_retries:
             time.sleep(0.4 * (2 ** attempt))
 
-    return json.dumps(
-        _empty_bazi_output(topic, last_error[0], last_error[1]),
-        ensure_ascii=False,
-    )
+    provider_record_failure(None, last_failure)
+    outward_code = {
+        "timeout": "FORTUNE_TIMEOUT",
+        "http_5xx": "FORTUNE_UPSTREAM_5XX",
+        "http_4xx": "FORTUNE_UPSTREAM_HTTP",
+        "quota": "FORTUNE_UPSTREAM_HTTP",
+        "invalid_response": "FORTUNE_PARSE_FAILED",
+        "network": "FORTUNE_UPSTREAM_HTTP",
+    }.get(str(last_failure.get("category") or ""), "FORTUNE_UPSTREAM_HTTP")
+    return _fortune_failure_output(topic, outward_code, str(last_failure.get("error_message") or "命理服务暂时不可用"), last_failure)
 
 @tool
 def yaoyigua():

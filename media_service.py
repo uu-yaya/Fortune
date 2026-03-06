@@ -19,10 +19,15 @@ SCENARIO_LABELS = {
 _TABLE_READY = False
 
 
-def _is_retryable_poll_failure(poll_status: str, error_code: str) -> bool:
+def _is_retryable_poll_failure(poll_status: str, error_code: str, provider_category: str = "") -> bool:
     status = str(poll_status or "").strip().lower()
     code = str(error_code or "").strip().upper()
+    category = str(provider_category or "").strip().lower()
     if status not in {"failed", "timeout"}:
+        return False
+    if category in {"timeout", "network", "http_5xx"}:
+        return True
+    if category in {"quota", "auth", "invalid_response", "safety"}:
         return False
     if code in {"DIFY_TIMEOUT", "DIFY_REQUEST_FAILED"}:
         return True
@@ -238,6 +243,7 @@ def submit_media_task(
     raw = submit.get("raw") if isinstance(submit.get("raw"), dict) else {}
     error_code = str(submit.get("error_code") or "")
     error_message = str(submit.get("error_message") or "")
+    error_category = str(submit.get("error_category") or "")
     now = datetime.now()
 
     if status == "succeeded":
@@ -318,8 +324,9 @@ def refresh_media_task(
     raw = poll.get("raw") if isinstance(poll.get("raw"), dict) else {}
     error_code = str(poll.get("error_code") or "")
     error_message = str(poll.get("error_message") or "")
+    error_category = str(poll.get("error_category") or "")
 
-    if _is_retryable_poll_failure(poll_status, error_code):
+    if _is_retryable_poll_failure(poll_status, error_code, error_category):
         _update_task_row(
             conn_factory,
             task_id,
@@ -396,6 +403,8 @@ def media_task_to_api(task: dict[str, Any]) -> dict[str, Any]:
         err_msg = str(task.get("error_message") or "")
         if err_code == "DIFY_PROVIDER_LIMIT":
             output = "呀哈～这次被上游模型的额度/安全模式拦住啦。先到 Dify 调整额度后再试，我这边已经帮你记好任务了。"
+        elif err_code == "DIFY_BREAKER_OPEN":
+            output = "呀哈～当前媒体生成服务正在降级保护中，请稍后再试。"
         elif "less than 256" in err_msg.lower():
             output = "噗噜。上游 Dify 的提示词长度上限（256）触发了，所以这次没生成出来。你先在 Dify 调整上限，再试就更稳。"
         else:
@@ -417,6 +426,8 @@ def media_task_to_api(task: dict[str, Any]) -> dict[str, Any]:
         "scenario": scenario,
         "error_code": error_code,
         "error_message": error_message,
+        "provider": "dify" if error_code.startswith("DIFY_") else "",
+        "provider_error_code": error_code if error_code.startswith("DIFY_") else "",
         "extra": {
             "dify_run_id": str(task.get("dify_run_id") or ""),
             "scenario_label": label,

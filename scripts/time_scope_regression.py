@@ -4,8 +4,16 @@ import random
 import re
 from datetime import datetime
 from dataclasses import dataclass
+from pathlib import Path
+import sys
 
 import requests
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import server
 
 
 @dataclass
@@ -52,6 +60,37 @@ def has_stale_time_window_year(text: str, anchor_year: int) -> tuple[bool, list[
         if (anchor_year - 3) <= year < anchor_year:
             stale_years.append(year)
     return (len(stale_years) > 0), stale_years
+
+
+def run_provider_timeout_contract_case() -> tuple[bool, str]:
+    payload = {
+        "topic": "daily",
+        "strength": "balanced",
+        "fortune_signals": {"love": "", "wealth": "", "career": "近期更适合先稳节奏。"},
+        "advice": ["先稳住一个关键动作。", "把节奏拆成可执行的小步。"],
+        "confidence": 0.2,
+        "error": {
+            "code": "FORTUNE_TIMEOUT",
+            "message": "命理服务超时，请稍后重试",
+            "provider": "yuanfenju",
+            "provider_code": "YUANFENJU_TIMEOUT",
+            "category": "timeout",
+            "degraded": True,
+        },
+    }
+    window_meta = {"window_text": "2026年3月7日至2026年3月9日", "label": "near_days"}
+    output = server._build_fortune_provider_safe_fallback(
+        payload,
+        "daily",
+        query="我今天整体运势最该注意什么？",
+        question_type="default",
+        time_anchor=server.build_time_anchor(),
+        window_meta=window_meta,
+        session_id="ts-provider-timeout",
+    )
+    output = server.validate_time_consistency(output, "我今天整体运势最该注意什么？", server.build_time_anchor(), window_meta=window_meta)
+    ok = "时间窗口" in output and has_explicit_window(output) and "建议" in output
+    return ok, output
 
 
 def main() -> int:
@@ -142,10 +181,17 @@ def main() -> int:
                 continue
         print(f"[PASS] {case.cid}")
 
+    provider_ok, provider_output = run_provider_timeout_contract_case()
+    if provider_ok:
+        print("[PASS] TS-PROV-001")
+    else:
+        failed += 1
+        print(f"[FAIL] TS-PROV-001 provider timeout fallback missing contract | output={provider_output[:180]}")
+
     if failed:
-        print(f"[SUMMARY] failed={failed} total={len(cases)}")
+        print(f"[SUMMARY] failed={failed} total={len(cases) + 1}")
         return 2
-    print(f"[SUMMARY] pass total={len(cases)}")
+    print(f"[SUMMARY] pass total={len(cases) + 1}")
     return 0
 
 
