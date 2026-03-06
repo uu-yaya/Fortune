@@ -821,6 +821,14 @@ def _last_blueprint_key(session_id: str) -> str:
     return f"jiyi:last_blueprint:{session_id}"
 
 
+def _recent_advice_signature_session_key(session_id: str) -> str:
+    return f"jiyi:recent_advice:session:{session_id}"
+
+
+def _quality_recent_advice_signature_key(day: datetime | None = None) -> str:
+    return f"jiyi:quality:recent_advice:{_quality_day_tag(day)}"
+
+
 def _metric_incr(metric: str, amount: int = 1):
     if not metric:
         return
@@ -1602,7 +1610,8 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
     day_limit = span_days if label in {"this_month", "next_30_days", "coming_period"} else 14
     days = _enumerate_days(start, end, limit=day_limit)
     year_span_labels = {"compare_year_span", "explicit_year_span", "relative_year_span"}
-    if label in year_span_labels or start.year != end.year:
+    single_year_with_year_labels = {"year_full", "year_h1", "year_h2", "explicit_year", "year_partial", "one_year", "multi_year"}
+    if label in year_span_labels or label in single_year_with_year_labels or start.year != end.year:
         window_text = f"{_cn_day_with_year(start)}至{_cn_day_with_year(end)}"
     else:
         window_text = f"{_cn_day(start)}至{_cn_day(end)}"
@@ -1627,6 +1636,22 @@ DATE_WEEKDAY_PATTERN = re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日[，,\s]
 DATE_FULL_PATTERN = re.compile(r"(20\d{2})年(\d{1,2})月(\d{1,2})日")
 DATE_SHORT_PATTERN = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日")
 YEAR_PATTERN = re.compile(r"(20\d{2})年")
+YEAR_SCOPE_QUERY_PATTERN = re.compile(r"(20\d{2}|今年|本年|明年|后年|去年|前年|全年|年度)")
+
+SHORT_WINDOW_LABELS = {"near_days", "two_days", "this_week", "next_week"}
+LONG_WINDOW_LABELS = {"next_30_days", "coming_period", "this_month"}
+YEAR_WINDOW_LABELS = {
+    "year_full",
+    "year_h1",
+    "year_h2",
+    "explicit_year",
+    "year_partial",
+    "one_year",
+    "multi_year",
+    "compare_year_span",
+    "relative_year_span",
+    "explicit_year_span",
+}
 
 
 def is_time_sensitive_query(query: str) -> bool:
@@ -1649,9 +1674,13 @@ def _should_show_window_text(query: str, window_label: str, question_type: str =
     label = str(window_label or "")
     if NEAR_DAYS_QUERY_PATTERN.search(q):
         return True
-    if question_type in {"colloquial"} and label in {"near_days", "two_days", "this_week", "next_week"}:
+    if question_type in {"colloquial"} and label in SHORT_WINDOW_LABELS:
         return True
-    if label in {"near_days", "two_days", "this_week", "next_week"}:
+    if label in SHORT_WINDOW_LABELS:
+        return True
+    if label in LONG_WINDOW_LABELS and RELATIVE_WINDOW_PATTERN.search(q):
+        return True
+    if label in YEAR_WINDOW_LABELS and YEAR_SCOPE_QUERY_PATTERN.search(q):
         return True
     return False
 
@@ -1817,10 +1846,18 @@ def _patch_time_text_locally(
     time_anchor: dict,
     allowed_dates: set[str],
     window_meta: dict | None = None,
-) -> tuple[str, int, bool]:
+) -> tuple[str, int, bool, dict[str, bool]]:
     patched = str(out or "")
     conflict_count = 0
     severe_mismatch = False
+    reason_flags = {
+        "weekday_mismatch": False,
+        "window_overflow": False,
+        "expected_year_mismatch": False,
+        "year_out_of_window": False,
+        "large_year_gap": False,
+        "too_many_conflicts": False,
+    }
 
     for m in reversed(list(DATE_WEEKDAY_PATTERN.finditer(patched))):
         year = int(m.group(1))
@@ -1830,6 +1867,7 @@ def _patch_time_text_locally(
         expected = _weekday_cn_from_date(year, month, day)
         if expected and weekday_text and weekday_text != expected:
             conflict_count += 1
+            reason_flags["weekday_mismatch"] = True
             _metric_incr("weekday_mismatch_count")
             start = m.start(4)
             end = m.end(4)
@@ -1846,13 +1884,16 @@ def _patch_time_text_locally(
             date_str = f"{year:04d}-{month:02d}-{day:02d}"
             if allowed_years:
                 if year not in allowed_years:
-                    severe_mismatch = True
+                    reason_flags["year_out_of_window"] = True
+                    conflict_count += 1
             elif abs(year - anchor_year) >= 2 and _expected_year_from_query(query, time_anchor) is None:
-                severe_mismatch = True
+                reason_flags["large_year_gap"] = True
+                conflict_count += 1
             if allowed_dates and date_str not in allowed_dates:
                 if _date_within_window(date_str, window_meta):
                     continue
                 conflict_count += 1
+                reason_flags["window_overflow"] = True
                 replacement = _pick_closest_allowed_date(date_str, allowed_dates)
                 patched = patched[:m.start()] + _iso_to_cn(replacement, short=False) + patched[m.end():]
         full_spans = [(m.start(), m.end()) for m in DATE_FULL_PATTERN.finditer(patched)]
@@ -1869,15 +1910,18 @@ def _patch_time_text_locally(
                 if _date_within_window(date_str, window_meta):
                     continue
                 conflict_count += 1
+                reason_flags["window_overflow"] = True
                 replacement = _pick_closest_allowed_date(date_str, allowed_dates)
                 patched = patched[:m.start()] + _iso_to_cn(replacement, short=True) + patched[m.end():]
         years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(patched)}
         if years:
             if allowed_years and any(y not in allowed_years for y in years):
-                severe_mismatch = True
+                reason_flags["year_out_of_window"] = True
+                conflict_count += 1
             elif not allowed_years and any(abs(y - anchor_year) >= 2 for y in years):
                 if _expected_year_from_query(query, time_anchor) is None:
-                    severe_mismatch = True
+                    reason_flags["large_year_gap"] = True
+                    conflict_count += 1
 
     expected_year = _expected_year_from_query(query, time_anchor)
     if expected_year is not None:
@@ -1887,11 +1931,17 @@ def _patch_time_text_locally(
             if year == expected_year:
                 continue
             conflict_count += 1
+            reason_flags["expected_year_mismatch"] = True
             patched = patched[:m.start(1)] + str(expected_year) + patched[m.end(1):]
 
-    if conflict_count >= 6:
+    if reason_flags["year_out_of_window"] and conflict_count >= 4:
         severe_mismatch = True
-    return patched, conflict_count, severe_mismatch
+    if reason_flags["large_year_gap"] and conflict_count >= 3:
+        severe_mismatch = True
+    if conflict_count >= 6:
+        reason_flags["too_many_conflicts"] = True
+        severe_mismatch = True
+    return patched, conflict_count, severe_mismatch, reason_flags
 
 
 def _validate_time_consistency_legacy(text: str, query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
@@ -1912,10 +1962,16 @@ def _validate_time_consistency_legacy(text: str, query: str, time_anchor: dict, 
         weekday_text = _normalize_weekday_label(m.group(4))
         expected = _weekday_cn_from_date(year, month, day)
         if expected and weekday_text and weekday_text != expected:
-            _metric_incr("time_validation_fail_total")
-            _metric_incr("time_validation_autofix_total")
-            _metric_incr("temporal_consistency_fail")
+            _record_temporal_failure({"weekday_mismatch": True}, severe=True)
             _metric_incr("weekday_mismatch_count")
+            _log_temporal_consistency_event(
+                "legacy_weekday_mismatch",
+                q,
+                window_meta,
+                conflict_count=1,
+                severe_mismatch=True,
+                reason_flags={"weekday_mismatch": True},
+            )
             return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
 
     if RELATIVE_WINDOW_PATTERN.search(q):
@@ -1933,28 +1989,54 @@ def _validate_time_consistency_legacy(text: str, query: str, time_anchor: dict, 
 
         for date_str in explicit_dates:
             if date_str not in allowed_dates:
-                _metric_incr("time_validation_fail_total")
-                _metric_incr("time_validation_autofix_total")
-                _metric_incr("temporal_consistency_fail")
+                _record_temporal_failure({"window_overflow": True}, severe=True)
+                _log_temporal_consistency_event(
+                    "legacy_window_overflow",
+                    q,
+                    window_meta,
+                    conflict_count=1,
+                    severe_mismatch=True,
+                    reason_flags={"window_overflow": True},
+                )
                 return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
 
         years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(out)}
         if years and any(str(y) not in {x[:4] for x in allowed_dates} for y in years):
-            _metric_incr("time_validation_fail_total")
-            _metric_incr("time_validation_autofix_total")
-            _metric_incr("temporal_consistency_fail")
+            _record_temporal_failure({"window_overflow": True}, severe=True)
+            _log_temporal_consistency_event(
+                "legacy_year_outside_window",
+                q,
+                window_meta,
+                conflict_count=1,
+                severe_mismatch=True,
+                reason_flags={"window_overflow": True},
+            )
             return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
 
     expected_year = _expected_year_from_query(q, time_anchor)
     if expected_year is not None:
         years = {int(m.group(1)) for m in YEAR_PATTERN.finditer(out)}
         if years and any(y != expected_year for y in years):
-            _metric_incr("time_validation_fail_total")
-            _metric_incr("time_validation_autofix_total")
-            _metric_incr("temporal_consistency_fail")
+            _record_temporal_failure({"expected_year_mismatch": True}, severe=True)
+            _log_temporal_consistency_event(
+                "legacy_expected_year_mismatch",
+                q,
+                window_meta,
+                conflict_count=1,
+                severe_mismatch=True,
+                reason_flags={"expected_year_mismatch": True},
+            )
             return _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
 
     _metric_incr("temporal_consistency_hit")
+    _log_temporal_consistency_event(
+        "legacy_pass",
+        q,
+        window_meta,
+        conflict_count=0,
+        severe_mismatch=False,
+        reason_flags={},
+    )
     return out
 
 
@@ -1988,6 +2070,99 @@ def _extract_business_sentences(text: str) -> str:
     return "。".join(kept).strip()
 
 
+def _record_temporal_failure(reason_flags: dict[str, bool] | None = None, severe: bool = False):
+    flags = reason_flags or {}
+    _metric_incr("time_validation_fail_total")
+    _metric_incr("time_validation_autofix_total")
+    _metric_incr("temporal_consistency_fail")
+    if severe:
+        _metric_incr("temporal_fail_severe_total")
+    if bool(flags.get("expected_year_mismatch")):
+        _metric_incr("temporal_fail_expected_year_total")
+    if bool(flags.get("window_overflow")):
+        _metric_incr("temporal_fail_window_overflow_total")
+
+
+def _log_temporal_consistency_event(
+    branch: str,
+    query: str,
+    window_meta: dict | None,
+    conflict_count: int,
+    severe_mismatch: bool,
+    reason_flags: dict[str, bool] | None = None,
+):
+    window_label = ""
+    if isinstance(window_meta, dict):
+        window_label = str(window_meta.get("label") or "")
+    event = {
+        "branch": str(branch or "none"),
+        "question_type": detect_question_type(str(query or "")),
+        "window_label": window_label or "none",
+        "conflict_count": int(conflict_count or 0),
+        "severe_mismatch": bool(severe_mismatch),
+        "reason_flags": {k: bool(v) for k, v in (reason_flags or {}).items()},
+    }
+    logger.info(f"temporal_consistency={json.dumps(event, ensure_ascii=False)}")
+
+
+def _sanitize_time_tokens_before_validation(text: str, query: str, window_meta: dict | None = None) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return out
+    q = str(query or "")
+    qtype = detect_question_type(q)
+    window_label = str((window_meta or {}).get("label") or "")
+    allow_window_text = _should_show_window_text(q, window_label, question_type=qtype)
+    normalized = out.replace("\\n", "\n")
+
+    # 非趋势/时窗问法，且不应展示窗口时，避免输出具体日期，降低时序一致性误伤。
+    if (not allow_window_text) and qtype not in {"trend", "colloquial"} and not RELATIVE_WINDOW_PATTERN.search(q):
+        normalized = re.sub(r"(20\d{2}年\d{1,2}月\d{1,2}日)", "这个时间范围", normalized)
+        normalized = re.sub(r"(?<!\d)(\d{1,2})月(\d{1,2})日(?!\d)", "这段时间", normalized)
+
+    # 不应展示窗口时，删除窗口对齐行，保留业务建议。
+    if not allow_window_text:
+        kept: list[str] = []
+        for line in [ln.strip() for ln in normalized.splitlines() if ln.strip()]:
+            if re.search(r"(时间上先对齐|时间窗口|窗口按这个范围计算|从\d{1,2}月\d{1,2}日到\d{1,2}月\d{1,2}日)", line):
+                continue
+            kept.append(line)
+        if kept:
+            normalized = "\n".join(kept).strip()
+    return normalized.strip()
+
+
+def _has_explicit_window_text(text: str) -> bool:
+    out = str(text or "")
+    if not out:
+        return False
+    if DATE_FULL_PATTERN.search(out):
+        return True
+    if DATE_SHORT_PATTERN.search(out) and re.search(r"(至|到|—|-)", out):
+        return True
+    return False
+
+
+def _ensure_time_window_contract(text: str, query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return out
+    q = str(query or "")
+    qtype = detect_question_type(q)
+    window_label = str((window_meta or {}).get("label") or "")
+    window_text = str((window_meta or {}).get("window_text") or "").strip()
+    allow_window_text = _should_show_window_text(q, window_label, question_type=qtype)
+
+    patched = out
+    if allow_window_text and window_text and not _has_explicit_window_text(patched):
+        patched = f"{patched}\n时间窗口：{window_text}。".strip()
+
+    expected_year = _expected_year_from_query(q, time_anchor)
+    if expected_year is not None and not re.search(rf"(?<!\d){expected_year}(?!\d)", patched):
+        patched = f"{patched}\n本次按{expected_year}年窗口解读。".strip()
+    return patched
+
+
 def validate_time_consistency(text: str, query: str, time_anchor: dict, window_meta: dict | None = None) -> str:
     if not _time_patch_v1_enabled():
         return _validate_time_consistency_legacy(text, query, time_anchor, window_meta=window_meta)
@@ -2000,9 +2175,10 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
         return out
     _metric_incr("temporal_consistency_total")
     _metric_incr("time_guard_total")
+    out = _sanitize_time_tokens_before_validation(out, q, window_meta=window_meta)
 
     allowed_dates = _collect_allowed_dates(time_anchor, window_meta=window_meta)
-    patched, conflict_count, severe_mismatch = _patch_time_text_locally(
+    patched, conflict_count, severe_mismatch, reason_flags = _patch_time_text_locally(
         out,
         q,
         time_anchor,
@@ -2010,23 +2186,47 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
         window_meta=window_meta,
     )
     if severe_mismatch:
-        _metric_incr("time_validation_fail_total")
-        _metric_incr("time_validation_autofix_total")
-        _metric_incr("temporal_consistency_fail")
+        _record_temporal_failure(reason_flags, severe=True)
+        _log_temporal_consistency_event(
+            "patch_severe_fallback",
+            q,
+            window_meta,
+            conflict_count=conflict_count,
+            severe_mismatch=True,
+            reason_flags=reason_flags,
+        )
         safe = _build_time_safe_fallback(q, time_anchor, window_meta=window_meta)
         residual = _strip_time_alignment_sentences(patched)
         if not residual:
             residual = _extract_business_sentences(patched)
         if residual:
-            return f"{safe}\n\n{residual}".strip()
+            merged = f"{safe}\n\n{residual}".strip()
+            return _ensure_time_window_contract(merged, q, time_anchor, window_meta=window_meta)
         _metric_incr("time_guard_overwrite_total")
-        return safe
+        return _ensure_time_window_contract(safe, q, time_anchor, window_meta=window_meta)
     if conflict_count > 0:
         _metric_incr("time_validation_fail_total")
         _metric_incr("time_validation_autofix_total")
         _metric_incr("time_validation_patch_total")
+        _log_temporal_consistency_event(
+            "patch_autofix",
+            q,
+            window_meta,
+            conflict_count=conflict_count,
+            severe_mismatch=False,
+            reason_flags=reason_flags,
+        )
     _metric_incr("temporal_consistency_hit")
-    return patched
+    if conflict_count == 0:
+        _log_temporal_consistency_event(
+            "patch_pass",
+            q,
+            window_meta,
+            conflict_count=0,
+            severe_mismatch=False,
+            reason_flags=reason_flags,
+        )
+    return _ensure_time_window_contract(patched, q, time_anchor, window_meta=window_meta)
 
 
 def get_fast_reply(query: str, time_anchor: dict | None = None, profile: dict | None = None) -> str | None:
@@ -3711,26 +3911,51 @@ def _default_fortune_advice(topic: str, strength: str) -> list[str]:
             "今天先完成一件最重要的小事，连续投入25分钟。",
             "把待办压到3项以内，先完成再扩展。",
             "晚上用3分钟复盘今天最顺和最卡的点。",
+            "先把最容易拖延的任务切成两步，完成第一步就收获正反馈。",
+            "对外沟通前先写三句结论，减少来回解释的成本。",
+            "遇到分心时先离开屏幕2分钟，再回到当前最关键任务。",
+            "今天只保留一个主目标，其他事项全部降级到备选。",
+            "把睡前15分钟留给整理与复盘，帮助明天开局更稳。",
         ],
         "love": [
             "今天主动发一次轻量关心，不求长聊但求真诚。",
             "表达感受时用'我感受'句式，减少猜测。",
             "关系不确定时，48小时内不做冲动决定。",
+            "把期待说成具体需求，别让对方靠猜来理解你。",
+            "出现分歧先复述对方观点，再表达你的底线和诉求。",
+            "高情绪时先暂停20分钟，等状态稳下来再回应。",
+            "先稳定互动频率，再讨论关系定义，避免节奏失衡。",
+            "先做一次真诚感谢，修复关系比争输赢更重要。",
         ],
         "wealth": [
             "今天先做一项与收入直接相关的动作。",
             "先记账再消费，避免情绪性花销。",
             "高风险决策设置24小时冷静期。",
+            "把本周可变支出先封顶，再安排非必要消费。",
+            "先清掉一项低价值开销，为现金流腾出缓冲区。",
+            "收入增长目标拆成日动作，先保连续性再追高强度。",
+            "遇到高收益承诺先核对风险条款，避免信息不对称。",
+            "优先补齐应急金，再考虑激进配置。",
         ],
         "career": [
             "先推进一个可量化产出点，别同时开太多线。",
             "把本周关键结果整理成3句汇报。",
             "遇到卡点先找一个能给反馈的人快速对齐。",
+            "先把任务标准写清楚，再动手可显著减少返工。",
+            "优先解决高杠杆问题，别被低价值杂事拖住节奏。",
+            "重要会议前先准备一页提纲，保证表达稳定有重点。",
+            "今天先完成一个可交付版本，再逐步打磨细节。",
+            "碰到争议先给备选方案，再表达偏好和理由。",
         ],
         "study": [
             "先做25分钟深度学习，再休息5分钟。",
             "先攻克最难的一节，建立正反馈。",
             "睡前做10分钟回顾，巩固关键知识点。",
+            "先做一组限时练习，再复盘错因比盲目刷题更有效。",
+            "把知识点讲给自己听一遍，检验理解是否完整。",
+            "把高频错题单独成册，每天固定回看一次。",
+            "先定今日最小达标线，完成后再加练。",
+            "把复习节奏拆成“输入-输出-纠错”三步，避免只看不练。",
         ],
     }
     advice = list(table.get(topic, table["daily"]))
@@ -3898,7 +4123,84 @@ def _basis_line(payload: dict) -> str:
     return "；".join(basis_parts)
 
 
-def _resolve_fortune_advice(payload: dict, topic: str, strength: str) -> list[str]:
+def _dedupe_text_items(items: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        clean = str(item or "").strip()
+        if not clean:
+            continue
+        norm = re.sub(r"\s+", "", clean)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(clean)
+    return deduped
+
+
+def _pick_advice_by_seed(candidates: list[str], seed: str, max_items: int = 3) -> list[str]:
+    if not candidates:
+        return []
+    cap = max(1, min(int(max_items), len(candidates)))
+    hashed = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    start = int(hashed[:8], 16) % len(candidates)
+    step = (int(hashed[8:16], 16) % len(candidates)) or 1
+    if len(candidates) > 1 and step % len(candidates) == 0:
+        step = 1
+    picked: list[str] = []
+    idx = start
+    guard = 0
+    while len(picked) < cap and guard < len(candidates) * 2:
+        choice = candidates[idx % len(candidates)]
+        if choice not in picked:
+            picked.append(choice)
+        idx += step
+        guard += 1
+    return picked[:cap]
+
+
+def _load_recent_advice_signatures(session_id: str) -> set[str]:
+    signatures: set[str] = set()
+    try:
+        if session_id:
+            s_key = _recent_advice_signature_session_key(session_id)
+            session_items = _REDIS_CLIENT.lrange(s_key, 0, 7) or []
+            signatures.update(str(x or "").strip() for x in session_items if str(x or "").strip())
+        g_key = _quality_recent_advice_signature_key()
+        global_items = _REDIS_CLIENT.lrange(g_key, 0, 31) or []
+        signatures.update(str(x or "").strip() for x in global_items if str(x or "").strip())
+    except Exception:
+        return signatures
+    return signatures
+
+
+def _remember_advice_signature(signature: str, session_id: str):
+    sign = str(signature or "").strip()
+    if not sign:
+        return
+    try:
+        g_key = _quality_recent_advice_signature_key()
+        _REDIS_CLIENT.lpush(g_key, sign)
+        _REDIS_CLIENT.ltrim(g_key, 0, 63)
+        _REDIS_CLIENT.expire(g_key, QUALITY_METRICS_TTL_DAYS * 24 * 3600)
+        if session_id:
+            s_key = _recent_advice_signature_session_key(session_id)
+            _REDIS_CLIENT.lpush(s_key, sign)
+            _REDIS_CLIENT.ltrim(s_key, 0, 15)
+            _REDIS_CLIENT.expire(s_key, SESSION_TTL_SECONDS)
+    except Exception:
+        return
+
+
+def _resolve_fortune_advice(
+    payload: dict,
+    topic: str,
+    strength: str,
+    query: str = "",
+    question_type: str = "default",
+    blueprint_id: str = "",
+    session_id: str = "",
+) -> list[str]:
     if _evidence_advice_v1_enabled():
         candidates: list[str] = []
         for key in ["opportunity_points", "risk_points", "time_hints", "evidence_lines"]:
@@ -3909,21 +4211,37 @@ def _resolve_fortune_advice(payload: dict, topic: str, strength: str) -> list[st
                 clean = str(item or "").strip()
                 if clean:
                     candidates.append(clean)
-        if candidates:
-            deduped: list[str] = []
-            seen: set[str] = set()
-            for item in candidates:
-                norm = re.sub(r"\s+", "", item)
-                if not norm or norm in seen:
-                    continue
-                seen.add(norm)
-                deduped.append(item)
-                if len(deduped) >= 3:
-                    break
-            if deduped:
-                return deduped
-    advice = payload.get("advice") or _default_fortune_advice(topic, strength)
-    return [str(x).strip() for x in advice if str(x).strip()][:3]
+        evidence_pool = _dedupe_text_items(candidates)
+    else:
+        evidence_pool = []
+    base_advice = payload.get("advice") or []
+    base_pool = _dedupe_text_items([str(x).strip() for x in base_advice if str(x).strip()])
+    default_pool = _dedupe_text_items(_default_fortune_advice(topic, strength))
+    pool: list[str] = []
+    for source in [evidence_pool, base_pool, default_pool]:
+        for item in source:
+            if item not in pool:
+                pool.append(item)
+    if not pool:
+        return []
+    seed_src = (
+        f"{topic}|{strength}|{str(question_type or 'default')}|{str(blueprint_id or 'none')}|"
+        f"{hashlib.sha256(str(query or '').encode('utf-8')).hexdigest()[:16]}"
+    )
+    max_items = min(3, len(pool))
+    selected = _pick_advice_by_seed(pool, seed_src, max_items=max_items)
+    recent_signatures = _load_recent_advice_signatures(session_id)
+    if selected and recent_signatures and len(pool) > max_items:
+        for offset in range(1, min(6, len(pool))):
+            alt = _pick_advice_by_seed(pool, f"{seed_src}|alt{offset}", max_items=max_items)
+            if not alt:
+                continue
+            alt_sign = _advice_signature(alt)
+            if alt_sign and alt_sign not in recent_signatures:
+                selected = alt
+                break
+    _remember_advice_signature(_advice_signature(selected), session_id=session_id)
+    return selected
 
 
 def _advice_signature(advice: list[str]) -> str:
@@ -3955,13 +4273,25 @@ def _generate_fortune_reply_with_model(
     query: str,
     question_type: str,
     window_meta: dict | None = None,
+    blueprint_id: str = "default_concise",
+    advice_override: list[str] | None = None,
 ) -> str:
     q = str(query or "").strip()
     if not q:
         return ""
     topic_cn = _topic_cn(topic)
     strength = str(payload.get("strength") or "balanced")
-    advice = _resolve_fortune_advice(payload, topic, strength)
+    advice = [str(x).strip() for x in (advice_override or []) if str(x).strip()]
+    if not advice:
+        advice = _resolve_fortune_advice(
+            payload,
+            topic,
+            strength,
+            query=q,
+            question_type=str(question_type or "default"),
+            blueprint_id=str(blueprint_id or ""),
+            session_id="",
+        )
     window_text = ""
     window_label = ""
     if isinstance(window_meta, dict):
@@ -3978,11 +4308,14 @@ def _generate_fortune_reply_with_model(
 6) 给1-3条可执行建议，可写成自然句或短列表；避免模板腔和重复句式。
 7) 不要回显完整生日和时辰原文；如果用户主动问“我叫什么”或已给称呼偏好，可用真实姓名或昵称自然称呼。不要输出JSON。
 8) 如果时间窗口跨度是“月/年/多年”，不要自动收缩为“近三天”。
+9) 如果题目不是趋势/时窗问题，不要输出具体日期（如“2026年3月5日”“3月5日”）。
+10) 若给定“时间窗口”，只能复述该窗口，不得自行新增窗口外日期。
 
 输入信息：
 - 用户问题：{query}
 - 问题类型：{question_type}
 - 主题：{topic_cn}
+- 蓝图风格：{blueprint_style}
 - 时间窗口标签：{window_label}
 - 时间窗口：{window_text}
 - 命理信号：{signal_line}
@@ -3999,6 +4332,7 @@ def _generate_fortune_reply_with_model(
                     "query": q,
                     "question_type": str(question_type or "default"),
                     "topic_cn": topic_cn,
+                    "blueprint_style": str(blueprint_id or "default_concise"),
                     "window_label": window_label or "none",
                     "window_text": window_text or "无",
                     "signal_line": _signal_for_topic(payload, topic) or "无",
@@ -4208,7 +4542,7 @@ def _render_user_fortune_reply_v2_legacy(
     else:
         lines.append(f"结论：这次{topic_cn}{strength_text}。")
 
-    if question_type in {"trend", "colloquial"} and isinstance(window_meta, dict):
+    if isinstance(window_meta, dict):
         window_text = str(window_meta.get("window_text") or "").strip()
         window_label = str(window_meta.get("label") or "").strip()
         if window_text and _should_show_window_text(query, window_label, question_type=question_type):
@@ -4277,19 +4611,31 @@ def render_user_fortune_reply_v2(
     session_id: str = "",
 ) -> str:
     strength = str(payload.get("strength") or "balanced")
-    advice_for_sign = _resolve_fortune_advice(payload, topic, strength)
+    query_hash = hashlib.sha256(str(query or "").encode("utf-8")).hexdigest()[:16]
+    blueprint_id = _select_fortune_blueprint(question_type, session_id, query_hash)
+    advice_for_sign = _resolve_fortune_advice(
+        payload,
+        topic,
+        strength,
+        query=str(query or ""),
+        question_type=str(question_type or "default"),
+        blueprint_id=blueprint_id,
+        session_id=session_id,
+    )
     payload["advice_signature"] = _advice_signature(advice_for_sign)
+    payload["blueprint_id"] = blueprint_id
+    payload["_render_blueprint_id"] = blueprint_id
     raw_error = payload.get("error")
     has_error = isinstance(raw_error, dict) and str(raw_error.get("code") or "")
     if not has_error:
-        payload["blueprint_id"] = "llm_nlg_v1"
-        payload["_render_blueprint_id"] = "llm_nlg_v1"
         model_reply = _generate_fortune_reply_with_model(
             payload=payload,
             topic=topic,
             query=query,
             question_type=question_type,
             window_meta=window_meta,
+            blueprint_id=blueprint_id,
+            advice_override=advice_for_sign,
         )
         if model_reply:
             return model_reply
@@ -4304,12 +4650,23 @@ def render_user_fortune_reply_v2(
     if isinstance(error, dict) and str(error.get("code") or ""):
         code = str(error.get("code") or "")
         msg = str(error.get("message") or "命理链路暂时不可用")
-        payload["blueprint_id"] = "error_fallback"
-        payload["_render_blueprint_id"] = "error_fallback"
-        payload["advice_signature"] = _advice_signature(_default_fortune_advice(topic, "balanced")[:1])
-        return (
-            f"呀哈～这次{topic_cn}盘面暂时没取全（{code}）。{msg}。"
-            f"先给你一个稳妥方向：{_default_fortune_advice(topic, 'balanced')[0]}"
+        fallback_advice = _resolve_fortune_advice(
+            payload,
+            topic,
+            "balanced",
+            query=str(query or ""),
+            question_type=str(question_type or "default"),
+            blueprint_id=blueprint_id,
+            session_id=session_id,
+        )[:2] or _default_fortune_advice(topic, "balanced")[:2]
+        payload["advice_signature"] = _advice_signature(fallback_advice)
+        return _render_fortune_with_blueprint(
+            blueprint_id=blueprint_id,
+            conclusion_line=f"这次{topic_cn}盘面暂时没取全（{code}）",
+            window_line="",
+            signal_line=msg,
+            basis_line="先按保守策略处理",
+            advice=fallback_advice,
         )
 
     strength_text = {
@@ -4323,20 +4680,15 @@ def render_user_fortune_reply_v2(
         conclusion = f"这次{topic_cn}{strength_text}"
 
     window_line = ""
-    if question_type in {"trend", "colloquial"} and isinstance(window_meta, dict):
+    if isinstance(window_meta, dict):
         window_text = str(window_meta.get("window_text") or "").strip()
         window_label = str(window_meta.get("label") or "").strip()
         if window_text and _should_show_window_text(query, window_label, question_type=question_type):
             window_line = f"时间窗口：{window_text}。"
     signal_line = _signal_for_topic(payload, topic)
     basis = _basis_line(payload)
-    advice = _resolve_fortune_advice(payload, topic, strength)
-    advice_signature = _advice_signature(advice)
-    query_hash = hashlib.sha256(str(query or "").encode("utf-8")).hexdigest()[:16]
-    blueprint_id = _select_fortune_blueprint(question_type, session_id, query_hash)
-    payload["blueprint_id"] = blueprint_id
-    payload["_render_blueprint_id"] = blueprint_id
-    payload["advice_signature"] = advice_signature
+    advice = advice_for_sign
+    payload["advice_signature"] = _advice_signature(advice)
     return _render_fortune_with_blueprint(
         blueprint_id=blueprint_id,
         conclusion_line=conclusion,

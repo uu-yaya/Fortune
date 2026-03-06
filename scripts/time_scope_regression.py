@@ -83,6 +83,10 @@ def main() -> int:
     if init.status_code != 200:
         print(f"[FATAL] init profile failed: {init.status_code} {init.text[:200]}")
         return 1
+    init_gender = post_json(session, f"{base}/chat", {"query": "我是男生"}, timeout=args.timeout)
+    if init_gender.status_code != 200:
+        print(f"[FATAL] init gender failed: {init_gender.status_code} {init_gender.text[:200]}")
+        return 1
 
     cases = [
         Case("TS-001", "我今天整体运势最该注意什么？", long_horizon=False),
