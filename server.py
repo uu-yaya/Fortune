@@ -1048,6 +1048,37 @@ def _rewrite_long_horizon_shrink(text: str, query: str, window_meta: dict | None
     return patched
 
 
+def _rewrite_today_only_window(text: str, query: str, window_meta: dict | None = None) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return out
+    q = str(query or "")
+    window_label = str((window_meta or {}).get("label") or "")
+    if "今天" not in q and window_label != "today_only":
+        return out
+    window_text = str((window_meta or {}).get("window_text") or "").strip()
+    short_day = ""
+    m_short = DATE_SHORT_PATTERN.search(window_text)
+    if m_short:
+        short_day = f"{m_short.group(1)}月{m_short.group(2)}日"
+    patched = out
+    if short_day:
+        patched = re.sub(
+            rf"今天(?:[（(])?{re.escape(short_day)}(?:[）)])?(?:（[^）]+）)?起的三天小窗口",
+            f"今天（{short_day}）的单日窗口",
+            patched,
+        )
+        patched = re.sub(
+            rf"{re.escape(short_day)}起的三天小窗口",
+            f"{short_day}的单日窗口",
+            patched,
+        )
+    patched = re.sub(r"起的三天小窗口", "的单日窗口", patched)
+    patched = re.sub(r"(这三天|最近三天|未来三天|接下来三天)", "今天", patched)
+    patched = re.sub(r"三天内", "今天", patched)
+    return patched
+
+
 def _has_fact_hallucination(query: str, output: str, profile: dict | None = None) -> bool:
     if not _is_identity_fact_query(query):
         return False
@@ -1680,6 +1711,10 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
             start = (now - timedelta(days=now.weekday())) + timedelta(days=7)
             end = start + timedelta(days=6)
             label = "next_week"
+        elif re.search(r"(今天)", q):
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+            label = "today_only"
         elif re.search(
             r"(接下来(?:的)?一个月|未来(?:的)?一个月|接下来1个月|未来1个月|接下来30天|未来30天)", q
         ):
@@ -1732,7 +1767,9 @@ def date_window_resolver(query: str, time_anchor: dict) -> dict:
     days = _enumerate_days(start, end, limit=day_limit)
     year_span_labels = {"compare_year_span", "explicit_year_span", "relative_year_span"}
     single_year_with_year_labels = {"year_full", "year_h1", "year_h2", "explicit_year", "year_partial", "one_year", "multi_year"}
-    if label in year_span_labels or label in single_year_with_year_labels or start.year != end.year:
+    if label == "today_only":
+        window_text = _cn_day(start)
+    elif label in year_span_labels or label in single_year_with_year_labels or start.year != end.year:
         window_text = f"{_cn_day_with_year(start)}至{_cn_day_with_year(end)}"
     else:
         window_text = f"{_cn_day(start)}至{_cn_day(end)}"
@@ -1759,7 +1796,7 @@ DATE_SHORT_PATTERN = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日")
 YEAR_PATTERN = re.compile(r"(20\d{2})年")
 YEAR_SCOPE_QUERY_PATTERN = re.compile(r"(20\d{2}|今年|本年|明年|后年|去年|前年|全年|年度)")
 
-SHORT_WINDOW_LABELS = {"near_days", "two_days", "this_week", "next_week"}
+SHORT_WINDOW_LABELS = {"today_only", "near_days", "two_days", "this_week", "next_week"}
 LONG_WINDOW_LABELS = {"next_30_days", "coming_period", "this_month"}
 YEAR_WINDOW_LABELS = {
     "year_full",
@@ -2307,6 +2344,7 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
         allowed_dates,
         window_meta=window_meta,
     )
+    patched = _rewrite_today_only_window(patched, q, window_meta=window_meta)
     if severe_mismatch:
         _record_temporal_failure(reason_flags, severe=True)
         _log_temporal_consistency_event(
@@ -2323,9 +2361,11 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
             residual = _extract_business_sentences(patched)
         if residual:
             residual = _rewrite_long_horizon_shrink(residual, q, window_meta=window_meta)
+            residual = _rewrite_today_only_window(residual, q, window_meta=window_meta)
             merged = f"{safe}\n\n{residual}".strip()
             return _ensure_time_window_contract(merged, q, time_anchor, window_meta=window_meta)
         _metric_incr("time_guard_overwrite_total")
+        safe = _rewrite_today_only_window(safe, q, window_meta=window_meta)
         return _ensure_time_window_contract(safe, q, time_anchor, window_meta=window_meta)
     if conflict_count > 0:
         _metric_incr("time_validation_fail_total")
@@ -2350,6 +2390,7 @@ def validate_time_consistency(text: str, query: str, time_anchor: dict, window_m
             reason_flags=reason_flags,
         )
     patched = _rewrite_long_horizon_shrink(patched, q, window_meta=window_meta)
+    patched = _rewrite_today_only_window(patched, q, window_meta=window_meta)
     return _ensure_time_window_contract(patched, q, time_anchor, window_meta=window_meta)
 
 
@@ -5088,7 +5129,9 @@ def route_fortune_pipeline(
         window_label = "near_days"
     time_window_clause = ""
     if window_text:
-        if window_label in {"near_days", "two_days", "this_week", "next_week"}:
+        if window_label == "today_only":
+            time_window_clause = f"若用户问“今天/今日”，仅允许按当天判断：{window_text}。不要扩成“三天”或“近几天”。"
+        elif window_label in {"near_days", "two_days", "this_week", "next_week"}:
             time_window_clause = f"若用户问“近几天/哪几天”，仅允许在此窗口判断：{window_text}。"
         else:
             time_window_clause = f"时间范围：{window_text}。回答不要收缩成“近三天”，要覆盖该范围。"

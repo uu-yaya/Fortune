@@ -37,7 +37,7 @@ def has_explicit_window(text: str) -> bool:
     out = str(text or "")
     if re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", out):
         return True
-    if re.search(r"(?<!\d)(\d{1,2})月(\d{1,2})日", out) and re.search(r"(至|到|—|-)", out):
+    if re.search(r"(?<!\d)(\d{1,2})月(\d{1,2})日", out):
         return True
     return False
 
