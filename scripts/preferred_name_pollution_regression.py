@@ -131,6 +131,14 @@ def build_cases() -> list[Case]:
             ["赵青"],
             ["打工人", "普通打工人"],
         ),
+        Case(
+            "PN-011",
+            "pending后生肖运势问句不应污染",
+            ["我叫周周", "属龙今日运势"],
+            "",
+            ["周周"],
+            ["属龙今日运势"],
+        ),
     ]
 
 
@@ -212,6 +220,19 @@ def run_case(base_url: str, timeout: int, case: Case) -> dict[str, Any]:
             "name": "identity_should_contain_expected_name",
             "ok": must_have,
             "detail": f"expect_any={case.expect_identity_contains}",
+        }
+    )
+    no_tautology = True
+    for token in case.expect_identity_contains:
+        clean = str(token or "").strip()
+        if clean and f"{clean}叫{clean}" in identity_output:
+            no_tautology = False
+            break
+    checks.append(
+        {
+            "name": "identity_should_not_be_tautology",
+            "ok": no_tautology,
+            "detail": identity_output[:120],
         }
     )
     must_not = not contains_any(identity_output, case.forbid_identity_contains)

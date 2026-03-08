@@ -440,6 +440,22 @@ function normalizeMediaList(data) {
         .filter(Boolean);
 }
 
+function safeDataImageUrl(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    if (!/^data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+$/.test(text)) return '';
+    return text.replace(/\s+/g, '');
+}
+
+function normalizePartnerPortrait(data) {
+    const url = safeDataImageUrl(data?.extra?.partner_portrait_image);
+    if (!url) return null;
+    return {
+        url,
+        label: String(data?.extra?.partner_portrait_label || '正缘画像预览').trim() || '正缘画像预览',
+    };
+}
+
 function updateMessageBubbleText(messageEl, text) {
     if (!messageEl) return;
     const safe = escapeHtml(String(text || '')).replace(/\n/g, '<br>');
@@ -581,6 +597,45 @@ function appendMediaCards(mediaItems) {
     });
     chatMessages.scrollTop = chatMessages.scrollHeight;
     return lastWrap;
+}
+
+function appendPartnerPortraitCard(item) {
+    if (!chatMessages || !item?.url) return null;
+    const wrap = document.createElement('div');
+    wrap.className = 'message bot-message media-message media-single-message';
+
+    const card = document.createElement('article');
+    card.className = 'media-card media-card-plain';
+
+    const preview = document.createElement('div');
+    preview.className = 'media-preview media-preview-plain';
+
+    const imgBtn = document.createElement('button');
+    imgBtn.type = 'button';
+    imgBtn.className = 'media-image-btn';
+    imgBtn.setAttribute('aria-label', item.label || '查看正缘画像');
+
+    const img = document.createElement('img');
+    img.src = item.url;
+    img.alt = item.label || '正缘画像预览';
+    img.loading = 'lazy';
+    imgBtn.appendChild(img);
+    imgBtn.addEventListener('click', () => openImagePreview(item.url, img.alt));
+    preview.appendChild(imgBtn);
+
+    const meta = document.createElement('div');
+    meta.className = 'media-meta';
+    const prompt = document.createElement('p');
+    prompt.className = 'media-prompt';
+    prompt.textContent = item.label || '正缘画像预览';
+    meta.appendChild(prompt);
+
+    card.appendChild(preview);
+    card.appendChild(meta);
+    wrap.appendChild(card);
+    chatMessages.appendChild(wrap);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return wrap;
 }
 
 function ensureImagePreviewModal() {
@@ -888,8 +943,12 @@ async function sendMessage() {
         const messageType = String(data?.message_type || 'text');
         const botResponse = getChatOutput(data);
         const choiceButtons = normalizeChoiceButtons(data);
+        const partnerPortrait = normalizePartnerPortrait(data);
 
         await replaceWithTypingEffect(thinkingMessage, withProfileHintIfMissing(botResponse));
+        if (partnerPortrait) {
+            appendPartnerPortraitCard(partnerPortrait);
+        }
         if (messageType === 'media_result') {
             appendMediaCards(normalizeMediaList(data));
         } else if (messageType === 'media_pending') {

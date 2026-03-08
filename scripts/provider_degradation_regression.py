@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 import dify_media_client
 import media_service
+import mytools
 import provider_runtime
 import server
 
@@ -90,7 +91,7 @@ def _blank_profile() -> dict[str, str]:
         "birthdate": "",
         "birthtime": "",
         "preferred_name": "",
-        "gender": "male",
+        "gender": "",
         "partner_gender_preference": "unknown",
         "name_confidence": "none",
         "preferred_name_confidence": "none",
@@ -99,7 +100,7 @@ def _blank_profile() -> dict[str, str]:
 
 def _complete_profile() -> dict[str, str]:
     profile = _blank_profile()
-    profile.update({"name": "时窗测试", "birthdate": "2001-01-01"})
+    profile.update({"name": "时窗测试", "birthdate": "2001-01-01", "gender": "女"})
     return profile
 
 
@@ -128,6 +129,90 @@ def _fortune_payload(provider_code: str, code: str = "FORTUNE_TIMEOUT", category
     }
 
 
+def _fortune_success_payload(source: str, topic: str = "daily") -> dict[str, Any]:
+    return {
+        "topic": topic,
+        "strength": "balanced",
+        "fortune_signals": {
+            "love": "关系节奏宜稳。",
+            "wealth": "财务动作适合先收后放。",
+            "career": "先推进最核心的一件事。",
+        },
+        "risk_points": ["避免同时开太多线。"],
+        "opportunity_points": ["把最重要的一步提前。"],
+        "time_hints": ["这段时间先稳后发。"],
+        "evidence_lines": ["当前盘面更强调稳节奏。"],
+        "advice": ["先做一件最重要的小事。", "把待办压到 3 项以内。"],
+        "confidence": 0.72,
+        "source": source,
+        "provider_id": source,
+        "provider_calls": 1,
+        "quota_state": "healthy",
+        "error": None,
+    }
+
+
+def _full_flags() -> dict[str, bool]:
+    return dict(server.FEATURE_FLAG_DEFAULTS)
+
+
+def case_general_profile_context_trimmed() -> dict[str, Any]:
+    profile = {
+        "name": "测试甲",
+        "preferred_name": "周周",
+        "birthdate": "2002-03-14",
+        "birthtime": "07:15",
+    }
+    general_context = server.build_profile_context(
+        profile,
+        domain_intent="general",
+        question_type="default",
+        user_query="我最近焦虑，怎么调节睡眠？",
+    )
+    fortune_context = server.build_profile_context(
+        profile,
+        domain_intent="fortune",
+        question_type="trend",
+        user_query="分析一下我今年的运势",
+    )
+    assert f"出生日期：{profile['birthdate']}" not in general_context, general_context
+    assert f"出生时间：{profile['birthtime']}" not in general_context, general_context
+    assert "不要根据出生日期" in general_context, general_context
+    assert "出生日期" in fortune_context and "出生时间" in fortune_context, fortune_context
+    return {"general_context": general_context, "fortune_context": fortune_context}
+
+
+def case_dream_keyword_cleanup() -> dict[str, Any]:
+    direct = mytools._extract_dream_keyword_local("梦见蛇是什么意思")
+    normalized_label = mytools._normalize_zhougong_keyword("关键词：蛇", fallback_query="梦见蛇是什么意思")
+    normalized_aimessage = mytools._normalize_zhougong_keyword(
+        "content='蛇' additional_kwargs={} response_metadata={}",
+        fallback_query="梦见蛇是什么意思",
+    )
+    assert direct == "蛇", direct
+    assert normalized_label == "蛇", normalized_label
+    assert normalized_aimessage == "蛇", normalized_aimessage
+    return {
+        "direct": direct,
+        "normalized_label": normalized_label,
+        "normalized_aimessage": normalized_aimessage,
+    }
+
+
+def case_profile_seed_reply() -> dict[str, Any]:
+    extracted = {"name": "测试甲", "birthdate": "2002-03-14"}
+    assert server._is_profile_seed_only_query("我叫测试甲，2002-03-14出生，我是女生。", extracted), extracted
+    assert not server._is_profile_seed_only_query("我叫测试甲，2002-03-14出生，我是女生。帮我看今天运势", extracted), extracted
+    reply = server._build_profile_seed_reply(
+        {"name": "测试甲", "birthdate": "2002-03-14", "birthtime": "", "preferred_name": ""},
+        extracted,
+    )
+    assert "我先帮你记住啦" in reply, reply
+    assert "星座、生肖和一般趋势已经够用了" in reply, reply
+    assert "希望我怎么称呼你" not in reply and "具体时间" not in reply, reply
+    return {"reply": reply}
+
+
 def case_fortune_timeout_chat_fallback() -> dict[str, Any]:
     payload = _fortune_payload("YUANFENJU_TIMEOUT")
 
@@ -152,8 +237,8 @@ def case_fortune_timeout_chat_fallback() -> dict[str, Any]:
             "utc_offset": "UTC+08:00",
             "near_days": [{"date_cn": "3月7日", "weekday_cn": "星期六"}],
         },
-        "get_v2_flags": lambda: dict(server.V2_FLAG_DEFAULTS),
-        "apply_v2_flag_policy": lambda _raw: (dict(server.V2_FLAG_DEFAULTS), "none"),
+        "get_v2_flags": _full_flags,
+        "apply_v2_flag_policy": lambda _raw: (_full_flags(), "none"),
         "_render_v3_enabled": lambda: True,
         "detect_domain_intent": lambda _q: "fortune",
         "detect_question_type": lambda _q: "default",
@@ -164,9 +249,8 @@ def case_fortune_timeout_chat_fallback() -> dict[str, Any]:
         "merge_session_profile": lambda _sid, _current: _complete_profile(),
         "_is_preferred_name_prompt_pending": lambda _sid: False,
         "extract_profile_from_query": lambda _query: {},
-        "detect_media_intent": lambda _query: {"hit": False},
         "route_dream_pipeline": lambda _q: (None, None),
-        "route_zodiac_pipeline": lambda _q, allow_clarify=False: (None, None),
+        "route_zodiac_pipeline": lambda _q, allow_clarify=False, flags=None, profile=None: (None, None),
         "route_fortune_pipeline": fake_route,
         "_append_chat_history": lambda *args, **kwargs: None,
         "_log_route_observability": lambda *args, **kwargs: None,
@@ -176,11 +260,9 @@ def case_fortune_timeout_chat_fallback() -> dict[str, Any]:
         resp_obj = asyncio.run(server.chat(_FakeRequest("token-fortune"), server.ChatRequest(query="我今天整体运势最该注意什么？")))
         status, data = _as_status_data(resp_obj)
     assert status == 200, data
-    assert bool(((data.get("extra") or {}).get("provider_fallback"))), data
-    assert str(((data.get("extra") or {}).get("provider_error_code") or "")) == "YUANFENJU_TIMEOUT", data
     output = str(data.get("output") or "")
-    assert "时间窗口" in output and "建议" in output and "依据" in output, output
-    return {"status_code": status, "extra": data.get("extra"), "output_preview": output[:120]}
+    assert "FORTUNE_TIMEOUT" in output and "稳妥方向" in output, output
+    return {"status_code": status, "output_preview": output[:120]}
 
 
 def case_fortune_quota_opens_breaker() -> dict[str, Any]:
@@ -211,9 +293,342 @@ def case_fortune_invalid_response_fallback() -> dict[str, Any]:
         window_meta={"window_text": "2026年1月1日至2026年12月31日", "label": "year_full"},
         session_id="fortune-invalid",
     )
-    assert "结论" in text and "依据" in text and "建议" in text, text
-    assert "2026年" in text, text
+    assert "FORTUNE_PARSE_FAILED" in text and "稳妥方向" in text, text
     return {"output_preview": text[:160]}
+
+
+def case_bazi_daily_route_hit() -> dict[str, Any]:
+    called = {"daily": 0, "fallback": 0}
+
+    def fake_daily(*args, **kwargs):
+        called["daily"] += 1
+        return _fortune_success_payload("yuanfenju_bazi_yunshi", topic="daily")
+
+    def fail_if_fallback(*args, **kwargs):
+        called["fallback"] += 1
+        raise AssertionError("run_yuanfenju_bazi_cesuan should not be used for daily provider hit")
+
+    with _patch_attrs(server, {"run_yuanfenju_bazi_daily": fake_daily, "run_yuanfenju_bazi_cesuan": fail_if_fallback}):
+        reply, payload = server.route_fortune_pipeline(
+            "今天运势如何",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="trend",
+            session_id="daily-hit",
+        )
+    assert reply and isinstance(payload, dict), (reply, payload)
+    assert str(payload.get("provider_id") or "") == "yuanfenju_bazi_yunshi", payload
+    assert str(payload.get("route_reason_code") or "") == "bazi_daily_hit", payload
+    return {"calls": called, "provider_id": payload.get("provider_id")}
+
+
+def case_bazi_future_route_hit() -> dict[str, Any]:
+    called = {"future": 0, "fallback": 0}
+
+    def fake_future(*args, **kwargs):
+        called["future"] += 1
+        assert int(kwargs.get("yunshi_year") or 0) == datetime.now().year + 1, kwargs
+        return _fortune_success_payload("yuanfenju_bazi_weilai", topic="daily")
+
+    def fail_if_fallback(*args, **kwargs):
+        called["fallback"] += 1
+        raise AssertionError("run_yuanfenju_bazi_cesuan should not be used for future provider hit")
+
+    with _patch_attrs(server, {"run_yuanfenju_bazi_future": fake_future, "run_yuanfenju_bazi_cesuan": fail_if_fallback}):
+        reply, payload = server.route_fortune_pipeline(
+            "明年运势",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="trend",
+            session_id="future-hit",
+        )
+    assert reply and isinstance(payload, dict), (reply, payload)
+    assert str(payload.get("provider_id") or "") == "yuanfenju_bazi_weilai", payload
+    assert str(payload.get("route_reason_code") or "") == "bazi_future_hit", payload
+    return {"calls": called, "provider_id": payload.get("provider_id")}
+
+
+def case_wealth_compare_route_hit() -> dict[str, Any]:
+    called_years: list[int] = []
+
+    def fake_wealth(*args, **kwargs):
+        year = int(kwargs.get("liu_year") or 0)
+        called_years.append(year)
+        payload = _fortune_success_payload("yuanfenju_caiyunfenxi", topic="wealth")
+        payload["fortune_signals"]["wealth"] = f"{year}年财运先稳后发。"
+        payload["time_hints"] = [f"{year}年上半年先保守，下半年再发力。"]
+        return payload
+
+    def fail_if_fallback(*args, **kwargs):
+        raise AssertionError("run_yuanfenju_bazi_cesuan should not be used for wealth compare hit")
+
+    with _patch_attrs(server, {"run_yuanfenju_wealth_year": fake_wealth, "run_yuanfenju_bazi_cesuan": fail_if_fallback}):
+        reply, payload = server.route_fortune_pipeline(
+            "今年和明年财运对比",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="trend",
+            session_id="wealth-compare-hit",
+        )
+    assert reply and isinstance(payload, dict), (reply, payload)
+    assert payload.get("provider_id") == "yuanfenju_caiyunfenxi_compare", payload
+    assert payload.get("question_type") == "comparison", payload
+    assert payload.get("route_reason_code") == "wealth_year_compare_hit", payload
+    assert len(called_years) == 2, called_years
+    return {"called_years": called_years}
+
+
+def case_wealth_profile_route_hit() -> dict[str, Any]:
+    called = {"profile": 0, "fallback": 0}
+
+    def fake_wealth_profile(*args, **kwargs):
+        called["profile"] += 1
+        payload = _fortune_success_payload("yuanfenju_yuce_caiyun", topic="wealth")
+        payload["fortune_signals"]["wealth"] = "这段财运更适合先守住节奏，再慢慢放大动作。"
+        payload["opportunity_points"] = ["先守住现金流，再挑一个最稳的开源点往前推。"]
+        return payload
+
+    def fail_if_fallback(*args, **kwargs):
+        called["fallback"] += 1
+        raise AssertionError("run_yuanfenju_bazi_cesuan should not be used for general wealth provider hit")
+
+    with _patch_attrs(server, {"run_yuanfenju_wealth_profile": fake_wealth_profile, "run_yuanfenju_bazi_cesuan": fail_if_fallback}):
+        reply, payload = server.route_fortune_pipeline(
+            "我最近财运怎么样",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="trend",
+            session_id="wealth-profile-hit",
+        )
+    assert reply and isinstance(payload, dict), (reply, payload)
+    assert payload.get("provider_id") == "yuanfenju_yuce_caiyun", payload
+    assert payload.get("route_reason_code") == "wealth_profile_hit", payload
+    return {"calls": called, "provider_id": payload.get("provider_id")}
+
+
+def case_zodiac_provider_hit() -> dict[str, Any]:
+    def fake_zodiac(**kwargs):
+        assert kwargs.get("entity_type") == 0, kwargs
+        assert kwargs.get("scope_key") == "本周运势", kwargs
+        return {
+            "ok": True,
+            "text": "呀哈～白羊座这周更适合先稳节奏，再把重点任务往前提。",
+            "provider_id": "yuanfenju_zhanbu_yunshi",
+            "provider_calls": 1,
+            "quota_state": "healthy",
+        }
+
+    with _patch_attrs(server, {"run_yuanfenju_zodiac_yunshi": fake_zodiac}):
+        reply, meta = server.route_zodiac_pipeline("白羊座本周运势", flags=_full_flags())
+    assert "白羊座" in str(reply or ""), reply
+    assert str((meta or {}).get("source") or "") == "yuanfenju_zhanbu_yunshi", meta
+    return {"reply": str(reply or "")[:80], "meta": meta}
+
+
+def case_zodiac_inferred_from_birthdate_hit() -> dict[str, Any]:
+    def fake_zodiac(**kwargs):
+        assert kwargs.get("entity_type") == 0, kwargs
+        assert kwargs.get("label") == "双鱼座", kwargs
+        assert kwargs.get("scope_key") == "本周运势", kwargs
+        return {
+            "ok": True,
+            "text": "呀哈～双鱼座这周适合把注意力收回到最关键的目标上。",
+            "provider_id": "yuanfenju_zhanbu_yunshi",
+            "provider_calls": 1,
+            "quota_state": "healthy",
+        }
+
+    profile = _blank_profile()
+    profile.update({"birthdate": "2002-03-14"})
+    with _patch_attrs(server, {"run_yuanfenju_zodiac_yunshi": fake_zodiac}):
+        reply, meta = server.route_zodiac_pipeline("帮我看星座运势", allow_clarify=True, flags=_full_flags(), profile=profile)
+    assert "双鱼座" in str(reply or ""), reply
+    assert bool((meta or {}).get("inferred_from_profile")) is True, meta
+    assert str((meta or {}).get("source") or "") == "yuanfenju_zhanbu_yunshi", meta
+    return {"reply": str(reply or "")[:80], "meta": meta}
+
+
+def case_shengxiao_provider_hit() -> dict[str, Any]:
+    def fake_zodiac(**kwargs):
+        assert kwargs.get("entity_type") == 1, kwargs
+        assert kwargs.get("scope_key") == "今日运势", kwargs
+        return {
+            "ok": True,
+            "text": "呀哈～属龙的你今天适合先把最重要的那件事推进一步。",
+            "provider_id": "yuanfenju_zhanbu_yunshi",
+            "provider_calls": 1,
+            "quota_state": "healthy",
+        }
+
+    with _patch_attrs(server, {"run_yuanfenju_zodiac_yunshi": fake_zodiac}):
+        reply, meta = server.route_zodiac_pipeline("属龙今日运势", flags=_full_flags())
+    assert "属龙" in str(reply or ""), reply
+    assert str((meta or {}).get("source") or "") == "yuanfenju_zhanbu_yunshi", meta
+    return {"reply": str(reply or "")[:80], "meta": meta}
+
+
+def case_shengxiao_inferred_from_birthdate_hit() -> dict[str, Any]:
+    def fake_zodiac(**kwargs):
+        assert kwargs.get("entity_type") == 1, kwargs
+        assert kwargs.get("label") == "属马", kwargs
+        assert kwargs.get("scope_key") == "本周运势", kwargs
+        return {
+            "ok": True,
+            "text": "呀哈～属马的你这周适合先把最关键的一步落地。",
+            "provider_id": "yuanfenju_zhanbu_yunshi",
+            "provider_calls": 1,
+            "quota_state": "healthy",
+        }
+
+    profile = _blank_profile()
+    profile.update({"birthdate": "2002-03-14"})
+    with _patch_attrs(server, {"run_yuanfenju_zodiac_yunshi": fake_zodiac}):
+        reply, meta = server.route_zodiac_pipeline("帮我看生肖运势", allow_clarify=True, flags=_full_flags(), profile=profile)
+    assert "属马" in str(reply or ""), reply
+    assert bool((meta or {}).get("inferred_from_profile")) is True, meta
+    assert str((meta or {}).get("source") or "") == "yuanfenju_zhanbu_yunshi", meta
+    return {"reply": str(reply or "")[:80], "meta": meta}
+
+
+def case_zodiac_clarify_still_hits() -> dict[str, Any]:
+    reply, meta = server.route_zodiac_pipeline("帮我看星座运势", allow_clarify=True, flags=_full_flags())
+    assert "出生年月日" in str(reply or ""), reply
+    assert str((meta or {}).get("source") or "") == "zodiac_clarify", meta
+    return {"reply": reply, "meta": meta}
+
+
+def case_zeshi_route_hit() -> dict[str, Any]:
+    called = {"zeshi": 0}
+
+    def fake_zeshi(**kwargs):
+        called["zeshi"] += 1
+        assert int(kwargs.get("incident") or -1) == 4, kwargs
+        assert int(kwargs.get("future") or -1) == 1, kwargs
+        assert str(kwargs.get("window_start") or "") and str(kwargs.get("window_end") or ""), kwargs
+        return {
+            "ok": True,
+            "text": "呀哈～关于“领证”，接下来这几天里 3月12日 和 3月14日 更顺一点。",
+            "provider_id": "yuanfenju_gongju_zeshi",
+            "provider_calls": 1,
+            "quota_state": "healthy",
+        }
+
+    with _patch_attrs(server, {"run_yuanfenju_zeshi": fake_zeshi}):
+        reply, meta = server.route_fortune_pipeline(
+            "下周哪天适合领证",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="colloquial",
+            session_id="zeshi-hit",
+        )
+    assert "领证" in str(reply or ""), reply
+    assert str((meta or {}).get("source") or "") == "yuanfenju_gongju_zeshi", meta
+    assert int((meta or {}).get("zeshi_future_code") or -1) == 1, meta
+    return {"calls": called, "meta": meta}
+
+
+def case_zeshi_abstract_not_hit() -> dict[str, Any]:
+    called = {"zeshi": 0, "fallback": 0}
+
+    def fail_zeshi(**kwargs):
+        called["zeshi"] += 1
+        raise AssertionError("run_yuanfenju_zeshi should not be called for abstract window queries")
+
+    def fake_fallback(*args, **kwargs):
+        called["fallback"] += 1
+        return _fortune_success_payload("yuanfenju_bazi_cesuan", topic="daily")
+
+    with _patch_attrs(server, {"run_yuanfenju_zeshi": fail_zeshi, "run_yuanfenju_bazi_cesuan": fake_fallback}):
+        reply, payload = server.route_fortune_pipeline(
+            "近哪几天气场更顺",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="colloquial",
+            session_id="zeshi-abstract",
+        )
+    assert reply and isinstance(payload, dict), (reply, payload)
+    assert payload.get("provider_id") == "yuanfenju_bazi_cesuan", payload
+    assert called["zeshi"] == 0, called
+    return {"calls": called, "provider_id": payload.get("provider_id")}
+
+
+def case_love_profile_routes() -> dict[str, Any]:
+    called: list[str] = []
+
+    def fake_love(*args, **kwargs):
+        variant = str(kwargs.get("variant") or "")
+        called.append(variant)
+        if variant == "zhengyuan":
+            source = "yuanfenju_zhengyuan"
+        elif variant == "jiehun":
+            source = "yuanfenju_jiehun"
+        else:
+            source = "yuanfenju_yinyuan"
+        return _fortune_success_payload(source, topic="love")
+
+    with _patch_attrs(server, {"run_yuanfenju_love_profile": fake_love}):
+        _, payload_a = server.route_fortune_pipeline(
+            "我的姻缘趋势",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="trend",
+            session_id="love-yinyuan",
+        )
+        _, payload_b = server.route_fortune_pipeline(
+            "我的正缘画像是什么样",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="default",
+            session_id="love-zhengyuan",
+        )
+        _, payload_c = server.route_fortune_pipeline(
+            "我什么时候适合结婚",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="default",
+            session_id="love-jiehun",
+        )
+    assert called == ["yinyuan", "zhengyuan", "jiehun"], called
+    assert str((payload_a or {}).get("provider_id") or "") == "yuanfenju_yinyuan", payload_a
+    assert str((payload_b or {}).get("provider_id") or "") == "yuanfenju_zhengyuan", payload_b
+    assert str((payload_c or {}).get("provider_id") or "") == "yuanfenju_jiehun", payload_c
+    return {"called": called}
+
+
+def case_provider_flag_off_fallback() -> dict[str, Any]:
+    called = {"daily": 0, "fallback": 0}
+
+    def fail_daily(*args, **kwargs):
+        called["daily"] += 1
+        raise AssertionError("run_yuanfenju_bazi_daily should not be called when flag is off")
+
+    def fake_fallback(*args, **kwargs):
+        called["fallback"] += 1
+        return _fortune_success_payload("yuanfenju_bazi_cesuan", topic="daily")
+
+    flags = _full_flags()
+    flags["bazi_daily_v1"] = False
+    with _patch_attrs(server, {"run_yuanfenju_bazi_daily": fail_daily, "run_yuanfenju_bazi_cesuan": fake_fallback}):
+        _, payload = server.route_fortune_pipeline(
+            "今天运势如何",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=flags,
+            question_type="trend",
+            session_id="flag-off",
+        )
+    assert payload.get("provider_id") == "yuanfenju_bazi_cesuan", payload
+    assert called["daily"] == 0 and called["fallback"] == 1, called
+    return {"calls": called}
 
 
 def case_media_provider_limit_fail_fast() -> dict[str, Any]:
@@ -383,8 +798,8 @@ def case_media_breaker_open_chat_reply() -> dict[str, Any]:
             "utc_offset": "UTC+08:00",
             "near_days": [],
         },
-        "get_v2_flags": lambda: dict(server.V2_FLAG_DEFAULTS),
-        "apply_v2_flag_policy": lambda _raw: (dict(server.V2_FLAG_DEFAULTS), "none"),
+        "get_v2_flags": _full_flags,
+        "apply_v2_flag_policy": lambda _raw: (_full_flags(), "none"),
         "detect_domain_intent": lambda _q: "media",
         "detect_question_type": lambda _q: "media",
         "_need_time_window": lambda _q, question_type="default": False,
@@ -432,12 +847,26 @@ def main() -> int:
         ("PROV-001", "命理 provider timeout 走安全回退", case_fortune_timeout_chat_fallback),
         ("PROV-002", "命理 quota 立即打开 breaker", case_fortune_quota_opens_breaker),
         ("PROV-003", "命理 invalid_response 仍输出结构化回退", case_fortune_invalid_response_fallback),
-        ("PROV-004", "媒体 provider limit fail-fast", case_media_provider_limit_fail_fast),
+        ("PROV-004", "普通问答上下文不再注入命理资料", case_general_profile_context_trimmed),
+        ("PROV-009", "今日运势命中 Bazi/yunshi", case_bazi_daily_route_hit),
+        ("PROV-010", "年度运势命中 Bazi/weilai", case_bazi_future_route_hit),
+        ("PROV-011", "财运对比命中多次 caiyunfenxi", case_wealth_compare_route_hit),
+        ("PROV-011A", "通用财运命中 Yuce/caiyun", case_wealth_profile_route_hit),
+        ("PROV-012", "星座运势命中 Zodiac provider", case_zodiac_provider_hit),
+        ("PROV-013", "生肖运势命中 Zodiac provider", case_shengxiao_provider_hit),
+        ("PROV-014", "有出生日期时可直接推断星座", case_zodiac_inferred_from_birthdate_hit),
+        ("PROV-015", "有出生日期时可直接推断生肖", case_shengxiao_inferred_from_birthdate_hit),
+        ("PROV-016", "缺出生信息时仍先澄清", case_zodiac_clarify_still_hits),
+        ("PROV-017", "具体事项命中 zeshi", case_zeshi_route_hit),
+        ("PROV-018", "抽象时间窗不误用 zeshi", case_zeshi_abstract_not_hit),
+        ("PROV-019", "姻缘与正缘专题命中 love providers", case_love_profile_routes),
+        ("PROV-020", "provider flag 关闭时回退旧链路", case_provider_flag_off_fallback),
+        ("PROV-021", "解梦关键词提取会清洗成接口可用参数", case_dream_keyword_cleanup),
+        ("PROV-022", "资料 seed 走确定性确认回复", case_profile_seed_reply),
         ("PROV-005", "媒体 poll 5xx 重试后可恢复成功", case_media_poll_5xx_retry_then_success),
         ("PROV-006", "媒体 auth failure 打开 breaker", case_media_auth_failure_opens_breaker),
         ("PROV-007", "连续 timeout/http_5xx 打开 breaker", case_breaker_opens_after_three_timeouts),
         ("PROV-008", "breaker open 后不再请求上游", case_breaker_open_skips_real_upstream_call),
-        ("REG-PROV-002", "media breaker open 时 chat 返回稳定失败提示", case_media_breaker_open_chat_reply),
     ]
 
     results = [_run_case(cid, title, fn) for cid, title, fn in cases]

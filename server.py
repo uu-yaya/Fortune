@@ -60,6 +60,14 @@ from mytools import (
     bazi_cesuan,
     get_info_from_local_db,
     jiemeng,
+    run_yuanfenju_bazi_daily,
+    run_yuanfenju_bazi_future,
+    run_yuanfenju_bazi_cesuan,
+    run_yuanfenju_love_profile,
+    run_yuanfenju_wealth_profile,
+    run_yuanfenju_wealth_year,
+    run_yuanfenju_zeshi,
+    run_yuanfenju_zodiac_yunshi,
     serp_search,
     yaoyigua,
 )
@@ -323,11 +331,15 @@ def _dump_profile_json(
     preferred_name: str = "",
     name_confidence: str = "",
     preferred_name_confidence: str = "",
+    gender: str = "",
 ) -> str | None:
     payload: dict[str, str] = {}
     call_name = str(preferred_name or "").strip()
     if call_name:
         payload["preferred_name"] = call_name
+    gender_text = str(gender or "").strip()
+    if gender_text:
+        payload["gender"] = gender_text
     n_conf = _normalize_name_confidence(name_confidence)
     p_conf = _normalize_name_confidence(preferred_name_confidence)
     if n_conf != "none":
@@ -371,9 +383,10 @@ def _get_profile_by_user_id(user_id: int) -> dict[str, str]:
             if m:
                 birthtime = f"{int(m.group(1)):02d}:{m.group(2)}"
     ext = _load_profile_json(row.get("profile_json"))
-    preferred_name = str(ext.get("preferred_name") or "").strip()
+    preferred_name = _sanitize_preferred_name(str(ext.get("preferred_name") or "").strip())
     name_confidence = _normalize_name_confidence(str(ext.get("name_confidence") or ""))
     preferred_name_confidence = _normalize_name_confidence(str(ext.get("preferred_name_confidence") or ""))
+    gender = _normalize_gender(str(ext.get("gender") or "").strip())
     if (row.get("name") or "").strip() and name_confidence == "none":
         name_confidence = "high"
     if preferred_name and preferred_name_confidence == "none":
@@ -382,6 +395,7 @@ def _get_profile_by_user_id(user_id: int) -> dict[str, str]:
         "name": row.get("name") or "",
         "birthdate": birthdate,
         "birthtime": birthtime,
+        "gender": gender,
         "preferred_name": preferred_name,
         "name_confidence": name_confidence,
         "preferred_name_confidence": preferred_name_confidence,
@@ -417,7 +431,19 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
     if current.get("birthtime") and not merged.get("birthtime"):
         merged["birthtime"] = current["birthtime"]
         changed = True
-    incoming_preferred_name = str(current.get("preferred_name") or "").strip()
+    incoming_gender = _normalize_gender(str(current.get("gender") or ""))
+    if incoming_gender and incoming_gender != str(merged.get("gender") or "").strip():
+        merged["gender"] = incoming_gender
+        changed = True
+    existing_preferred_name = str(merged.get("preferred_name") or "").strip()
+    sanitized_existing_preferred_name = _sanitize_preferred_name(existing_preferred_name)
+    if existing_preferred_name and not sanitized_existing_preferred_name:
+        merged["preferred_name"] = ""
+        if merged_pref_conf != "none":
+            merged["preferred_name_confidence"] = "none"
+        merged_pref_conf = "none"
+        changed = True
+    incoming_preferred_name = _sanitize_preferred_name(str(current.get("preferred_name") or "").strip())
     if incoming_preferred_name:
         _metric_incr("name_write_total")
         if _confidence_ge(incoming_pref_conf, "medium"):
@@ -432,11 +458,15 @@ def _merge_profile_to_db(user_id: int, current: dict[str, str]) -> dict[str, str
                 _metric_incr("name_write_high_confidence_total")
         else:
             _metric_incr("name_slot_pollution")
+    elif str(current.get("preferred_name") or "").strip():
+        _metric_incr("name_write_total")
+        _metric_incr("name_slot_pollution")
     if changed:
         profile_json = _dump_profile_json(
             preferred_name=str(merged.get("preferred_name") or "").strip(),
             name_confidence=str(merged.get("name_confidence") or "none"),
             preferred_name_confidence=str(merged.get("preferred_name_confidence") or "none"),
+            gender=str(merged.get("gender") or "").strip(),
         )
         with _db_conn() as conn:
             with conn.cursor() as cur:
@@ -534,6 +564,16 @@ def _set_reply_style_state(session_id: str, state: dict):
 QUALITY_METRICS_TTL_DAYS = 14
 V2_FLAG_REDIS_KEY = "jiyi:feature_flags:v2"
 V2_FLAG_NAMES = ("intent_v2", "clarify_v2", "window_v2", "render_v2", "quality_gate_v2")
+PROVIDER_FLAG_NAMES = (
+    "merchant_probe_v1",
+    "bazi_daily_v1",
+    "bazi_future_v1",
+    "wealth_year_v1",
+    "zodiac_api_v1",
+    "zeshi_api_v1",
+    "love_profile_v1",
+)
+FEATURE_FLAG_NAMES = V2_FLAG_NAMES + PROVIDER_FLAG_NAMES
 V2_FLAG_DEFAULTS = {
     "intent_v2": True,
     "clarify_v2": True,
@@ -541,6 +581,16 @@ V2_FLAG_DEFAULTS = {
     "render_v2": True,
     "quality_gate_v2": True,
 }
+PROVIDER_FLAG_DEFAULTS = {
+    "merchant_probe_v1": True,
+    "bazi_daily_v1": True,
+    "bazi_future_v1": True,
+    "wealth_year_v1": True,
+    "zodiac_api_v1": True,
+    "zeshi_api_v1": True,
+    "love_profile_v1": True,
+}
+FEATURE_FLAG_DEFAULTS = {**V2_FLAG_DEFAULTS, **PROVIDER_FLAG_DEFAULTS}
 V2_FLAG_ENV_KEYS = {
     "intent_v2": "INTENT_V2",
     "clarify_v2": "CLARIFY_V2",
@@ -548,6 +598,16 @@ V2_FLAG_ENV_KEYS = {
     "render_v2": "RENDER_V2",
     "quality_gate_v2": "QUALITY_GATE_V2",
 }
+PROVIDER_FLAG_ENV_KEYS = {
+    "merchant_probe_v1": "MERCHANT_PROBE_V1",
+    "bazi_daily_v1": "BAZI_DAILY_V1",
+    "bazi_future_v1": "BAZI_FUTURE_V1",
+    "wealth_year_v1": "WEALTH_YEAR_V1",
+    "zodiac_api_v1": "ZODIAC_API_V1",
+    "zeshi_api_v1": "ZESHI_API_V1",
+    "love_profile_v1": "LOVE_PROFILE_V1",
+}
+FEATURE_FLAG_ENV_KEYS = {**V2_FLAG_ENV_KEYS, **PROVIDER_FLAG_ENV_KEYS}
 
 
 def _to_bool(value, default: bool = False) -> bool:
@@ -582,15 +642,15 @@ def _time_patch_v1_enabled() -> bool:
 
 
 def get_v2_flags() -> dict[str, bool]:
-    flags = dict(V2_FLAG_DEFAULTS)
+    flags = dict(FEATURE_FLAG_DEFAULTS)
     # 环境变量兜底（用于本地/容器静态配置）
-    for name, env_key in V2_FLAG_ENV_KEYS.items():
+    for name, env_key in FEATURE_FLAG_ENV_KEYS.items():
         if env_key in os.environ:
             flags[name] = _to_bool(os.getenv(env_key), flags[name])
     # Redis 动态覆盖（用于灰度/回滚）
     try:
         raw = _REDIS_CLIENT.hgetall(V2_FLAG_REDIS_KEY) or {}
-        for name in V2_FLAG_NAMES:
+        for name in FEATURE_FLAG_NAMES:
             if name in raw:
                 flags[name] = _to_bool(raw.get(name), flags[name])
     except Exception:
@@ -599,7 +659,7 @@ def get_v2_flags() -> dict[str, bool]:
 
 
 def apply_v2_flag_policy(flags: dict[str, bool]) -> tuple[dict[str, bool], str]:
-    effective = {k: bool(flags.get(k, False)) for k in V2_FLAG_NAMES}
+    effective = {k: bool(flags.get(k, FEATURE_FLAG_DEFAULTS.get(k, False))) for k in FEATURE_FLAG_NAMES}
     reason_code = "none"
     # 非法组合：window 依赖 intent，缺失时强制降级旧链路
     if effective.get("window_v2") and not effective.get("intent_v2"):
@@ -623,7 +683,7 @@ def _log_route_observability(
     event = {
         "route_path": str(route_path or "unknown"),
         "reason_code": str(reason_code or "none"),
-        "flag_snapshot": {k: bool(flag_snapshot.get(k, False)) for k in V2_FLAG_NAMES},
+        "flag_snapshot": {k: bool(flag_snapshot.get(k, False)) for k in FEATURE_FLAG_NAMES},
         "domain_intent": str(domain_intent or "unknown"),
         "question_type": str(question_type or "default"),
     }
@@ -713,7 +773,7 @@ def _has_profile_echo(text: str, profile: dict | None = None, query: str = "") -
     if not out:
         return False
     name = str(p.get("name") or "").strip()
-    preferred_name = str(p.get("preferred_name") or "").strip()
+    preferred_name = _sanitize_preferred_name(str(p.get("preferred_name") or "").strip())
     birthdate = str(p.get("birthdate") or "").strip()
     birthtime = str(p.get("birthtime") or "").strip()
     allow_name_echo = _is_asking_own_name(query)
@@ -801,7 +861,7 @@ def _has_fact_hallucination(query: str, output: str, profile: dict | None = None
         return False
     out = str(output or "")
     p = profile or {}
-    known_name = str(p.get("preferred_name") or "").strip() or str(p.get("name") or "").strip()
+    known_name = _sanitize_preferred_name(str(p.get("preferred_name") or "").strip()) or str(p.get("name") or "").strip()
     if not known_name:
         if re.search(r"(你叫|你是)\s*[^\s，。！？,.]{2,12}", out) and not re.search(r"(不知道|还没有|没记录|告诉我)", out):
             return True
@@ -2127,9 +2187,9 @@ def get_fast_reply(query: str, time_anchor: dict | None = None, profile: dict | 
         return None
     if _is_asking_own_name(raw_text):
         p = profile or {}
-        call_name = str(p.get("preferred_name") or "").strip()
+        call_name = _sanitize_preferred_name(str(p.get("preferred_name") or "").strip())
         legal_name = str(p.get("name") or "").strip()
-        if _is_valid_call_name(call_name):
+        if call_name:
             return f"我记得你喜欢我叫你{call_name}。"
         if _is_valid_name(legal_name):
             return f"我记得你叫{legal_name}。"
@@ -2182,6 +2242,21 @@ def _normalize_birthtime(text: str) -> str:
     return ""
 
 
+def _normalize_gender(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if raw.lower() in {"female", "f", "woman", "girl"}:
+        return "女"
+    if raw.lower() in {"male", "m", "man", "boy"}:
+        return "男"
+    if raw in {"女", "女生", "女的", "女性", "女孩", "女士"} or re.search(r"(女生|女的|女性|女孩|女士)", raw):
+        return "女"
+    if raw in {"男", "男生", "男的", "男性", "男孩", "先生"} or re.search(r"(男生|男的|男性|男孩|先生)", raw):
+        return "男"
+    return ""
+
+
 def _is_valid_name(name: str) -> bool:
     n = (name or "").strip()
     if not n:
@@ -2224,6 +2299,35 @@ def _looks_like_time_or_date_fragment(text: str) -> bool:
     if re.search(r"^\d+$", t):
         return True
     return False
+
+
+def _looks_like_preferred_name_pollution(text: str, source: str = "") -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if _looks_like_time_or_date_fragment(t):
+        return True
+    if re.search(r"^属[鼠牛虎兔龙蛇马羊猴鸡狗猪]", t):
+        return True
+    if re.search(r"(运势|星座|生肖|属相|财运|事业运|桃花|姻缘|解梦|占卜|摇卦|领证|搬家|工作节奏|小目标|睡眠)", t):
+        return True
+    src = str(source or "").strip()
+    if src and not re.search(r"(叫我|喊我|称呼我)", src):
+        if re.search(
+            r"(帮我|给我|看一下|看下|看看|算一下|分析|适合|哪天|几天|怎么|如何|记得吗|我叫什么|运势|星座|生肖|属相|解梦|占卜|摇卦)",
+            src,
+        ):
+            return True
+    return False
+
+
+def _sanitize_preferred_name(name: str, source: str = "") -> str:
+    candidate = str(name or "").strip()
+    if not _is_valid_call_name(candidate):
+        return ""
+    if _looks_like_preferred_name_pollution(candidate, source=source):
+        return ""
+    return candidate
 
 
 def _is_name_question_query(query: str) -> bool:
@@ -2282,11 +2386,7 @@ def _extract_preferred_name_with_confidence(query: str, allow_soft: bool = False
             continue
         candidate = str(m.group(1) or "").strip()
         candidate = re.sub(r"(吧|呀|啦|哦|喔|呢)$", "", candidate).strip()
-        if not _is_valid_call_name(candidate):
-            _metric_incr("name_slot_total")
-            _metric_incr("name_slot_pollution")
-            return "", "none"
-        if _looks_like_time_or_date_fragment(candidate):
+        if not _sanitize_preferred_name(candidate, source=source):
             _metric_incr("name_slot_total")
             _metric_incr("name_slot_pollution")
             return "", "none"
@@ -2296,7 +2396,7 @@ def _extract_preferred_name_with_confidence(query: str, allow_soft: bool = False
         normalized = re.sub(r"[\s，。！？,.!？、；;:：]", "", source)
         normalized = re.sub(r"^(那就|就|那|嗯|啊|呀|呜啦|呀哈)", "", normalized).strip()
         normalized = re.sub(r"(吧|呀|啦|哦|喔|呢|就行|即可)$", "", normalized).strip()
-        if 1 <= len(normalized) <= 6 and _is_valid_call_name(normalized) and not _looks_like_time_or_date_fragment(normalized):
+        if 1 <= len(normalized) <= 6 and _sanitize_preferred_name(normalized, source=source):
             _metric_incr("name_slot_total")
             return normalized, "medium"
     if re.search(r"(叫我|喊我|称呼我|昵称|名字)", source):
@@ -2380,8 +2480,8 @@ def _name_alias_candidates(name: str) -> list[str]:
 
 def _pick_address_name(profile: dict | None, user_query: str = "") -> str:
     p = profile or {}
-    preferred_name = str(p.get("preferred_name") or "").strip()
-    if _is_valid_call_name(preferred_name):
+    preferred_name = _sanitize_preferred_name(str(p.get("preferred_name") or "").strip())
+    if preferred_name:
         return preferred_name
     name = str(p.get("name") or "").strip()
     if not _is_valid_name(name):
@@ -2411,6 +2511,82 @@ def _is_name_intro_query(query: str, extracted: dict[str, str] | None = None) ->
     if re.search(r"(我叫|名字是|姓名是|^.{1,16}\s*[，,]\s*(?:19|20)\d{2})", q):
         return True
     return False
+
+
+def _profile_seed_remainder(query: str, extracted: dict[str, str] | None = None) -> str:
+    q = str(query or "").strip()
+    if not q:
+        return ""
+    extracted = extracted or {}
+    out = q
+    name = str(extracted.get("name") or "").strip()
+    if name:
+        out = re.sub(rf"(?:我叫|我的名字是|名字是|姓名是)\s*{re.escape(name)}", "", out)
+        out = re.sub(rf"^{re.escape(name)}[，,\s]*", "", out)
+    out = re.sub(r"(?:19|20)\d{2}[年/\-.]\s*\d{1,2}[月/\-.]\s*\d{1,2}(?:日)?", "", out)
+    out = re.sub(r"(?:[01]?\d|2[0-3])\s*[:：点时]\s*(?:[0-5]?\d)?\s*(?:分)?", "", out)
+    out = re.sub(r"(我是|性别是)?\s*(女生|女的|女性|女孩|男生|男的|男性|男孩)", "", out)
+    out = re.sub(r"(出生于|出生在|出生|生日是|生日)", "", out)
+    out = re.sub(r"(公历|阳历|农历)", "", out)
+    out = re.sub(r"[，。！？、,.!?；;：:\s]+", "", out)
+    out = re.sub(r"(好的|收到|啦|呀|哦|喔|呢)$", "", out)
+    return out.strip()
+
+
+def _is_profile_seed_only_query(query: str, extracted: dict[str, str] | None = None) -> bool:
+    extracted = extracted or {}
+    has_profile_piece = any(str(extracted.get(key) or "").strip() for key in ("name", "birthdate", "birthtime"))
+    if not has_profile_piece:
+        return False
+    q = str(query or "").strip()
+    if not q:
+        return False
+    if _is_identity_fact_query(q):
+        return False
+    if is_dream_query(q) or is_divination_query(q) or is_zodiac_intent_query(q) or is_bazi_fortune_query(q):
+        return False
+    if is_time_sensitive_query(q):
+        return False
+    remainder = _profile_seed_remainder(q, extracted=extracted)
+    return not remainder
+
+
+def _build_profile_seed_reply(profile: dict[str, str], extracted: dict[str, str] | None = None) -> str:
+    profile = profile or {}
+    extracted = extracted or {}
+    name = str(profile.get("name") or extracted.get("name") or "").strip()
+    birthdate = str(profile.get("birthdate") or extracted.get("birthdate") or "").strip()
+    birthtime = str(profile.get("birthtime") or extracted.get("birthtime") or "").strip()
+    gender = _normalize_gender(str(profile.get("gender") or extracted.get("gender") or ""))
+    parts: list[str] = []
+    if name and birthdate:
+        parts.append(f"呀哈～我先帮你记住啦：你叫{name}，生日是{_iso_to_cn(birthdate)}。")
+    elif name:
+        parts.append(f"呀哈～我先记住啦，你叫{name}。")
+    elif birthdate:
+        parts.append(f"呀哈～我先把你的生日记下啦：{_iso_to_cn(birthdate)}。")
+    else:
+        parts.append("呀哈～我先把你刚刚补的资料记下啦。")
+
+    if gender:
+        parts.append(f"性别我也一起记好了（{gender}）。")
+
+    if birthtime:
+        parts.append(f"出生时段也一起收好了（{birthtime}）。之后如果你想看更细一点的八字、流年或择时，直接问我就行。")
+    elif birthdate and gender:
+        parts.append("现在看大部分命理、姻缘和趋势已经够用了；如果你之后想看更细一点的八字或择时，再补出生时间就行。")
+    elif birthdate:
+        parts.append("现在看星座、生肖和一般趋势已经够用了；但如果要看更完整的命理、姻缘或择时，还需要再补一个性别。")
+    else:
+        parts.append("如果你之后想看命理或运势，再补一个出生年月日，我就能继续往下看。")
+
+    if birthdate and gender:
+        parts.append("你下一句可以直接问我：今天运势如何、帮我看星座运势，或者下周哪天适合搬家。")
+    elif birthdate:
+        parts.append("你可以继续补一句“我是男生/我是女生”，补完我就能继续看更完整的命理问题。")
+    else:
+        parts.append("你可以继续补资料，也可以直接告诉我你现在最想问的那件事。")
+    return "\n\n".join(parts)
 
 
 def _set_preferred_name_prompt_pending(session_id: str, pending: bool) -> None:
@@ -2450,6 +2626,9 @@ def extract_profile_from_query(query: str) -> dict[str, str]:
     birthtime = _normalize_birthtime(source)
     if birthtime:
         profile["birthtime"] = birthtime
+    gender = _normalize_gender(source)
+    if gender:
+        profile["gender"] = gender
     preferred_name, preferred_conf = _extract_preferred_name_with_confidence(source, allow_soft=False)
     if preferred_name:
         profile["preferred_name"] = preferred_name
@@ -2465,6 +2644,7 @@ def merge_session_profile(session_id: str, current: dict[str, str]) -> dict[str,
             "name": "",
             "birthdate": "",
             "birthtime": "",
+            "gender": "",
             "preferred_name": "",
             "name_confidence": "none",
             "preferred_name_confidence": "none",
@@ -2472,21 +2652,45 @@ def merge_session_profile(session_id: str, current: dict[str, str]) -> dict[str,
     return _merge_profile_to_db(int(user["id"]), current)
 
 
-def build_profile_context(profile: dict[str, str]) -> str:
+def build_profile_context(
+    profile: dict[str, str],
+    *,
+    domain_intent: str = "general",
+    question_type: str = "default",
+    user_query: str = "",
+) -> str:
+    lightweight_intents = {"general", "time", "dream", "divination"}
+    lightweight_guardrail = "当前问题不是命理咨询，除非用户明确要求，否则不要根据出生日期、生肖、星座、八字、流年来推导结论。"
     if not profile:
+        if domain_intent in lightweight_intents and question_type != "identity_fact":
+            return f"暂无用户资料。{lightweight_guardrail}"
         return "暂无用户资料。"
     parts = []
     if profile.get("name"):
         parts.append(f"姓名：{profile['name']}")
-    if profile.get("preferred_name"):
-        parts.append(f"称呼偏好：{profile['preferred_name']}")
-    if profile.get("birthdate"):
-        parts.append(f"出生日期：{profile['birthdate']}")
-    if profile.get("birthtime"):
-        parts.append(f"出生时间：{profile['birthtime']}")
+    preferred_name = _sanitize_preferred_name(str(profile.get("preferred_name") or "").strip())
+    if preferred_name:
+        parts.append(f"称呼偏好：{preferred_name}")
+    allow_birth_context = (
+        domain_intent in {"fortune", "zodiac"}
+        or is_bazi_fortune_query(user_query)
+        or is_zodiac_intent_query(user_query)
+    )
+    if allow_birth_context:
+        if profile.get("birthdate"):
+            parts.append(f"出生日期：{profile['birthdate']}")
+        if profile.get("birthtime"):
+            parts.append(f"出生时间：{profile['birthtime']}")
+        gender = _normalize_gender(str(profile.get("gender") or ""))
+        if gender:
+            parts.append(f"性别：{gender}")
     if not parts:
+        if domain_intent in lightweight_intents and question_type != "identity_fact":
+            return f"暂无用户资料。{lightweight_guardrail}"
         return "暂无用户资料。"
     profile_line = "；".join(parts)
+    if not allow_birth_context and domain_intent in lightweight_intents and question_type != "identity_fact":
+        return f"{profile_line}。{lightweight_guardrail}"
     return f"{profile_line}。可自然使用用户偏好的称呼；不要逐字回显完整生日和时辰。"
 
 
@@ -2517,7 +2721,9 @@ def extract_profile_from_history(chat_message_history) -> dict[str, str]:
                 profile["birthdate"] = piece["birthdate"]
             if piece.get("birthtime") and not profile.get("birthtime"):
                 profile["birthtime"] = piece["birthtime"]
-            if profile.get("name") and profile.get("birthdate") and profile.get("birthtime"):
+            if piece.get("gender") and not profile.get("gender"):
+                profile["gender"] = piece["gender"]
+            if profile.get("name") and profile.get("birthdate") and profile.get("birthtime") and profile.get("gender"):
                 break
     except Exception:
         return profile
@@ -2700,12 +2906,12 @@ def build_ellipsis_context_note(query: str, chat_message_history) -> str:
 
 
 BAZI_FORTUNE_QUERY_PATTERN = re.compile(
-    r"(算命|八字|流年|运势|桃花|姻缘|感情运|财运|事业运|学业运|贵人运|命盘|命理|紫微|测算|提运|气场|顺不顺|更顺)"
+    r"(算命|八字|流年|运势|桃花|姻缘|婚缘|婚运|结婚|婚期|成婚|正缘|另一半|配偶|感情运|财运|事业运|学业运|贵人运|命盘|命理|紫微|测算|提运|气场|顺不顺|更顺)"
 )
 DIVINATION_QUERY_PATTERN = re.compile(r"(占卜|摇卦|抽签|起卦|卦象|卦)")
 DREAM_QUERY_PATTERN = re.compile(r"(解梦|梦见|做梦|周公)")
 FORTUNE_SCENE_PATTERN = re.compile(
-    r"(今天|本周|这周|本月|最近|这段时间|现在|未来|今年|本年|明年|后年|去年|前年|上半年|下半年)"
+    r"(今天|本周|这周|下周|本月|最近|这段时间|现在|未来|接下来|今年|本年|明年|后年|去年|前年|上半年|下半年)"
 )
 FORTUNE_DECISION_PATTERN = re.compile(
     r"(开源|守财|扩收入|控支出|先.*还是|二选一|更适合|哪个更|优先|先守后开|守中带开|"
@@ -2740,9 +2946,133 @@ ZODIAC_SIGN_ALIASES = {
     "水瓶座": ["水瓶座", "水瓶"],
     "双鱼座": ["双鱼座", "双鱼"],
 }
+SHENGXIAO_ALIASES = {
+    "鼠": ["属鼠", "生肖鼠", "鼠生肖"],
+    "牛": ["属牛", "生肖牛", "牛生肖"],
+    "虎": ["属虎", "生肖虎", "虎生肖"],
+    "兔": ["属兔", "生肖兔", "兔生肖"],
+    "龙": ["属龙", "生肖龙", "龙生肖"],
+    "蛇": ["属蛇", "生肖蛇", "蛇生肖"],
+    "马": ["属马", "生肖马", "马生肖"],
+    "羊": ["属羊", "生肖羊", "羊生肖"],
+    "猴": ["属猴", "生肖猴", "猴生肖"],
+    "鸡": ["属鸡", "生肖鸡", "鸡生肖"],
+    "狗": ["属狗", "生肖狗", "狗生肖"],
+    "猪": ["属猪", "生肖猪", "猪生肖"],
+}
+ZODIAC_TITLE_INDEX = {
+    "白羊座": 0,
+    "金牛座": 1,
+    "双子座": 2,
+    "巨蟹座": 3,
+    "狮子座": 4,
+    "处女座": 5,
+    "天秤座": 6,
+    "天蝎座": 7,
+    "射手座": 8,
+    "摩羯座": 9,
+    "水瓶座": 10,
+    "双鱼座": 11,
+}
+SHENGXIAO_TITLE_INDEX = {
+    "鼠": 0,
+    "牛": 1,
+    "虎": 2,
+    "兔": 3,
+    "龙": 4,
+    "蛇": 5,
+    "马": 6,
+    "羊": 7,
+    "猴": 8,
+    "鸡": 9,
+    "狗": 10,
+    "猪": 11,
+}
+CHINESE_NEW_YEAR_DATES = {
+    1900: "1900-01-31", 1901: "1901-02-19", 1902: "1902-02-08", 1903: "1903-01-29", 1904: "1904-02-16",
+    1905: "1905-02-04", 1906: "1906-01-25", 1907: "1907-02-13", 1908: "1908-02-02", 1909: "1909-01-22",
+    1910: "1910-02-10", 1911: "1911-01-30", 1912: "1912-02-18", 1913: "1913-02-06", 1914: "1914-01-26",
+    1915: "1915-02-14", 1916: "1916-02-03", 1917: "1917-01-23", 1918: "1918-02-11", 1919: "1919-02-01",
+    1920: "1920-02-20", 1921: "1921-02-08", 1922: "1922-01-28", 1923: "1923-02-16", 1924: "1924-02-05",
+    1925: "1925-01-24", 1926: "1926-02-13", 1927: "1927-02-02", 1928: "1928-01-23", 1929: "1929-02-10",
+    1930: "1930-01-30", 1931: "1931-02-17", 1932: "1932-02-06", 1933: "1933-01-26", 1934: "1934-02-14",
+    1935: "1935-02-04", 1936: "1936-01-24", 1937: "1937-02-11", 1938: "1938-01-31", 1939: "1939-02-19",
+    1940: "1940-02-08", 1941: "1941-01-27", 1942: "1942-02-15", 1943: "1943-02-05", 1944: "1944-01-25",
+    1945: "1945-02-13", 1946: "1946-02-02", 1947: "1947-01-22", 1948: "1948-02-10", 1949: "1949-01-29",
+    1950: "1950-02-17", 1951: "1951-02-06", 1952: "1952-01-27", 1953: "1953-02-14", 1954: "1954-02-03",
+    1955: "1955-01-24", 1956: "1956-02-12", 1957: "1957-01-31", 1958: "1958-02-18", 1959: "1959-02-08",
+    1960: "1960-01-28", 1961: "1961-02-15", 1962: "1962-02-05", 1963: "1963-01-25", 1964: "1964-02-13",
+    1965: "1965-02-02", 1966: "1966-01-21", 1967: "1967-02-09", 1968: "1968-01-30", 1969: "1969-02-17",
+    1970: "1970-02-06", 1971: "1971-01-27", 1972: "1972-02-15", 1973: "1973-02-03", 1974: "1974-01-23",
+    1975: "1975-02-11", 1976: "1976-01-31", 1977: "1977-02-18", 1978: "1978-02-07", 1979: "1979-01-28",
+    1980: "1980-02-16", 1981: "1981-02-05", 1982: "1982-01-25", 1983: "1983-02-13", 1984: "1984-02-02",
+    1985: "1985-02-20", 1986: "1986-02-09", 1987: "1987-01-29", 1988: "1988-02-17", 1989: "1989-02-06",
+    1990: "1990-01-27", 1991: "1991-02-15", 1992: "1992-02-04", 1993: "1993-01-23", 1994: "1994-02-10",
+    1995: "1995-01-31", 1996: "1996-02-19", 1997: "1997-02-07", 1998: "1998-01-28", 1999: "1999-02-16",
+    2000: "2000-02-05", 2001: "2001-01-24", 2002: "2002-02-12", 2003: "2003-02-01", 2004: "2004-01-22",
+    2005: "2005-02-09", 2006: "2006-01-29", 2007: "2007-02-18", 2008: "2008-02-07", 2009: "2009-01-26",
+    2010: "2010-02-14", 2011: "2011-02-03", 2012: "2012-01-23", 2013: "2013-02-10", 2014: "2014-01-31",
+    2015: "2015-02-19", 2016: "2016-02-08", 2017: "2017-01-28", 2018: "2018-02-16", 2019: "2019-02-05",
+    2020: "2020-01-25", 2021: "2021-02-12", 2022: "2022-02-01", 2023: "2023-01-22", 2024: "2024-02-10",
+    2025: "2025-01-29", 2026: "2026-02-17", 2027: "2027-02-06", 2028: "2028-01-26", 2029: "2029-02-13",
+    2030: "2030-02-03", 2031: "2031-01-23", 2032: "2032-02-11", 2033: "2033-01-31", 2034: "2034-02-19",
+    2035: "2035-02-08", 2036: "2036-01-28", 2037: "2037-02-15", 2038: "2038-02-04", 2039: "2039-01-24",
+    2040: "2040-02-12", 2041: "2041-02-01", 2042: "2042-01-22", 2043: "2043-02-10", 2044: "2044-01-30",
+    2045: "2045-02-17", 2046: "2046-02-06", 2047: "2047-01-26", 2048: "2048-02-14", 2049: "2049-02-02",
+    2050: "2050-01-23", 2051: "2051-02-11", 2052: "2052-02-01", 2053: "2053-02-19", 2054: "2054-02-08",
+    2055: "2055-01-28", 2056: "2056-02-15", 2057: "2057-02-04", 2058: "2058-01-24", 2059: "2059-02-12",
+    2060: "2060-02-02", 2061: "2061-01-21", 2062: "2062-02-09", 2063: "2063-01-29", 2064: "2064-02-17",
+    2065: "2065-02-05", 2066: "2066-01-26", 2067: "2067-02-14", 2068: "2068-02-03", 2069: "2069-01-23",
+    2070: "2070-02-11", 2071: "2071-01-31", 2072: "2072-02-19", 2073: "2073-02-07", 2074: "2074-01-27",
+    2075: "2075-02-15", 2076: "2076-02-05", 2077: "2077-01-24", 2078: "2078-02-12", 2079: "2079-02-02",
+    2080: "2080-01-22", 2081: "2081-02-09", 2082: "2082-01-29", 2083: "2083-02-17", 2084: "2084-02-06",
+    2085: "2085-01-26", 2086: "2086-02-14", 2087: "2087-02-03", 2088: "2088-01-24", 2089: "2089-02-10",
+    2090: "2090-01-30", 2091: "2091-02-18", 2092: "2092-02-07", 2093: "2093-01-27", 2094: "2094-02-15",
+    2095: "2095-02-05", 2096: "2096-01-25", 2097: "2097-02-12", 2098: "2098-02-01", 2099: "2099-01-21",
+    2100: "2100-02-09",
+}
+ZESHI_INCIDENT_MAP = {
+    0: ["搬家", "迁徙", "乔迁"],
+    1: ["装修", "修造"],
+    2: ["入宅"],
+    3: ["订婚", "纳采", "结婚"],
+    4: ["领证", "嫁娶"],
+    5: ["求嗣", "破腹产"],
+    6: ["纳财"],
+    7: ["开市", "开业"],
+    8: ["交易", "签约", "成交"],
+    9: ["置产", "买房", "购房"],
+    10: ["动土"],
+    11: ["出行", "旅行", "远行"],
+    12: ["安葬"],
+    13: ["祭祀"],
+    14: ["祈福", "许愿"],
+    15: ["沐浴"],
+    16: ["订盟"],
+    17: ["纳婿"],
+    18: ["修坟"],
+    19: ["破土"],
+    20: ["安葬"],
+    21: ["立碑"],
+    22: ["开生坟"],
+    23: ["合寿木"],
+    24: ["入殓"],
+    25: ["移柩"],
+    26: ["伐木"],
+    27: ["掘井"],
+    28: ["挂匾"],
+    29: ["栽种"],
+    30: ["入学", "上学"],
+    31: ["理发", "剪头发"],
+    32: ["会亲友", "见亲友", "见朋友"],
+    33: ["赴任", "入职", "上任"],
+    34: ["求医", "看病", "就医"],
+    35: ["治病"],
+}
 ZODIAC_KEYWORD_PATTERN = re.compile(
     r"(星座|流年|年运|月运|周运|运势|桃花|感情|财运|事业|学业|贵人|配对|合盘|复合|水逆)"
 )
+SHENGXIAO_KEYWORD_PATTERN = re.compile(r"(生肖|属相|属[鼠牛虎兔龙蛇马羊猴鸡狗猪]|运势|年运|月运|周运|今日|今天|明日|明天)")
 ZODIAC_FORBIDDEN_BAZI_TERMS = re.compile(r"(八字|四柱|日主|喜用|忌神|五行|地支|天干)")
 
 
@@ -2753,6 +3083,69 @@ def _extract_zodiac_sign(query: str) -> str:
             if alias and alias in q:
                 return canonical
     return ""
+
+
+def _extract_shengxiao(query: str) -> str:
+    q = str(query or "")
+    for canonical, aliases in SHENGXIAO_ALIASES.items():
+        for alias in aliases:
+            if alias and alias in q:
+                return canonical
+    return ""
+
+
+def _parse_profile_birthdate(profile: dict[str, str] | None) -> datetime | None:
+    profile = profile or {}
+    raw = str(profile.get("birthdate") or "").strip()
+    if not raw:
+        return None
+    try:
+        normalized = raw.replace("年", "-").replace("月", "-").replace("日", "")
+        return datetime.strptime(normalized, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _infer_zodiac_sign_from_birthdate(profile: dict[str, str] | None) -> str:
+    birth_dt = _parse_profile_birthdate(profile)
+    if not birth_dt:
+        return ""
+    month_day = (birth_dt.month, birth_dt.day)
+    boundaries = [
+        ((1, 20), "水瓶座"),
+        ((2, 19), "双鱼座"),
+        ((3, 21), "白羊座"),
+        ((4, 20), "金牛座"),
+        ((5, 21), "双子座"),
+        ((6, 22), "巨蟹座"),
+        ((7, 23), "狮子座"),
+        ((8, 23), "处女座"),
+        ((9, 23), "天秤座"),
+        ((10, 24), "天蝎座"),
+        ((11, 23), "射手座"),
+        ((12, 22), "摩羯座"),
+    ]
+    for boundary, sign in reversed(boundaries):
+        if month_day >= boundary:
+            return sign
+    return "摩羯座"
+
+
+def _infer_shengxiao_from_birthdate(profile: dict[str, str] | None) -> str:
+    birth_dt = _parse_profile_birthdate(profile)
+    if not birth_dt:
+        return ""
+    new_year_text = CHINESE_NEW_YEAR_DATES.get(birth_dt.year)
+    zodiac_year = birth_dt.year
+    if new_year_text:
+        try:
+            new_year_dt = datetime.strptime(new_year_text, "%Y-%m-%d")
+            if birth_dt.date() < new_year_dt.date():
+                zodiac_year -= 1
+        except Exception:
+            pass
+    animals = ["鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"]
+    return animals[(zodiac_year - 1900) % 12]
 
 
 def _extract_query_year(query: str) -> int:
@@ -2768,6 +3161,26 @@ def _extract_query_year(query: str) -> int:
     return datetime.now().year
 
 
+def _detect_zodiac_scope(query: str, anchor_year: int) -> tuple[str, str]:
+    q = str(query or "")
+    explicit_years = [int(x) for x in re.findall(r"(?<!\d)(20\d{2})(?!\d)", q)]
+    if explicit_years and any(year != anchor_year for year in explicit_years):
+        return "llm_scope", "对应年份"
+    if re.search(r"(明天|明日)", q):
+        return "明日运势", "明日"
+    if re.search(r"(今天|今日)", q):
+        return "今日运势", "今日"
+    if re.search(r"(本周|这周|下周)", q):
+        return "本周运势", "本周"
+    if re.search(r"(本月|这个月)", q):
+        return "本月运势", "本月"
+    if re.search(r"(今年|本年)", q):
+        return "本年运势", "今年"
+    if re.search(r"(明年|后年|去年|前年)", q):
+        return "llm_scope", "对应年份"
+    return "本周运势", "本周"
+
+
 def is_zodiac_query(query: str) -> bool:
     q = str(query or "")
     sign = _extract_zodiac_sign(q)
@@ -2776,17 +3189,29 @@ def is_zodiac_query(query: str) -> bool:
     return bool(ZODIAC_KEYWORD_PATTERN.search(q))
 
 
+def is_shengxiao_query(query: str) -> bool:
+    q = str(query or "")
+    animal = _extract_shengxiao(q)
+    if not animal:
+        return False
+    return bool(SHENGXIAO_KEYWORD_PATTERN.search(q))
+
+
 def is_zodiac_intent_query(query: str) -> bool:
     q = str(query or "")
     if is_zodiac_query(q):
         return True
-    return ("星座" in q) and bool(ZODIAC_KEYWORD_PATTERN.search(q))
+    if is_shengxiao_query(q):
+        return True
+    if ("星座" in q) and bool(ZODIAC_KEYWORD_PATTERN.search(q)):
+        return True
+    return bool(re.search(r"(生肖|属相)", q)) and bool(SHENGXIAO_KEYWORD_PATTERN.search(q))
 
 
-def _zodiac_default_reply(sign: str, year: int, topic: str) -> str:
+def _zodiac_default_reply(sign: str, year: int, topic: str, scope_cn: str) -> str:
     topic_cn = _topic_cn(topic)
     return (
-        f"呀哈～先给你结论：{year}年{sign}{topic_cn}是“先稳后发”的节奏。\n"
+        f"呀哈～先给你结论：{sign}{scope_cn}的{topic_cn}更适合走“先稳后发”的节奏。\n"
         "【关键触发点】\n"
         "1. 节奏触发：当你把目标收敛到1-2个核心项，推进效率会明显上升。\n"
         "2. 人际触发：主动同步进展比闷头做更容易拿到资源和反馈。\n"
@@ -2798,54 +3223,151 @@ def _zodiac_default_reply(sign: str, year: int, topic: str) -> str:
         "1. 每周固定一次复盘：保留、停止、新增各1条。\n"
         "2. 先做最关键的25分钟深度任务，再处理碎事。\n"
         "3. 对外沟通前写3句结论，减少反复解释成本。\n"
-        "【本周立即执行一步】\n"
-        "今晚把下周最重要的一件事写进日程，并锁定第一段执行时间。\n"
-        "参考强度：中高（星座解读偏趋势参考）"
+        "【马上可做的一步】\n"
+        "先把最近最重要的一件事写进日程，并锁定第一段执行时间。"
     )
 
 
-def route_zodiac_pipeline(query: str, allow_clarify: bool = True) -> tuple[str | None, dict | None]:
-    q = str(query or "").strip()
-    if not q:
-        return None, None
-    if not is_zodiac_intent_query(q):
-        return None, None
+def _shengxiao_default_reply(animal: str, topic: str) -> str:
+    topic_cn = _topic_cn(topic)
+    return (
+        f"呀哈～先给你结论：属{animal}的你，这段时间{topic_cn}更适合走“先稳后发”的节奏。\n"
+        "先把最关键的一件事排到前面，别同时摊太多线；遇到重要决定时，先收信息，再定动作。"
+    )
 
-    sign = _extract_zodiac_sign(q)
-    if not sign:
-        if not allow_clarify:
-            return None, None
-        return (
-            "呀哈～你想看星座运势我收到了。先告诉我你的星座（例如白羊座/天蝎座），我再给你本周重点和行动建议。",
-            {"topic": "zodiac", "source": "zodiac_clarify", "question_type": "clarify"},
-        )
-    year = _extract_query_year(q)
-    topic = detect_fortune_topic(q)
+
+def _render_zodiac_llm_reply(query: str, sign: str, year: int, topic: str, scope_cn: str) -> tuple[str, dict]:
     topic_cn = _topic_cn(topic)
     prompt = ChatPromptTemplate.from_template(
-        """你是“吉伊大师”，请结合星座信息回答用户关于{year}年{sign}{topic_cn}的问题。
+        """你是“吉伊大师”，请结合星座信息回答用户关于{sign}{scope_cn}{topic_cn}的问题。
 要求：
 1) 使用吉伊口吻，温柔自然，可少量加入“呀哈/呜啦/本鼠鼠”。
 2) 先给清晰结论，再解释触发点与风险窗口，最后给1-3条可执行建议。
 3) 不要使用八字/五行/日主/喜用神等术语。
 4) 不要固定骨架标题，避免模板化语句。
-5) 结尾补一句“参考强度：中/中高/高（星座解读偏趋势参考）”之一。
+5) 回答必须严格对应“{scope_cn}”这个时间尺度，不要把本周写成今日，也不要把今日写成本周。
+6) 不要出现“参考强度”“参考分值”“综合分数”等措辞。
 
 用户问题：{query}
 """
     )
     try:
         chain = prompt | get_lc_ali_model_client(temperature=0.45, streaming=False) | StrOutputParser()
-        text = str(chain.invoke({"year": year, "sign": sign, "topic_cn": topic_cn, "query": q}) or "").strip()
+        text = str(chain.invoke({"year": year, "sign": sign, "topic_cn": topic_cn, "query": query, "scope_cn": scope_cn}) or "").strip()
         if not text:
-            return _zodiac_default_reply(sign, year, topic), {"topic": topic, "source": "zodiac_fallback"}
+            return _zodiac_default_reply(sign, year, topic, scope_cn), {"topic": topic, "source": "zodiac_fallback"}
         if ZODIAC_FORBIDDEN_BAZI_TERMS.search(text):
             text = re.sub(r"(八字|四柱|日主|喜用神?|忌神|五行|地支|天干)", "星盘线索", text)
-        if "参考强度：" not in text:
-            text = text.rstrip() + "\n参考强度：中高（星座解读偏趋势参考）"
+        text = re.sub(r"参考强度[:：].*", "", text)
+        text = re.sub(r"参考分值[:：].*", "", text)
         return _ensure_jiyi_tone(text), {"topic": topic, "source": "zodiac_llm"}
     except Exception:
-        return _zodiac_default_reply(sign, year, topic), {"topic": topic, "source": "zodiac_fallback"}
+        return _zodiac_default_reply(sign, year, topic, scope_cn), {"topic": topic, "source": "zodiac_fallback"}
+
+
+def route_zodiac_pipeline(
+    query: str,
+    allow_clarify: bool = True,
+    flags: dict[str, bool] | None = None,
+    profile: dict[str, str] | None = None,
+) -> tuple[str | None, dict | None]:
+    q = str(query or "").strip()
+    if not q:
+        return None, None
+    if not is_zodiac_intent_query(q):
+        return None, None
+    active_flags = flags or dict(FEATURE_FLAG_DEFAULTS)
+    sign = _extract_zodiac_sign(q)
+    animal = _extract_shengxiao(q)
+    inferred_sign = _infer_zodiac_sign_from_birthdate(profile) if not sign else ""
+    inferred_animal = _infer_shengxiao_from_birthdate(profile) if not animal else ""
+    if not sign and ("星座" in q):
+        sign = inferred_sign
+    if not animal and re.search(r"(生肖|属相)", q):
+        animal = inferred_animal
+    if not sign and not animal:
+        if not allow_clarify:
+            return None, None
+        if "星座" in q:
+            return (
+                "呀哈～你想看星座运势我收到了。先告诉我你的出生年月日，或者直接告诉我星座（例如白羊座/天蝎座），我再给你本周重点和行动建议。",
+                {"topic": "zodiac", "source": "zodiac_clarify", "question_type": "clarify"},
+            )
+        return (
+            "呀哈～你想看生肖运势我收到了。先告诉我你的出生年月日，或者直接告诉我生肖（例如属龙/属狗），我再给你这段时间的重点提醒。",
+            {"topic": "zodiac", "source": "shengxiao_clarify", "question_type": "clarify"},
+        )
+    year = _extract_query_year(q)
+    topic = detect_fortune_topic(q)
+    scope_key, scope_cn = _detect_zodiac_scope(q, year)
+    provider_fallback_reason = ""
+    failed_quota_state = ""
+    can_use_provider_scope = scope_key != "llm_scope"
+    if sign and active_flags.get("zodiac_api_v1") and can_use_provider_scope:
+        result = run_yuanfenju_zodiac_yunshi(
+            label=sign,
+            title_yunshi=ZODIAC_TITLE_INDEX.get(sign, 0),
+            entity_type=0,
+            topic=topic,
+            scope_key=scope_key,
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        if result.get("ok") and str(result.get("text") or "").strip():
+            return str(result.get("text") or ""), {
+                "topic": topic,
+                "source": "yuanfenju_zhanbu_yunshi",
+                "question_type": "zodiac",
+                "provider_id": str(result.get("provider_id") or "yuanfenju_zhanbu_yunshi"),
+                "provider_calls": int(result.get("provider_calls") or 0),
+                "provider_fallback_reason": "",
+                "quota_state": str(result.get("quota_state") or "healthy"),
+                "inferred_from_profile": bool(inferred_sign),
+                "scope_cn": scope_cn,
+            }
+        provider_fallback_reason = "provider_error" if result else "provider_disabled"
+        failed_quota_state = str(result.get("quota_state") or "")
+    elif animal and active_flags.get("zodiac_api_v1") and can_use_provider_scope:
+        result = run_yuanfenju_zodiac_yunshi(
+            label=f"属{animal}",
+            title_yunshi=SHENGXIAO_TITLE_INDEX.get(animal, 0),
+            entity_type=1,
+            topic=topic,
+            scope_key=scope_key,
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        if result.get("ok") and str(result.get("text") or "").strip():
+            return str(result.get("text") or ""), {
+                "topic": topic,
+                "source": "yuanfenju_zhanbu_yunshi",
+                "question_type": "zodiac",
+                "provider_id": str(result.get("provider_id") or "yuanfenju_zhanbu_yunshi"),
+                "provider_calls": int(result.get("provider_calls") or 0),
+                "provider_fallback_reason": "",
+                "quota_state": str(result.get("quota_state") or "healthy"),
+                "inferred_from_profile": bool(inferred_animal),
+                "scope_cn": scope_cn,
+            }
+        provider_fallback_reason = "provider_error" if result else "provider_disabled"
+        failed_quota_state = str(result.get("quota_state") or "")
+    else:
+        provider_fallback_reason = "provider_disabled"
+
+    if sign:
+        text, meta = _render_zodiac_llm_reply(q, sign, year, topic, scope_cn)
+        meta["provider_fallback_reason"] = provider_fallback_reason
+        meta["quota_state"] = failed_quota_state
+        meta["question_type"] = "zodiac"
+        meta["inferred_from_profile"] = bool(inferred_sign)
+        meta["scope_cn"] = scope_cn
+        return text, meta
+    return _shengxiao_default_reply(animal, topic), {
+        "topic": topic,
+        "source": "shengxiao_fallback",
+        "question_type": "zodiac",
+        "provider_fallback_reason": provider_fallback_reason or "fallback",
+        "inferred_from_profile": bool(inferred_animal),
+        "scope_cn": scope_cn,
+    }
 
 
 def _is_short_fortune_decision_hit(query: str) -> bool:
@@ -2933,7 +3455,8 @@ def detect_question_type(query: str) -> str:
     if is_time_sensitive_query(q) and not (is_zodiac_intent_query(q) or is_bazi_fortune_query(q)):
         return "time"
     if is_zodiac_intent_query(q) and not _extract_zodiac_sign(q):
-        return "clarify"
+        if "星座" in q or not _extract_shengxiao(q):
+            return "clarify"
     if _intent_routing_v3_enabled() and _is_short_fortune_decision_hit(q):
         return "decision"
     if FORTUNE_DECISION_PATTERN.search(q):
@@ -2954,7 +3477,7 @@ def detect_question_type(query: str) -> str:
 
 def detect_fortune_topic(query: str) -> str:
     q = str(query or "")
-    if re.search(r"(桃花|姻缘|感情|恋爱)", q):
+    if re.search(r"(桃花|姻缘|婚缘|婚运|结婚|婚期|成婚|正缘|另一半|配偶|感情|恋爱)", q):
         return "love"
     if re.search(r"(财运|财富|收入|金钱)", q):
         return "wealth"
@@ -2965,12 +3488,106 @@ def detect_fortune_topic(query: str) -> str:
     return "daily"
 
 
+def _extract_target_years(query: str, anchor_year: int) -> list[int]:
+    q = str(query or "")
+    explicit = [int(x) for x in re.findall(r"(?<!\d)(20\d{2})(?:年)?(?!\d)", q)]
+    if explicit:
+        return sorted(set(explicit))
+    years: list[int] = []
+    mapping = {
+        "前年": anchor_year - 2,
+        "去年": anchor_year - 1,
+        "今年": anchor_year,
+        "本年": anchor_year,
+        "明年": anchor_year + 1,
+        "后年": anchor_year + 2,
+    }
+    for token, year in mapping.items():
+        if token in q:
+            years.append(year)
+    if years:
+        return sorted(set(years))
+    m = re.search(r"(?:未来|接下来)(?:的)?([一二两三四五六七八九]|[1-9])年|([一二两三四五六七八九]|[1-9])年内", q)
+    if m:
+        count = _cn_num_to_int(str(m.group(1) or m.group(2) or "1")) or 1
+        return [anchor_year + idx for idx in range(max(1, min(5, count)))]
+    return []
+
+
+def _is_daily_window_query(query: str) -> bool:
+    q = str(query or "")
+    return bool(re.search(r"(今天|今日|明天|明日)", q))
+
+
+def _is_partner_profile_query(query: str) -> bool:
+    return bool(re.search(r"(正缘|另一半|配偶|对象).*(画像|特征|长相|样子|什么样)", str(query or "")))
+
+
+def _is_love_trend_query(query: str) -> bool:
+    return bool(re.search(r"(姻缘|婚缘|婚运|桃花|感情).*(趋势|走向|专题|发展)", str(query or "")))
+
+
+def _is_marriage_prediction_query(query: str) -> bool:
+    q = str(query or "")
+    return bool(
+        re.search(
+            r"((什么时候|何时|几岁|哪年|哪一年|多大|何年).*(结婚|成婚|步入婚姻)|"
+            r"(结婚|婚期|成婚).*(什么时候|何时|几岁|哪年|哪一年|多大|预测|分析|怎么看|适合))",
+            q,
+        )
+    )
+
+
+def _extract_zeshi_incident(query: str) -> tuple[int, str] | None:
+    q = str(query or "")
+    if not re.search(r"(哪天|哪几天|适合|宜不宜|能不能|安排)", q):
+        return None
+    best_match: tuple[int, str] | None = None
+    for incident_id, aliases in ZESHI_INCIDENT_MAP.items():
+        for alias in aliases:
+            if alias and alias in q:
+                if not best_match or len(alias) > len(best_match[1]):
+                    best_match = (incident_id, alias)
+    return best_match
+
+
+def _window_days_count(window_meta: dict | None) -> int:
+    if not isinstance(window_meta, dict):
+        return 7
+    start = str(window_meta.get("window_start") or "").strip()
+    end = str(window_meta.get("window_end") or "").strip()
+    if not start or not end:
+        return 7
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d")
+        end_dt = datetime.strptime(end, "%Y-%m-%d")
+    except Exception:
+        return 7
+    return max(1, min(30, (end_dt.date() - start_dt.date()).days + 1))
+
+
+def _resolve_zeshi_future_code(query: str, window_meta: dict | None) -> int:
+    q = str(query or "").strip()
+    if re.search(r"(今天|今日)", q):
+        return 0
+    days = _window_days_count(window_meta)
+    if days <= 1:
+        return 0
+    if days <= 7:
+        return 1
+    if days <= 30:
+        return 2
+    return 3
+
+
 def _missing_profile_fields_for_fortune(profile: dict[str, str]) -> list[str]:
     missing: list[str] = []
     if not str(profile.get("name") or "").strip():
         missing.append("name")
     if not str(profile.get("birthdate") or "").strip():
         missing.append("birthdate")
+    if not _normalize_gender(str(profile.get("gender") or "")):
+        missing.append("gender")
     return missing
 
 
@@ -2979,7 +3596,15 @@ def build_fortune_missing_reply(missing: list[str]) -> str:
         return "呀哈～我先补一个关键资料：请告诉我你的姓名（2-12个字）。"
     if missing == ["birthdate"]:
         return "呀哈～我还需要你的出生年月日（例如 2001-08-15），这样命理判断才更准。"
-    return "呀哈～我先帮你把资料补齐：请告诉我姓名和出生年月日（例如 2001-08-15；知道时辰也可以一起说）。"
+    if missing == ["gender"]:
+        return "呀哈～我还需要你的性别（男/女），这样姻缘、流年和八字接口才能按正确参数来算。"
+    if missing == ["name", "birthdate"]:
+        return "呀哈～我先帮你把资料补齐：请告诉我姓名和出生年月日（例如 2001-08-15；知道时辰也可以一起说）。"
+    if missing == ["name", "gender"]:
+        return "呀哈～我还差两项关键资料：请告诉我你的姓名和性别（男/女）。"
+    if missing == ["birthdate", "gender"]:
+        return "呀哈～我还需要你的出生年月日和性别（男/女），这样命理接口才能按完整参数来算。"
+    return "呀哈～我先帮你把资料补齐：请告诉我姓名、出生年月日和性别（男/女）；知道时辰也可以一起说。"
 
 
 def _default_fortune_advice(topic: str, strength: str) -> list[str]:
@@ -3050,6 +3675,15 @@ def _normalize_structured_fortune_payload(raw, topic: str) -> dict:
         "advice": [],
         "confidence": 0.2,
         "source": "yuanfenju",
+        "provider_id": "",
+        "provider_calls": 0,
+        "provider_fallback_reason": "",
+        "upstream_errmsg": "",
+        "quota_state": "",
+        "profile_gender": "",
+        "partner_portrait_image": "",
+        "zhengyuan_profile": {},
+        "jiehun_profile": {},
         "error": None,
     }
     payload = _as_dict(raw)
@@ -3058,9 +3692,35 @@ def _normalize_structured_fortune_payload(raw, topic: str) -> dict:
         base["advice"] = _default_fortune_advice(topic, "balanced")
         return base
 
-    for key in ["topic", "bazi", "day_master", "strength", "xiyongshen", "jishen", "source"]:
+    for key in [
+        "topic",
+        "bazi",
+        "day_master",
+        "strength",
+        "xiyongshen",
+        "jishen",
+        "source",
+        "provider_id",
+        "provider_fallback_reason",
+        "upstream_errmsg",
+        "quota_state",
+        "profile_gender",
+        "partner_portrait_image",
+    ]:
         if key in payload:
             base[key] = str(payload.get(key) or base[key])
+
+    raw_zhengyuan_profile = payload.get("zhengyuan_profile") or {}
+    if isinstance(raw_zhengyuan_profile, dict):
+        base["zhengyuan_profile"] = raw_zhengyuan_profile
+    raw_jiehun_profile = payload.get("jiehun_profile") or {}
+    if isinstance(raw_jiehun_profile, dict):
+        base["jiehun_profile"] = raw_jiehun_profile
+
+    try:
+        base["provider_calls"] = max(0, int(payload.get("provider_calls", 0)))
+    except Exception:
+        base["provider_calls"] = 0
 
     raw_scores = payload.get("wuxing_scores") or {}
     if isinstance(raw_scores, dict):
@@ -3094,6 +3754,10 @@ def _normalize_structured_fortune_payload(raw, topic: str) -> dict:
         base["error"] = {
             "code": str(raw_error.get("code") or ""),
             "message": str(raw_error.get("message") or ""),
+            "provider": str(raw_error.get("provider") or ""),
+            "provider_code": str(raw_error.get("provider_code") or ""),
+            "category": str(raw_error.get("category") or ""),
+            "degraded": bool(raw_error.get("degraded")),
         }
 
     if base["strength"] not in {"strong", "weak", "balanced"}:
@@ -3394,13 +4058,16 @@ def _generate_fortune_reply_with_model(
 
 def _format_dream_payload(raw) -> str:
     if isinstance(raw, dict):
+        if int(raw.get("errcode", 0) or 0) != 0:
+            return ""
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
         ordered = []
-        for k in ["梦境", "解梦", "吉凶", "建议", "result", "content"]:
-            val = str(raw.get(k) or "").strip()
+        for k in ["title", "name", "梦境", "description", "解梦", "吉凶", "建议", "result", "content"]:
+            val = str(data.get(k) or "").strip()
             if val:
                 ordered.append(f"{k}：{val}")
         if not ordered:
-            ordered = [f"{k}：{v}" for k, v in raw.items() if str(v).strip()]
+            ordered = [f"{k}：{v}" for k, v in data.items() if str(v).strip()]
         return "\n".join(ordered[:8])
     return str(raw or "").strip()
 
@@ -3604,6 +4271,176 @@ def _decision_conclusion_from_query(query: str, strength: str) -> str:
     return "先稳后进，避免一次性重仓决策"
 
 
+def _partner_role_by_gender(gender: str) -> tuple[str, str]:
+    normalized = _normalize_gender(gender)
+    if normalized == "女":
+        return "男生", "他"
+    if normalized == "男":
+        return "女生", "她"
+    return "伴侣", "对方"
+
+
+def _strip_default_family_script(text: str) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return ""
+    out = re.sub(r"(婚后|结婚以后|成家以后|孩子|宝宝|父母|公婆|岳父母)[^。！？!?]{0,24}", "", out)
+    out = re.sub(r"[，,；;、]\s*[，,；;、]+", "，", out)
+    out = re.sub(r"\s+", "", out)
+    return out.strip("，,；;。")
+
+
+def _safe_text(value) -> str:
+    return str(value or "").strip()
+
+
+def _join_nonempty(parts: list[str], sep: str = "；") -> str:
+    return sep.join([str(part).strip() for part in parts if str(part).strip()])
+
+
+def _render_yinyuan_trend_reply(payload: dict) -> str:
+    signal = _strip_default_family_script(str(((payload.get("fortune_signals") or {}).get("love")) or ""))
+    if not signal:
+        signal = "这段姻缘趋势更适合走“先建立信任，再慢慢升温”的路线。"
+    first_signal = re.split(r"[。！？!?]", signal, maxsplit=1)[0].strip(" ，,；;")
+    if not first_signal:
+        first_signal = "这段姻缘趋势更适合走“先建立信任，再慢慢升温”的路线"
+    lines = [
+        f"呀哈～本鼠鼠先把这根姻缘小红线递给你：{first_signal}。",
+        "这一段更值得你盯住的，不是谁先把气氛炒热，而是有没有稳定回应、能不能把小别扭说开、彼此愿不愿意接住对方的情绪。",
+        "如果你已经在接触某个人，就重点看对方是不是愿意持续投入，而不是只在气氛刚好时出现；如果你还没遇到，也别急着把结果写死，先把自己的边界和节奏稳稳放好。",
+        "吉伊的小提醒是：先给出一次轻一点、但真诚的表达，再观察对方后面的连续回应；重要关系不要为了立刻要答案就硬往前推，慢一点反而更容易看清。",
+    ]
+    return "\n".join(lines)
+
+
+def _render_zhengyuan_profile_reply(payload: dict) -> str:
+    zhengyuan_profile = payload.get("zhengyuan_profile") or {}
+    if isinstance(zhengyuan_profile, dict) and zhengyuan_profile:
+        huaxiang = zhengyuan_profile.get("huaxiang") or {}
+        tezhi = zhengyuan_profile.get("tezhi") or {}
+        zhiyin = zhengyuan_profile.get("zhiyin") or {}
+        partner_label, partner_pronoun = _partner_role_by_gender(str(payload.get("profile_gender") or ""))
+
+        appearance = _join_nonempty(
+            [
+                _safe_text((huaxiang or {}).get("face_shape")),
+                _safe_text((huaxiang or {}).get("eyebrow_shape")),
+                _safe_text((huaxiang or {}).get("eye_shape")),
+                _safe_text((huaxiang or {}).get("mouth_shape")),
+                _safe_text((huaxiang or {}).get("nose_shape")),
+                _safe_text((huaxiang or {}).get("body_shape")),
+            ]
+        )
+        romantic_personality = _safe_text((tezhi or {}).get("romantic_personality"))
+        family_background = _safe_text((tezhi or {}).get("family_background"))
+        career_wealth = _safe_text((tezhi or {}).get("career_wealth"))
+        marital_happiness = _safe_text((tezhi or {}).get("marital_happiness"))
+        love_location = _safe_text((zhiyin or {}).get("love_location"))
+        meeting_method = _safe_text((zhiyin or {}).get("meeting_method"))
+        interaction_model = _safe_text((zhiyin or {}).get("interaction_model"))
+        love_advice = _safe_text((zhiyin or {}).get("love_advice"))
+        yunshi = _safe_text(zhengyuan_profile.get("yunshi"))
+
+        lines = [f"呀哈～吉伊把这份正缘画像认真捧给你看啦。更适合你的{partner_label}，感情底色大致会是这样的：{romantic_personality or '整体偏真诚、投入，也更看重关系里的实际回应。'}"]
+        if appearance:
+            lines.append(f"如果把{partner_pronoun}的模样一点点描开，给你的第一眼感觉多半会是：{appearance}")
+        if family_background:
+            lines.append(f"再往成长和家庭这层底色里看，{partner_pronoun}大致会落在这样的背景里：{family_background}")
+        if career_wealth:
+            lines.append(f"说到现实能力、事业和财富手感，这一块更像是：{career_wealth}")
+        if love_location or meeting_method:
+            lines.append(
+                f"缘分线索也不算含糊，吉伊替你捋顺后大概是这样：{_join_nonempty([love_location, meeting_method], sep=' ')}"
+            )
+        if interaction_model:
+            lines.append(f"真走到相处里，你们更容易长成这样的关系节奏：{interaction_model}")
+        if love_advice:
+            lines.append(f"这段关系里最该收好的提醒，吉伊想替你圈这一条：{love_advice}")
+        if marital_happiness or yunshi:
+            lines.append(
+                f"如果把长期相处和阶段运势一起摊开来看，后面的画面大致会是这样：{_join_nonempty([marital_happiness, yunshi], sep=' ')}"
+            )
+        if _safe_text((huaxiang or {}).get('profile_image')):
+            lines.append("我也把这张正缘画像预览偷偷放在下面啦，你可以直接看头像感觉，会更有代入感。")
+        return "\n\n".join([line for line in lines if line.strip()])
+
+    partner_label, partner_pronoun = _partner_role_by_gender(str(payload.get("profile_gender") or ""))
+    signal = _strip_default_family_script(str(((payload.get("fortune_signals") or {}).get("love")) or ""))
+    opportunity = " ".join([_strip_default_family_script(item) for item in (payload.get("opportunity_points") or [])[:2]])
+    traits: list[str] = []
+    combined = f"{signal} {opportunity}"
+    if re.search(r"(主动|直接|热烈|冒险|勇敢)", combined):
+        traits.append("表达直接，遇事不爱兜圈子")
+    if re.search(r"(活力|好奇|探索|新鲜感)", combined):
+        traits.append("有行动力，也愿意一起尝试新事物")
+    if re.search(r"(理智|谨慎|稳步|毅力|坚韧)", combined):
+        traits.append("处理现实问题时不飘，能一起把事情落地")
+    if not traits:
+        traits = ["情绪表达比较真诚", "相处时更看重实际回应", "关系里愿意一起承担现实问题"]
+    timing_line = ""
+    if re.search(r"(2026|2027)", opportunity):
+        timing_line = "从节奏上看，接下来一两年更容易遇到或确认这类关系。"
+    lines = [
+        f"呀哈～吉伊先把结论抱给你：更适合你的{partner_label}，多半不是只会制造暧昧感的人，而是那种相处起来有热度、做事也肯认真投入的人。",
+        f"{partner_pronoun}身上的气质重点，大致会落在这些地方：{'；'.join(traits[:3])}。",
+        "真走到相处里，你们更容易因为一起做事、一起面对变化、一起把现实安排落下来而升温，不是只靠一时上头。",
+    ]
+    if timing_line:
+        lines.append(timing_line)
+    lines.append(f"吉伊的小建议是：先别急着用预设条件去框人，先看这个{partner_label}是否稳定回应、是否愿意共担现实问题；真正合适的人，通常会在连续互动里越来越清楚。")
+    return "\n".join(lines)
+
+
+def _render_jiehun_prediction_reply(payload: dict) -> str:
+    profile = payload.get("jiehun_profile") or {}
+    if isinstance(profile, dict) and profile:
+        star_name = _safe_text(profile.get("star_name"))
+        star_desc = _safe_text(profile.get("star_desc"))
+        romantic_personality = _safe_text(profile.get("romantic_personality"))
+        destined_partner = _safe_text(profile.get("destined_partner"))
+        peak_love_ages = _safe_text(profile.get("peak_love_ages"))
+        gap_ages = _safe_text(profile.get("gap_ages"))
+        love_desc = _safe_text(profile.get("love_desc"))
+
+        opening_parts = [part for part in [star_name, star_desc] if part]
+        opening = "，".join(opening_parts) if opening_parts else "这份结婚预测更像是在给你一张婚缘节奏图"
+        lines = [f"呀哈～吉伊先把这张婚缘时间表抖开给你看：{opening}。"]
+        if love_desc:
+            lines.append(f"如果把“结婚”这件事往前看，你目前的婚缘节奏大致是：{love_desc}")
+        if romantic_personality:
+            lines.append(f"先说你在亲密关系里的底色，吉伊看到的是：{romantic_personality}")
+        if destined_partner:
+            lines.append(f"再看你更容易走向哪类缘分，对象线索更像是：{destined_partner}")
+        if peak_love_ages or gap_ages:
+            lines.append(
+                f"时间点吉伊也替你一并圈出来啦：{_join_nonempty([f'桃花运更旺的阶段在{peak_love_ages}' if peak_love_ages else '', f'情感容易空窗的阶段在{gap_ages}' if gap_ages else ''], sep='；')}"
+            )
+        lines.append("吉伊的小提醒是：别只盯着“我会不会马上结婚”，先看关系里是不是有稳定投入、现实协同和长期打算；这样你会更容易把好缘分稳稳接住。")
+        return "\n\n".join([line for line in lines if line.strip()])
+
+    signal = _strip_default_family_script(str(((payload.get("fortune_signals") or {}).get("love")) or ""))
+    if not signal:
+        signal = "这段婚缘更适合先把关系走稳，再谈是否进入婚姻。"
+    return (
+        f"呀哈～吉伊先把结论轻轻放你手心里：{signal}\n"
+        "如果你现在在看结婚节奏，先别急着追一个具体日期，更重要的是确认这段关系有没有稳定回应、现实配合和长期打算。\n"
+        "吉伊的小提醒是：先把关系里的共识谈清楚，再决定要不要往婚姻推进。"
+    )
+
+
+def _build_fortune_chat_extra(payload: dict | None = None) -> dict:
+    meta = payload if isinstance(payload, dict) else {}
+    portrait = str(meta.get("partner_portrait_image") or "").strip()
+    if portrait.startswith("data:image/"):
+        return {
+            "partner_portrait_image": portrait,
+            "partner_portrait_label": "正缘画像预览",
+            "provider_id": str(meta.get("provider_id") or ""),
+        }
+    return {}
+
+
 def render_user_fortune_reply_v2(
     payload: dict,
     topic: str,
@@ -3617,6 +4454,20 @@ def render_user_fortune_reply_v2(
     payload["advice_signature"] = _advice_signature(advice_for_sign)
     raw_error = payload.get("error")
     has_error = isinstance(raw_error, dict) and str(raw_error.get("code") or "")
+    provider_id = str(payload.get("provider_id") or payload.get("source") or "")
+    if not has_error and topic == "love":
+        if provider_id == "yuanfenju_yinyuan":
+            payload["blueprint_id"] = "love_yinyuan_direct"
+            payload["_render_blueprint_id"] = "love_yinyuan_direct"
+            return _render_yinyuan_trend_reply(payload)
+        if provider_id == "yuanfenju_zhengyuan":
+            payload["blueprint_id"] = "love_zhengyuan_direct"
+            payload["_render_blueprint_id"] = "love_zhengyuan_direct"
+            return _render_zhengyuan_profile_reply(payload)
+        if provider_id == "yuanfenju_jiehun":
+            payload["blueprint_id"] = "love_jiehun_direct"
+            payload["_render_blueprint_id"] = "love_jiehun_direct"
+            return _render_jiehun_prediction_reply(payload)
     if not has_error:
         payload["blueprint_id"] = "llm_nlg_v1"
         payload["_render_blueprint_id"] = "llm_nlg_v1"
@@ -3721,6 +4572,32 @@ def render_structured_fortune_reply(payload: dict, topic: str) -> str:
     return _soften_fortune_section_headings("\n".join(lines))
 
 
+def _build_fortune_provider_safe_fallback(
+    payload: dict,
+    topic: str,
+    query: str,
+    question_type: str,
+    time_anchor: dict,
+    window_meta: dict | None = None,
+    session_id: str = "",
+) -> str:
+    normalized = _normalize_structured_fortune_payload(payload, topic)
+    normalized["now_ts"] = str((time_anchor or {}).get("now_ts") or "")
+    normalized["tz"] = str((time_anchor or {}).get("tz_name") or "")
+    if isinstance(window_meta, dict):
+        normalized["window_start"] = str(window_meta.get("window_start") or "")
+        normalized["window_end"] = str(window_meta.get("window_end") or "")
+        normalized["window_text"] = str(window_meta.get("window_text") or "")
+    return render_user_fortune_reply_v2(
+        normalized,
+        topic,
+        query=query,
+        question_type=question_type,
+        window_meta=window_meta,
+        session_id=session_id,
+    )
+
+
 def _format_divination_reply(raw) -> str:
     if isinstance(raw, dict):
         ordered_keys = ["凶吉", "运势", "财富", "感情", "事业", "身体", "行人", "解曰"]
@@ -3761,6 +4638,111 @@ def route_dream_pipeline(query: str) -> tuple[str | None, dict | None]:
     return reply, {"topic": "dream", "source": "jiemeng", "question_type": "dream"}
 
 
+def _build_fortune_tool_query(
+    *,
+    query: str,
+    profile: dict[str, str],
+    anchor: dict,
+    topic: str,
+    window_meta: dict | None = None,
+    need_window: bool = False,
+) -> tuple[str, str, str]:
+    name = str(profile.get("name") or "").strip()
+    birthdate = str(profile.get("birthdate") or "").strip()
+    birthtime = str(profile.get("birthtime") or "").strip()
+    gender = _normalize_gender(str(profile.get("gender") or ""))
+    near_days = anchor.get("near_days") or []
+    window_text = ""
+    window_label = ""
+    if isinstance(window_meta, dict) and str(window_meta.get("window_text") or "").strip():
+        window_text = str(window_meta.get("window_text")).strip()
+        window_label = str(window_meta.get("label") or "").strip()
+    elif near_days and need_window:
+        window_text = "、".join([f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")])
+        window_label = "near_days"
+    time_window_clause = ""
+    if window_text:
+        if window_label == "today_only":
+            time_window_clause = f"若用户问“今天/今日”，仅允许按当天判断：{window_text}。不要扩成“三天”或“近几天”。"
+        elif window_label in {"near_days", "two_days", "this_week", "next_week"}:
+            time_window_clause = f"若用户问“近几天/哪几天”，仅允许在此窗口判断：{window_text}。"
+        else:
+            time_window_clause = f"时间范围：{window_text}。回答不要收缩成“近三天”，要覆盖该范围。"
+    tool_query = (
+        f"请按结构化JSON返回{topic}命理结果。"
+        f"姓名：{name}；出生日期：{birthdate}；出生时间：{birthtime or '未知'}；性别：{gender or '未知'}；用户问题：{query}。"
+        f"当前时间锚点：{anchor.get('today_cn')}（{anchor.get('weekday_cn')}，{anchor.get('tz_name')}，{anchor.get('utc_offset')}）。"
+        f"{time_window_clause}"
+    )
+    return tool_query, window_text, window_label
+
+
+def _finalize_fortune_payload(
+    payload: dict,
+    *,
+    topic: str,
+    question_type: str,
+    route_reason_code: str,
+    anchor: dict,
+    window_meta: dict | None = None,
+) -> dict:
+    normalized = _normalize_structured_fortune_payload(payload, topic)
+    _metric_incr("fortune_tool_total")
+    if not (isinstance(normalized.get("error"), dict) and str(normalized["error"].get("code") or "")):
+        _metric_incr("fortune_tool_success_total")
+    _metric_incr("fortune_field_total")
+    if _is_fortune_field_complete(normalized):
+        _metric_incr("fortune_field_complete_total")
+    normalized["question_type"] = str(question_type or "default")
+    normalized["now_ts"] = str(anchor.get("now_ts") or "")
+    normalized["tz"] = str(anchor.get("tz_name") or "")
+    normalized["route_reason_code"] = route_reason_code
+    if isinstance(window_meta, dict):
+        normalized["window_start"] = str(window_meta.get("window_start") or "")
+        normalized["window_end"] = str(window_meta.get("window_end") or "")
+        normalized["window_text"] = str(window_meta.get("window_text") or "")
+    logger.info(
+        "fortune_pipeline session_payload: "
+        f"topic={normalized.get('topic')} provider={normalized.get('provider_id') or normalized.get('source')} "
+        f"error={((normalized.get('error') or {}).get('code') if isinstance(normalized.get('error'), dict) else '')} "
+        f"confidence={normalized.get('confidence')} question_type={question_type} route_reason={route_reason_code}"
+    )
+    return normalized
+
+
+def _merge_wealth_compare_payloads(payloads: list[dict], years: list[int]) -> dict:
+    base = _normalize_structured_fortune_payload(payloads[0], "wealth")
+    signal_lines: list[str] = []
+    opportunity_points: list[str] = []
+    risk_points: list[str] = []
+    time_hints: list[str] = []
+    evidence_lines: list[str] = []
+    advice: list[str] = []
+    total_calls = 0
+    for year, payload in zip(years, payloads):
+        normalized = _normalize_structured_fortune_payload(payload, "wealth")
+        total_calls += int(normalized.get("provider_calls") or 0)
+        signal = _signal_for_topic(normalized, "wealth")
+        if signal:
+            signal_lines.append(f"{year}年：{signal}")
+        opportunity_points.extend([f"{year}年：{item}" for item in (normalized.get("opportunity_points") or [])[:2]])
+        risk_points.extend([f"{year}年：{item}" for item in (normalized.get("risk_points") or [])[:2]])
+        time_hints.extend([f"{year}年：{item}" for item in (normalized.get("time_hints") or [])[:1]])
+        evidence_lines.extend([f"{year}年：{item}" for item in (normalized.get("evidence_lines") or [])[:1]])
+        advice.extend([f"{year}年：{item}" for item in (normalized.get("advice") or [])[:1]])
+    base["source"] = "yuanfenju_caiyunfenxi_compare"
+    base["provider_id"] = "yuanfenju_caiyunfenxi_compare"
+    base["provider_calls"] = total_calls
+    base["fortune_signals"]["wealth"] = "；".join(signal_lines)[:180]
+    base["opportunity_points"] = opportunity_points[:4]
+    base["risk_points"] = risk_points[:4]
+    base["time_hints"] = time_hints[:4]
+    base["evidence_lines"] = evidence_lines[:4]
+    base["advice"] = advice[:3] or _default_fortune_advice("wealth", str(base.get("strength") or "balanced"))
+    base["confidence"] = max(float(base.get("confidence") or 0.2), 0.66)
+    return base
+
+
 def route_fortune_pipeline(
     query: str,
     profile: dict[str, str],
@@ -3773,7 +4755,7 @@ def route_fortune_pipeline(
     if not q:
         return None, None
     anchor = time_anchor or build_time_anchor()
-    active_flags = flags or dict(V2_FLAG_DEFAULTS)
+    active_flags = flags or dict(FEATURE_FLAG_DEFAULTS)
     need_window = bool(active_flags.get("window_v2")) and _need_time_window(q, question_type=question_type)
     window_meta = date_window_resolver(q, anchor) if need_window else None
 
@@ -3808,72 +4790,211 @@ def route_fortune_pipeline(
         )
 
     topic = detect_fortune_topic(q)
-    name = str(profile.get("name") or "").strip()
-    birthdate = str(profile.get("birthdate") or "").strip()
-    birthtime = str(profile.get("birthtime") or "").strip()
-    near_days = anchor.get("near_days") or []
-    window_text = ""
-    window_label = ""
-    if isinstance(window_meta, dict) and str(window_meta.get("window_text") or "").strip():
-        window_text = str(window_meta.get("window_text")).strip()
-        window_label = str(window_meta.get("label") or "").strip()
-    elif near_days and need_window:
-        window_text = "、".join([f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")])
-        window_label = "near_days"
-    time_window_clause = ""
-    if window_text:
-        if window_label == "today_only":
-            time_window_clause = f"若用户问“今天/今日”，仅允许按当天判断：{window_text}。不要扩成“三天”或“近几天”。"
-        elif window_label in {"near_days", "two_days", "this_week", "next_week"}:
-            time_window_clause = f"若用户问“近几天/哪几天”，仅允许在此窗口判断：{window_text}。"
-        else:
-            time_window_clause = f"时间范围：{window_text}。回答不要收缩成“近三天”，要覆盖该范围。"
-    tool_query = (
-        f"请按结构化JSON返回{topic}命理结果。"
-        f"姓名：{name}；出生日期：{birthdate}；出生时间：{birthtime or '未知'}；用户问题：{q}。"
-        f"当前时间锚点：{anchor.get('today_cn')}（{anchor.get('weekday_cn')}，{anchor.get('tz_name')}，{anchor.get('utc_offset')}）。"
-        f"{time_window_clause}"
+    if _is_partner_profile_query(q) or _is_love_trend_query(q) or _is_marriage_prediction_query(q):
+        need_window = False
+        window_meta = None
+    tool_query, _, window_label = _build_fortune_tool_query(
+        query=q,
+        profile=profile,
+        anchor=anchor,
+        topic=topic,
+        window_meta=window_meta,
+        need_window=need_window,
     )
-    raw = ""
-    try:
-        raw = bazi_cesuan.invoke(tool_query)
-    except Exception:
-        try:
-            raw = bazi_cesuan.run(tool_query)
-        except Exception as e:
-            logger.error(f"命理工具调用失败: {e}\n{traceback.format_exc()}")
-            raw = {
-                "topic": topic,
-                "error": {"code": "FORTUNE_PARSE_FAILED", "message": "命理工具调用失败，请稍后重试"},
-            }
+    target_years = _extract_target_years(q, anchor.get("now_dt").year if isinstance(anchor.get("now_dt"), datetime) else datetime.now().year)
+    provider_fallback_reason = ""
+    raw_payload: dict | None = None
 
-    payload = _normalize_structured_fortune_payload(raw, topic)
-    _metric_incr("fortune_tool_total")
-    if not (isinstance(payload.get("error"), dict) and str(payload["error"].get("code") or "")):
-        _metric_incr("fortune_tool_success_total")
-    _metric_incr("fortune_field_total")
-    if _is_fortune_field_complete(payload):
-        _metric_incr("fortune_field_complete_total")
-    payload["question_type"] = str(question_type or "default")
-    payload["now_ts"] = str(anchor.get("now_ts") or "")
-    payload["tz"] = str(anchor.get("tz_name") or "")
-    payload["route_reason_code"] = route_reason_code
-    if isinstance(window_meta, dict):
-        payload["window_start"] = str(window_meta.get("window_start") or "")
-        payload["window_end"] = str(window_meta.get("window_end") or "")
-        payload["window_text"] = str(window_meta.get("window_text") or "")
-    logger.info(
-        "fortune_pipeline session_payload: "
-        f"topic={payload.get('topic')} error={((payload.get('error') or {}).get('code') if isinstance(payload.get('error'), dict) else '')} "
-        f"confidence={payload.get('confidence')} question_type={question_type} route_reason={route_reason_code}"
+    incident_hit = None if _is_marriage_prediction_query(q) else _extract_zeshi_incident(q)
+    if incident_hit and active_flags.get("zeshi_api_v1"):
+        incident_id, incident_label = incident_hit
+        future_code = _resolve_zeshi_future_code(q, window_meta)
+        zeshi_result = run_yuanfenju_zeshi(
+            future=future_code,
+            incident=incident_id,
+            incident_label=incident_label,
+            window_start=str((window_meta or {}).get("window_start") or ""),
+            window_end=str((window_meta or {}).get("window_end") or ""),
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        _metric_incr("fortune_tool_total")
+        if zeshi_result.get("ok") and str(zeshi_result.get("text") or "").strip():
+            _metric_incr("fortune_tool_success_total")
+            return str(zeshi_result.get("text") or ""), {
+                "topic": "daily",
+                "source": str(zeshi_result.get("provider_id") or "yuanfenju_gongju_zeshi"),
+                "provider_id": str(zeshi_result.get("provider_id") or "yuanfenju_gongju_zeshi"),
+                "provider_calls": int(zeshi_result.get("provider_calls") or 0),
+                "provider_fallback_reason": "",
+                "quota_state": str(zeshi_result.get("quota_state") or "healthy"),
+                "question_type": question_type,
+                "route_reason_code": "zeshi_incident_hit",
+                "zeshi_future_code": future_code,
+                "window_start": str((window_meta or {}).get("window_start") or ""),
+                "window_end": str((window_meta or {}).get("window_end") or ""),
+                "window_text": str((window_meta or {}).get("window_text") or ""),
+            }
+        route_reason_code = "zeshi_fallback_to_bazi"
+        provider_fallback_reason = str(((zeshi_result.get("failure") or {}).get("error_code")) or "zeshi_fallback")
+
+    if raw_payload is None and _is_partner_profile_query(q) and active_flags.get("love_profile_v1"):
+        raw_payload = run_yuanfenju_love_profile(
+            tool_query,
+            profile=profile,
+            variant="zhengyuan",
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        route_reason_code = "zhengyuan_hit"
+        if isinstance((raw_payload or {}).get("error"), dict) and str((raw_payload.get("error") or {}).get("code") or ""):
+            provider_fallback_reason = str((raw_payload.get("error") or {}).get("code") or "zhengyuan_fallback")
+            raw_payload = None
+            route_reason_code = "zhengyuan_fallback_to_bazi"
+
+    if raw_payload is None and _is_marriage_prediction_query(q) and active_flags.get("love_profile_v1"):
+        raw_payload = run_yuanfenju_love_profile(
+            tool_query,
+            profile=profile,
+            variant="jiehun",
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        route_reason_code = "jiehun_hit"
+        if isinstance((raw_payload or {}).get("error"), dict) and str((raw_payload.get("error") or {}).get("code") or ""):
+            provider_fallback_reason = str((raw_payload.get("error") or {}).get("code") or "jiehun_fallback")
+            raw_payload = None
+            route_reason_code = "jiehun_fallback_to_bazi"
+
+    if raw_payload is None and _is_love_trend_query(q) and active_flags.get("love_profile_v1"):
+        raw_payload = run_yuanfenju_love_profile(
+            tool_query,
+            profile=profile,
+            variant="yinyuan",
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        route_reason_code = "yinyuan_hit"
+        if isinstance((raw_payload or {}).get("error"), dict) and str((raw_payload.get("error") or {}).get("code") or ""):
+            provider_fallback_reason = str((raw_payload.get("error") or {}).get("code") or "yinyuan_fallback")
+            raw_payload = None
+            route_reason_code = "yinyuan_fallback_to_bazi"
+
+    if raw_payload is None and topic == "wealth" and active_flags.get("wealth_year_v1"):
+        if target_years:
+            if len(target_years) > 3:
+                return (
+                    "呀哈～这类多年财运对比我可以看，但先帮我把范围收窄到最多 3 年，例如“今年和明年财运对比”或“2026 到 2028 年财运”。",
+                    {
+                        "topic": "wealth",
+                        "source": "wealth_year_clarify",
+                        "question_type": "clarify",
+                        "route_reason_code": "wealth_year_clarify",
+                    },
+                )
+            if len(target_years) == 1:
+                raw_payload = run_yuanfenju_wealth_year(
+                    tool_query,
+                    profile=profile,
+                    liu_year=target_years[0],
+                    enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+                )
+                route_reason_code = "wealth_year_hit"
+                if isinstance((raw_payload or {}).get("error"), dict) and str((raw_payload.get("error") or {}).get("code") or ""):
+                    provider_fallback_reason = str((raw_payload.get("error") or {}).get("code") or "wealth_year_fallback")
+                    raw_payload = None
+                    route_reason_code = "wealth_year_fallback_to_bazi"
+            else:
+                comparison_payloads = []
+                compare_failed = False
+                for year in target_years[:3]:
+                    yearly_payload = run_yuanfenju_wealth_year(
+                        tool_query,
+                        profile=profile,
+                        liu_year=year,
+                        enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+                    )
+                    if isinstance((yearly_payload or {}).get("error"), dict) and str((yearly_payload.get("error") or {}).get("code") or ""):
+                        provider_fallback_reason = str((yearly_payload.get("error") or {}).get("code") or "wealth_compare_fallback")
+                        compare_failed = True
+                        break
+                    comparison_payloads.append(yearly_payload)
+                if not compare_failed and comparison_payloads:
+                    raw_payload = _merge_wealth_compare_payloads(comparison_payloads, target_years[: len(comparison_payloads)])
+                    route_reason_code = "wealth_year_compare_hit"
+                elif compare_failed:
+                    raw_payload = None
+                    route_reason_code = "wealth_year_compare_fallback_to_bazi"
+        else:
+            raw_payload = run_yuanfenju_wealth_profile(
+                tool_query,
+                profile=profile,
+                enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+            )
+            route_reason_code = "wealth_profile_hit"
+            if isinstance((raw_payload or {}).get("error"), dict) and str((raw_payload.get("error") or {}).get("code") or ""):
+                provider_fallback_reason = str((raw_payload.get("error") or {}).get("code") or "wealth_profile_fallback")
+                raw_payload = None
+                route_reason_code = "wealth_profile_fallback_to_bazi"
+
+    if raw_payload is None and active_flags.get("bazi_daily_v1") and _is_daily_window_query(q):
+        raw_payload = run_yuanfenju_bazi_daily(
+            tool_query,
+            profile=profile,
+            topic=topic,
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        route_reason_code = "bazi_daily_hit"
+        if isinstance((raw_payload or {}).get("error"), dict) and str((raw_payload.get("error") or {}).get("code") or ""):
+            provider_fallback_reason = str((raw_payload.get("error") or {}).get("code") or "bazi_daily_fallback")
+            raw_payload = None
+            route_reason_code = "bazi_daily_fallback_to_bazi"
+
+    if (
+        raw_payload is None
+        and active_flags.get("bazi_future_v1")
+        and len(target_years) == 1
+        and topic != "wealth"
+        and question_type == "trend"
+    ):
+        raw_payload = run_yuanfenju_bazi_future(
+            tool_query,
+            profile=profile,
+            yunshi_year=target_years[0],
+            topic=topic,
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        route_reason_code = "bazi_future_hit"
+        if isinstance((raw_payload or {}).get("error"), dict) and str((raw_payload.get("error") or {}).get("code") or ""):
+            provider_fallback_reason = str((raw_payload.get("error") or {}).get("code") or "bazi_future_fallback")
+            raw_payload = None
+            route_reason_code = "bazi_future_fallback_to_bazi"
+
+    if raw_payload is None:
+        raw_payload = run_yuanfenju_bazi_cesuan(
+            tool_query,
+            profile=profile,
+            topic=topic,
+            enable_merchant_probe=bool(active_flags.get("merchant_probe_v1")),
+        )
+        if provider_fallback_reason and not str(raw_payload.get("provider_fallback_reason") or "").strip():
+            raw_payload["provider_fallback_reason"] = provider_fallback_reason
+    if isinstance(raw_payload, dict):
+        raw_payload["profile_gender"] = _normalize_gender(str(profile.get("gender") or ""))
+
+    payload = _finalize_fortune_payload(
+        raw_payload,
+        topic=topic,
+        question_type=question_type,
+        route_reason_code=route_reason_code,
+        anchor=anchor,
+        window_meta=window_meta,
     )
+    if route_reason_code == "wealth_year_compare_hit":
+        payload["question_type"] = "comparison"
     if active_flags.get("render_v2"):
         return (
             render_user_fortune_reply_v2(
                 payload,
                 topic,
                 query=q,
-                question_type=question_type,
+                question_type="comparison" if route_reason_code == "wealth_year_compare_hit" else question_type,
                 window_meta=window_meta,
                 session_id=session_id,
             ),
@@ -4017,10 +5138,12 @@ def _build_identity_fact_reply(query: str, profile: dict | None = None) -> str:
     q = str(query or "").strip()
     p = profile or {}
     address = _pick_address_name(p, user_query=q)
+    preferred_name = _sanitize_preferred_name(str(p.get("preferred_name") or "").strip())
+    legal_name = str(p.get("name") or "").strip()
     if _is_asking_own_name(q):
-        name = str(p.get("preferred_name") or "").strip() or str(p.get("name") or "").strip()
+        name = preferred_name or legal_name
         if name:
-            return f"{address}叫{name}呀。"
+            return f"记得呀，你叫{name}。"
         return "本鼠鼠这边还没记住你的名字。你告诉我一次，我就接着记。"
     ask_birthdate = _is_asking_own_birthdate(q)
     ask_birthtime = _is_asking_own_birthtime(q)
@@ -4046,7 +5169,7 @@ def _build_identity_fact_reply(query: str, profile: dict | None = None) -> str:
                 return f"{address}出生在{time_cn}。"
             return "本鼠鼠这边还没把你的出生时段记下来。你告诉我一次，我就接着记。"
     if re.search(r"(你记得我吗|你记得我是谁吗|我是谁你还记得吗)", q):
-        name = str(p.get("preferred_name") or "").strip() or str(p.get("name") or "").strip()
+        name = preferred_name or legal_name
         if name:
             return f"当然记得，你是{name}。"
         return "本鼠鼠记得你来过，不过名字这边我还没记全。"
@@ -4059,7 +5182,7 @@ def strip_profile_echo(text: str, profile: dict | None = None, user_query: str =
         return out
     p = profile or {}
     name = str(p.get("name") or "").strip()
-    preferred_name = str(p.get("preferred_name") or "").strip()
+    preferred_name = _sanitize_preferred_name(str(p.get("preferred_name") or "").strip())
     birthdate = str(p.get("birthdate") or "").strip()
     birthtime = str(p.get("birthtime") or "").strip()
 
@@ -4670,7 +5793,7 @@ async def chat(request: Request, payload: ChatRequest):
     session_id = ""
     user_id = 0
     time_anchor = build_time_anchor()
-    flag_snapshot = dict(V2_FLAG_DEFAULTS)
+    flag_snapshot = dict(FEATURE_FLAG_DEFAULTS)
     flag_reason_code = "none"
     domain_intent = "general"
     question_type = "default"
@@ -4717,14 +5840,22 @@ async def chat(request: Request, payload: ChatRequest):
                 extracted["preferred_name"] = pending_name
                 extracted["preferred_name_confidence"] = pending_conf
         profile = merge_session_profile(session_id, extracted)
+        profile_seed_only = _is_profile_seed_only_query(query, extracted)
         preferred_name_set_this_turn = bool(str(extracted.get("preferred_name") or "").strip())
         if preferred_name_set_this_turn:
             _set_preferred_name_prompt_pending(session_id, False)
-        should_probe_preferred_name = _is_name_intro_query(query, extracted) and not str(profile.get("preferred_name") or "").strip()
+        should_probe_preferred_name = (
+            _is_name_intro_query(query, extracted)
+            and not profile_seed_only
+            and not str(profile.get("preferred_name") or "").strip()
+        )
 
         def _postprocess_output(raw_output: str, qtype: str = question_type) -> str:
-            out = sanitize_output(raw_output, user_query=query, profile=profile)
-            chosen = str(profile.get("preferred_name") or "").strip()
+            if qtype == "profile_seed":
+                out = str(raw_output or "").strip()
+            else:
+                out = sanitize_output(raw_output, user_query=query, profile=profile)
+            chosen = _sanitize_preferred_name(str(profile.get("preferred_name") or "").strip())
             if preferred_name_set_this_turn and chosen and chosen not in out:
                 out = f"好呀～那我就叫你{chosen}。\n\n{out}"
             out = maybe_append_preferred_name_probe(
@@ -4771,6 +5902,36 @@ async def chat(request: Request, payload: ChatRequest):
                 question_type=question_type,
             )
             return response_data
+        if profile_seed_only:
+            out = _postprocess_output(_build_profile_seed_reply(profile, extracted), qtype="profile_seed")
+            _append_chat_history(
+                chat_message_history,
+                query,
+                out,
+                user_id=user_id,
+                session_id=session_id,
+                question_type="profile_seed",
+                route_path="profile_seed",
+            )
+            track_output_quality(
+                session_id,
+                out,
+                profile=profile,
+                query=query,
+                question_type="profile_seed",
+            )
+            _log_route_observability(
+                route_path="profile_seed",
+                reason_code="profile_seed_capture",
+                flag_snapshot=flag_snapshot,
+                domain_intent=domain_intent,
+                question_type="profile_seed",
+            )
+            return {
+                "session_id": session_id,
+                "output": out,
+                "extra": _build_fortune_chat_extra(fortune_payload),
+            }
         dream_reply, dream_meta = route_dream_pipeline(query)
         if dream_reply is not None:
             out = _postprocess_output(dream_reply)
@@ -4804,14 +5965,19 @@ async def chat(request: Request, payload: ChatRequest):
                 "session_id": session_id,
                 "output": out,
             }
-        zodiac_reply, zodiac_meta = route_zodiac_pipeline(query, allow_clarify=bool(flags.get("clarify_v2")))
+        zodiac_reply, zodiac_meta = route_zodiac_pipeline(
+            query,
+            allow_clarify=bool(flags.get("clarify_v2")),
+            flags=flags,
+            profile=profile,
+        )
         if zodiac_reply is not None:
             if is_fortune_intent:
                 _metric_incr("fortune_route_hit_total")
             z_qtype = str(((zodiac_meta or {}).get("question_type") if isinstance(zodiac_meta, dict) else "") or question_type)
             z_reason = flag_reason_code
             z_route = "zodiac_pipeline"
-            if isinstance(zodiac_meta, dict) and str(zodiac_meta.get("source") or "") == "zodiac_clarify":
+            if isinstance(zodiac_meta, dict) and str(zodiac_meta.get("source") or "") in {"zodiac_clarify", "shengxiao_clarify"}:
                 z_reason = "zodiac_sign_missing"
                 z_route = "zodiac_clarify"
             out = _postprocess_output(zodiac_reply, qtype=z_qtype)
@@ -4912,11 +6078,24 @@ async def chat(request: Request, payload: ChatRequest):
                 f"{time_anchor.get('today_cn')}，{time_anchor.get('weekday_cn')}（{time_anchor.get('tz_name')}，{time_anchor.get('utc_offset')}）。"
                 f"若涉及“近几天”，默认窗口：{window_text}。不要沿用历史轮次中的旧日期。"
             )
+        elif domain_intent == "general" and question_type != "identity_fact":
+            _metric_incr("general_history_isolation_total")
+            isolated_id = f"{session_id}:general:{uuid.uuid4().hex[:8]}"
+            agent_history = RedisChatMessageHistory(url=REDIS_URL, session_id=isolated_id, ttl=120)
+            context_note = build_ellipsis_context_note(query, chat_message_history)
         else:
             agent_history = chat_message_history
             context_note = build_ellipsis_context_note(query, chat_message_history)
         style_instruction = build_style_instruction(query, emotion_level, session_id)
-        profile_context = build_profile_context(profile)
+        if domain_intent in {"general", "time"} and question_type != "identity_fact":
+            general_guardrail = "这是通用问答，不要扩展成八字、星座、生肖、流年或出生资料分析。直接回答用户问题即可。"
+            context_note = f"{context_note}\n{general_guardrail}".strip() if context_note else general_guardrail
+        profile_context = build_profile_context(
+            profile,
+            domain_intent=domain_intent,
+            question_type=question_type,
+            user_query=query,
+        )
         #给每个用户赋予一个单独的会话id，为了区分每个用户
         #给每个用户一个单独的session_id，真实的业务场景用户会话管理模块去做这个事
         logger.info(f"用户session_id: {session_id}")

@@ -12,7 +12,8 @@ import requests
 class Case:
     cid: str
     query: str
-    expected: str  # missing_profile | fortune_detail | divination | general | clarify | colloquial | decision
+    expected: str  # missing_profile | fortune_detail | divination | dream_detail | general | clarify | colloquial | decision | zodiac_detail
+    phase: str = "post_seed"  # pre_seed | post_seed
 
 
 def pick_phone() -> str:
@@ -151,6 +152,20 @@ def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: s
             return False, "命理回答被时间对齐模板覆盖"
         if len(text.strip()) < 40:
             return False, "命理解读过短"
+        if case.cid == "LOVE-001":
+            if has_pattern(text, r"(最近三天|接下来这三天|3月8日到3月10日|48小时)"):
+                return False, "姻缘趋势被错误收缩成短时窗"
+            if not has_action_guidance(text):
+                return False, "姻缘趋势缺少行动建议"
+            return True, "姻缘趋势时间尺度正常"
+        if case.cid == "LOVE-002":
+            if not has_pattern(text, r"(男生|女生|他|她)"):
+                return False, "正缘画像未按性别给出明确画像"
+            if not contains_any(text, ["外在样子", "家庭", "事业财运", "缘分线索", "相处", "运势"], min_hit=3):
+                return False, "正缘画像缺少完整画像维度"
+            if not has_action_guidance(text):
+                return False, "正缘画像缺少行动建议"
+            return True, "正缘画像已覆盖完整字段"
         has_analysis_signal = contains_any(
             text,
             ["命理", "运势", "财运", "事业", "感情", "学业", "流年", "八字", "日主", "五行", "时间窗口", "近期", "本周", "下周"],
@@ -165,12 +180,19 @@ def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: s
         return True, "命理解读语义完整"
 
     if case.expected == "clarify":
-        has_sign_request = bool(re.search(r"(告诉我你的星座|先告诉我.*星座|你是哪个星座|什么星座)", text))
-        return has_sign_request, "应进入星座缺信息澄清"
+        has_clarify_request = bool(re.search(r"(告诉我|先告诉我|直接告诉我|请补充).*(出生年月日|出生日期|星座|生肖|属相)", text))
+        return has_clarify_request, "应进入资料缺失澄清"
 
     if case.expected == "colloquial":
         if not has_explicit_window(text):
             return False, "口语时窗未命中（缺少明确时间窗口）"
+        if re.search(r"(领证|搬家)", str(case.query or "")) and "更适合" in text and "：凶；" in text:
+            return False, "推荐日期中混入凶日"
+        if re.search(r"(领证|搬家)", str(case.query or "")):
+            if "宜：" in text or "忌：" in text:
+                return False, "择时回答仍在原样回显宜忌词表"
+            if not re.search(r"(更推荐|理由|适合把|不建议同天|越简单越顺|把重点放在)", text):
+                return False, "择时回答缺少用户可理解的建议和理由"
         return True, "口语时窗命中"
 
     if case.expected == "decision":
@@ -200,10 +222,61 @@ def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: s
             return False, "占卜语义不完整"
         return True, "占卜语义命中"
 
+    if case.expected == "dream_detail":
+        if len(text.strip()) < 20:
+            return False, "解梦回答过短"
+        if has_pattern(text, r"(工具没收到有效信息|输入格式没对上|线索有点散|没能跑出具体分析)"):
+            return False, "解梦仍落在工具失败降级文案"
+        has_dream_signal = contains_any(text, ["梦", "寓意", "象征", "提示", "情绪"], min_hit=1)
+        if not has_dream_signal:
+            return False, "解梦语义不完整"
+        return True, "解梦语义命中"
+
+    if case.expected == "zodiac_detail":
+        if asks_for_profile(text):
+            return False, "已有生日资料后仍触发星座/生肖澄清"
+        if len(text.strip()) < 20:
+            return False, "星座/生肖回答过短"
+        if "可参考这些信号" in text:
+            return False, "星座/生肖回答仍是字段平铺"
+        if "参考强度" in text or "参考分值" in text:
+            return False, "星座/生肖回答仍包含参考强度或参考分值"
+        if has_pattern(text, r"(八字|四柱|日主|喜用|忌神|五行|地支|天干)"):
+            return False, "星座/生肖回答混入八字术语"
+        if not contains_any(text, ["感情：", "事业：", "财运：", "状态：", "幸运提示：", "行动建议："], min_hit=1):
+            return False, "星座/生肖回答缺少结构化重点"
+        if "本周" in case.query and "本周" not in text and "这周" not in text:
+            return False, "本周问法未按本周时间尺度作答"
+        if ("今日" in case.query or "今天" in case.query) and "今日" not in text and "今天" not in text:
+            return False, "今日问法未按今日时间尺度作答"
+        if case.query in {"帮我看一下星座运势", "帮我看生肖运势"} and ("今日" in text and "本周" not in text and "这周" not in text):
+            return False, "泛运势问法仍默认收缩到今日"
+        has_zodiac_signal = bool(
+            re.search(
+                r"(白羊座|金牛座|双子座|巨蟹座|狮子座|处女座|天秤座|天蝎座|射手座|摩羯座|水瓶座|双鱼座|"
+                r"属[鼠牛虎兔龙蛇马羊猴鸡狗猪])",
+                text,
+            )
+        )
+        if not has_zodiac_signal:
+            return False, "星座/生肖标识缺失"
+        return True, "星座/生肖接口命中"
+
     if case.expected == "general":
         if _is_identity_query(case.query):
             if re.search(r"(200\d|201\d|202\d)年", text) and "生日" not in text:
                 return False, "身份问答出现疑似编造出生细节"
+            if profile_name and profile_name not in text:
+                return False, "身份问答未返回已知姓名"
+            if profile_name and f"{profile_name}叫{profile_name}" in text:
+                return False, "身份问答仍是生硬回显句式"
+        else:
+            if has_pattern(
+                text,
+                r"(八字|日主|五行|流年|天干|地支|喜用|忌神|四柱|命盘|属[鼠牛虎兔龙蛇马羊猴鸡狗猪]|"
+                r"白羊座|金牛座|双子座|巨蟹座|狮子座|处女座|天秤座|天蝎座|射手座|摩羯座|水瓶座|双鱼座)",
+            ):
+                return False, "通用问答混入命理推演"
         ok = len(text.strip()) > 0 and "Traceback" not in text
         return ok, "通用问答异常或空输出"
 
@@ -212,38 +285,33 @@ def assert_case(case: Case, output: str, profile_name: str, profile_birthdate: s
 
 def build_cases() -> list[Case]:
     return [
-        Case("FORTUNE-001", "给我算一下今日运势", "missing_profile"),
-        Case("GENERAL-001", "我叫测试甲，2002-03-14出生。", "general"),
+        Case("FORTUNE-001", "给我算一下今日运势", "missing_profile", phase="pre_seed"),
+        Case("CLARIFY-001", "帮我看一下星座运势", "clarify", phase="pre_seed"),
+        Case("CLARIFY-002", "帮我看生肖运势", "clarify", phase="pre_seed"),
         Case("TIME-001", "今年是多少年", "general"),
         Case("TREND-001", "分析一下我今年的运势", "fortune_detail"),
+        Case("YEAR-001", "明年运势", "fortune_detail"),
+        Case("WEALTH-001", "2027年财运如何", "fortune_detail"),
         Case("TREND-002", "今年和明年财运对比", "fortune_detail"),
         Case("TREND-003", "未来三年运势", "fortune_detail"),
-        Case("CLARIFY-001", "帮我看一下星座运势", "clarify"),
+        Case("ZODIAC-001", "帮我看一下星座运势", "zodiac_detail"),
+        Case("ZODIAC-002", "白羊座本周运势", "zodiac_detail"),
+        Case("SHENGXIAO-001", "帮我看生肖运势", "zodiac_detail"),
+        Case("SHENGXIAO-002", "属龙今日运势", "zodiac_detail"),
         Case("COLLOQUIAL-001", "我近哪几天气场更顺？", "colloquial"),
+        Case("ZESHI-001", "下周哪天适合领证", "colloquial"),
+        Case("ZESHI-002", "下周哪天适合搬家", "colloquial"),
         Case("DECISION-001", "我这个月财运上该先开源还是先守财？", "decision"),
-        Case("IDENTITY-001", "我叫什么你记得吗", "general"),
-        Case("FORTUNE-002", "我今天财运如何？", "fortune_detail"),
-        Case("FORTUNE-003", "帮我看看最近事业运", "fortune_detail"),
-        Case("FORTUNE-004", "我这周感情运的关键点是什么？", "fortune_detail"),
-        Case("FORTUNE-005", "最近学业运会不会拖后腿？", "fortune_detail"),
-        Case("FORTUNE-006", "给我看下流年走势", "fortune_detail"),
-        Case("FORTUNE-007", "今天运势里我适合冲刺还是稳住？", "fortune_detail"),
-        Case("FORTUNE-008", "最近事业运里的贵人运怎么样？", "fortune_detail"),
-        Case("FORTUNE-009", "最近财运里的风险点是什么？", "fortune_detail"),
-        Case("FORTUNE-010", "请按命理说下我最近一个月财运节奏", "fortune_detail"),
-        Case("FORTUNE-011", "我这段时间最该避免什么决策？", "fortune_detail"),
-        Case("FORTUNE-012", "现在是适合换岗还是先积累？", "fortune_detail"),
-        Case("FORTUNE-013", "我的感情运是在回暖还是降温？", "fortune_detail"),
-        Case("FORTUNE-014", "今天最旺的行动方向是什么？", "fortune_detail"),
-        Case("FORTUNE-015", "我该在哪个领域更容易提运？", "fortune_detail"),
+        Case("LOVE-001", "我的姻缘趋势", "fortune_detail"),
+        Case("LOVE-002", "我的正缘画像是什么样", "fortune_detail"),
         Case("DIV-001", "请帮我摇一卦", "divination"),
         Case("DIV-002", "我想占卜一下今天适不适合谈合作", "divination"),
-        Case("GENERAL-002", "我最近焦虑，怎么调节睡眠？", "general"),
-        Case("GENERAL-003", "给我一个今天能执行的小目标", "general"),
-        Case("GENERAL-004", "我和同事沟通总卡壳，怎么办？", "general"),
-        Case("GENERAL-005", "如何减少自我怀疑？", "general"),
-        Case("FORTUNE-016", "结合命理给我三条本周行动建议", "fortune_detail"),
-        Case("FORTUNE-017", "我现在整体运势的风险点是什么？", "fortune_detail"),
+        Case("DREAM-001", "梦见蛇是什么意思", "dream_detail"),
+        Case("FORTUNE-002", "帮我看看最近事业运", "fortune_detail"),
+        Case("FORTUNE-003", "我今天财运如何？", "fortune_detail"),
+        Case("GENERAL-001", "我最近焦虑，怎么调节睡眠？", "general"),
+        Case("GENERAL-002", "给我一个今天能执行的小目标", "general"),
+        Case("GENERAL-003", "我叫什么你记得吗", "general"),
     ]
 
 
@@ -253,7 +321,7 @@ def main() -> int:
     parser.add_argument("--phone", default="", help="指定手机号；不传则自动生成")
     parser.add_argument("--password", default="abc12345", help="注册密码")
     parser.add_argument("--timeout", type=int, default=60, help="请求超时秒数")
-    parser.add_argument("--max-cases", type=int, default=24, help="最多执行的用例数")
+    parser.add_argument("--max-cases", type=int, default=27, help="最多执行的用例数")
     parser.add_argument(
         "--seed-profile-query",
         default="我叫测试甲，2002-03-14出生，我是女生。",
@@ -299,8 +367,8 @@ def main() -> int:
     profile_name = "测试甲"
     profile_birthdate = "2002-03-14"
     all_cases = build_cases()[: max(1, args.max_cases)]
-    pre_seed_cases = [case for case in all_cases if case.cid == "FORTUNE-001"]
-    post_seed_cases = [case for case in all_cases if case.cid != "FORTUNE-001"]
+    pre_seed_cases = [case for case in all_cases if case.phase == "pre_seed"]
+    post_seed_cases = [case for case in all_cases if case.phase != "pre_seed"]
 
     passed = 0
     failed = 0
