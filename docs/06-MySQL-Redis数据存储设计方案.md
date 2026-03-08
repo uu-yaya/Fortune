@@ -1,37 +1,43 @@
 # MySQL + Redis 数据存储设计方案
 
+- 更新日期：2026-03-08
+- 目标：说明当前主线实现下，MySQL 与 Redis 的分工、键设计和运维要求。
+
 ## 1. 目标与原则
+
 - 支持两种登录方式：`手机号+验证码`、`账号+密码`
 - 支持忘记密码：`手机号+验证码`重置
 - 一个手机号唯一对应一个用户
-- 注册自动生成：`uuid`（系统唯一标识）、`account`（短账号）
+- 注册自动生成：`uuid`、`account`
 - 用户资料与历史可跨会话恢复，不依赖浏览器本地存储
-- MySQL 作为真数据源（SoT），Redis 作为高性能临时态与缓存
-
----
+- MySQL 作为真数据源，Redis 作为高性能临时态与缓存
+- 命理主链路当前把 `gender` 视为关键资料字段
 
 ## 2. 存储分工
 
 ### 2.1 MySQL（持久层）
+
 - 用户主数据（账号、手机号、密码哈希）
-- 用户画像资料（姓名、出生日期、出生时刻等）
+- 用户画像资料（姓名、出生日期、出生时刻）
+- `profile_json` 扩展资料（称呼偏好、性别等）
 - 会话审计记录
-- 聊天消息持久化（可选异步落库）
+- 聊天消息持久化（预留）
 - 短信发送/校验审计日志
 - 密码重置审计日志
 
 ### 2.2 Redis（高速层）
+
 - 登录态 Session（token 映射用户）
 - 验证码与冷却计时
 - 短期聊天上下文（最近 N 轮）
-- 限流计数器
-- 热点资料缓存
-
----
+- provider flag
+- merchant probe 缓存
+- 质量指标聚合
 
 ## 3. MySQL 逻辑模型
 
-## 3.1 `users` 用户主表
+### 3.1 `users` 用户主表
+
 - `id` bigint PK auto_increment
 - `uuid` char(32) not null unique
 - `account` varchar(24) not null unique
@@ -43,20 +49,32 @@
 - `updated_at` datetime not null
 
 说明：
-- `account` 自动生成，建议格式：`JIYI-` + 6~8位大写字母数字。
-- `password_hash` 必须为哈希值（bcrypt/argon2），不落明文密码。
 
-## 3.2 `user_profile` 用户资料表
+- `account` 自动生成，格式为 `JIYI-XXXXXXXX`
+- `password_hash` 存哈希，不落明文密码
+
+### 3.2 `user_profile` 用户资料表
+
 - `user_id` bigint PK（FK -> users.id）
 - `name` varchar(64) null
 - `birth_date` date null
 - `birth_time` time null
 - `gender` tinyint null
 - `timezone` varchar(64) null default 'Asia/Shanghai'
-- `profile_json` json null（扩展资料）
+- `profile_json` json null
 - `updated_at` datetime not null
 
-## 3.3 `auth_sessions` 登录会话表（审计）
+说明：
+
+- 代码当前主读 `name / birth_date / birth_time + profile_json`
+- `profile_json` 至少承载：
+  - `preferred_name`
+  - `preferred_name_confidence`
+  - `name_confidence`
+  - `gender`
+
+### 3.3 `auth_sessions` 登录会话表（审计）
+
 - `id` bigint PK auto_increment
 - `user_id` bigint not null（FK -> users.id）
 - `token_hash` char(64) not null unique
@@ -67,7 +85,8 @@
 - `created_at` datetime not null
 - `revoked_at` datetime null
 
-## 3.4 `chat_messages` 聊天消息表（建议异步写入）
+### 3.4 `chat_messages` 聊天消息表（预留）
+
 - `id` bigint PK auto_increment
 - `user_id` bigint not null
 - `session_id` varchar(64) not null
@@ -76,11 +95,8 @@
 - `meta_json` json null
 - `created_at` datetime not null
 
-索引：
-- `idx_chat_user_time (user_id, created_at)`
-- `idx_chat_session_time (session_id, created_at)`
+### 3.5 `sms_code_logs` 验证码日志表
 
-## 3.5 `sms_code_logs` 验证码日志表
 - `id` bigint PK auto_increment
 - `phone` varchar(20) not null
 - `scene` enum('login','register','reset_password') not null
@@ -89,15 +105,14 @@
 - `created_at` datetime not null
 - `verified_at` datetime null
 
-## 3.6 `password_reset_logs` 密码重置日志表
+### 3.6 `password_reset_logs` 密码重置日志表
+
 - `id` bigint PK auto_increment
 - `user_id` bigint not null
 - `phone` varchar(20) not null
 - `reset_at` datetime not null
 - `ip` varchar(64) null
 - `user_agent` varchar(255) null
-
----
 
 ## 4. MySQL 建表 SQL（参考）
 
@@ -179,25 +194,39 @@ CREATE TABLE IF NOT EXISTS password_reset_logs (
 
 ## 5. Redis Key 设计
 
-## 5.1 登录会话
-- `auth:session:{token}` -> JSON `{user_id, uuid, account, phone}`，TTL=`30d`
+### 5.1 登录会话
 
-## 5.2 验证码与冷却
+- `auth:session:{token}` -> JSON `{phone, user_uuid}`，TTL=`30d`
+
+### 5.2 验证码与冷却
+
 - `auth:sms:{scene}:{phone}` -> `code_hash`，TTL=`300s`
 - `auth:sms:cooldown:{scene}:{phone}` -> `1`，TTL=`60s`
 
-## 5.3 忘记密码校验通过态
+### 5.3 忘记密码校验通过态
+
 - `auth:pwdreset:verified:{phone}` -> `1`，TTL=`600s`
 
-## 5.4 聊天上下文
-- `chat:ctx:{uuid}` -> 最近 N 轮对话（List/JSON），TTL=`7d~30d`
+### 5.4 聊天上下文
 
-## 5.5 热缓存
-- `user:profile:{user_id}` -> profile json，TTL=`10m~60m`
+- `RedisChatMessageHistory(session_id=user_uuid)` -> 最近 N 轮对话，TTL=`SESSION_TTL_SECONDS`
+- `chat:preferred_name_prompt:{session_id}` -> 是否需要追问称呼偏好
 
-## 5.6 限流
-- `ratelimit:sms:{phone}:{yyyyMMddHHmm}` -> 计数，TTL=`120s~300s`
-- `ratelimit:chat:{user_id}:{yyyyMMddHHmm}` -> 计数，TTL=`120s`
+### 5.5 特性开关与 probe
+
+- `jiyi:feature_flags:v2` -> V2 / provider 开关
+- `yuanfenju:merchant_probe:*` -> 缘分居额度与会员状态探测缓存
+
+### 5.6 质量指标
+
+- `jiyi:quality:metrics:{yyyymmdd}`
+- `jiyi:quality:unique_output:{yyyymmdd}`
+- `jiyi:quality:recent_output:{yyyymmdd}`
+
+### 5.7 限流
+
+- `ratelimit:sms:{phone}:{yyyyMMddHHmm}`
+- `ratelimit:chat:{user_id}:{yyyyMMddHHmm}`
 
 ---
 
@@ -218,29 +247,17 @@ CREATE TABLE IF NOT EXISTS password_reset_logs (
 ---
 
 ## 7. 一致性与容灾
+
 - MySQL 为最终一致基准；Redis 丢失可由 MySQL 回填
-- 写资料采用：先写 MySQL，再删/刷新 Redis 缓存
-- 聊天消息可先写 Redis，异步批量落 MySQL
-- 定时任务：
-  - 清理过期会话审计
-  - 清理历史验证码日志
-  - 归档长期聊天记录
+- 写资料采用：先写 MySQL，再刷新 Redis 会话视图
+- 聊天消息当前主要保存在 Redis 短期上下文里
+- merchant probe 与质量指标属于可重建缓存
 
 ---
 
-## 8. 与当前项目的迁移步骤
-1. 新增 MySQL 连接与 DAO 层（用户、资料、认证、消息）
-2. 保留现有 API 路径，替换内存字典实现
-3. 把 `output/auth_state.json` 迁移到 `users/user_profile`
-4. 把验证码与登录态切换为 Redis Key
-5. `chat` 统一按 `uuid` 拉资料与历史，前端不再承担会话持久化职责
-6. 上线前做压测与风控阈值调优（验证码、登录、聊天）
+## 8. 当前运维建议
 
----
-
-## 9. 验收标准
-- 清空浏览器本地存储后，重新登录仍可恢复账号与历史资料
-- 同一手机号不可重复注册
-- 账号+密码登录与手机号+验证码登录均可用
-- 忘记密码流程可闭环，且旧密码失效
-- 聊天可读取历史上下文与用户资料，跨 session 连续
+1. MySQL 至少每日备份
+2. Redis 选择合适的持久化策略
+3. 发布前确认 `gender` 与 `preferred_name` 的资料读写无回归
+4. 如果 provider 调整了额度探测或新增缓存键，及时同步 `03` 与 `06`
