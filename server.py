@@ -1917,41 +1917,103 @@ def _soften_fortune_section_headings(text: str) -> str:
     lines = out.splitlines()
     softened: list[str] = []
     pending_advice_intro = False
+    seed_text = out
     for raw_line in lines:
         line = str(raw_line or "").strip()
         if not line:
             if softened and softened[-1] != "":
                 softened.append("")
             continue
-        if re.match(r"^参考置信度[:：]", line):
+        lead_stripped = re.sub(r"^(?:[呀哼嗯呜哈哦啊啦～~，,。!！…\s]+)", "", line).strip()
+        if re.match(r"^参考置信度[:：]", lead_stripped):
             continue
-        if re.match(r"^结论[:：]", line):
-            body = re.sub(r"^结论[:：]\s*", "", line).strip()
-            softened.append(f"先跟你说重点，{body}")
+        if re.match(r"^结论[:：]", lead_stripped):
+            body = re.sub(r"^结论[:：]\s*", "", lead_stripped).strip()
+            softened.append(
+                _pick_non_repeat(
+                    [
+                        f"本鼠鼠先跟你说重点呀，{body}",
+                        f"先把最要紧的一句递给你：{body}",
+                        f"我先把答案轻轻放前面，{body}",
+                        f"先别急，本鼠鼠先把重点捧给你：{body}",
+                    ],
+                    f"{seed_text}|conclusion|{body}",
+                )
+            )
             pending_advice_intro = False
             continue
-        if re.match(r"^(依据|命理依据)[:：]", line):
-            body = re.sub(r"^(依据|命理依据)[:：]\s*", "", line).strip()
-            softened.append(f"我会这么看，是因为{body}")
+        if re.match(r"^(依据|命理依据)[:：]", lead_stripped):
+            body = re.sub(r"^(依据|命理依据)[:：]\s*", "", lead_stripped).strip()
+            softened.append(
+                _pick_non_repeat(
+                    [
+                        f"我会这么想呀，是因为{body}",
+                        f"我会往这个方向看，是因为{body}",
+                        f"这层意思会冒出来，是因为{body}",
+                        f"本鼠鼠会这样判断，主要是因为{body}",
+                    ],
+                    f"{seed_text}|basis|{body}",
+                )
+            )
             pending_advice_intro = False
             continue
-        if re.match(r"^命理信号[:：]", line):
-            body = re.sub(r"^命理信号[:：]\s*", "", line).strip()
-            softened.append(f"盘面里更明显的一笔是：{body}")
+        if re.match(r"^命理信号[:：]", lead_stripped):
+            body = re.sub(r"^命理信号[:：]\s*", "", lead_stripped).strip()
+            softened.append(
+                _pick_non_repeat(
+                    [
+                        f"盘面里最冒头的小信号是：{body}",
+                        f"这会儿最扎眼的一笔，其实是：{body}",
+                        f"本鼠鼠瞄到最明显的线头是：{body}",
+                        f"盘里先跳出来提醒人的，是这句：{body}",
+                    ],
+                    f"{seed_text}|signal|{body}",
+                )
+            )
             pending_advice_intro = False
             continue
-        if re.match(r"^工具验证[:：]", line):
-            body = re.sub(r"^工具验证[:：]\s*", "", line).strip()
-            softened.append(f"我又顺手交叉看了一眼：{body}")
+        if re.match(r"^工具验证[:：]", lead_stripped):
+            body = re.sub(r"^工具验证[:：]\s*", "", lead_stripped).strip()
+            softened.append(
+                _pick_non_repeat(
+                    [
+                        f"本鼠鼠又悄悄交叉看了一眼：{body}",
+                        f"我顺手多比对了一下，看到的是：{body}",
+                        f"我又偷偷核了一遍细节，落下来是：{body}",
+                        f"顺着这条线再查一眼，会发现：{body}",
+                    ],
+                    f"{seed_text}|tool|{body}",
+                )
+            )
             pending_advice_intro = False
             continue
-        if re.match(r"^五行分布[:：]", line):
-            body = re.sub(r"^五行分布[:：]\s*", "", line).strip()
-            softened.append(f"五行这边大概是：{body}")
+        if re.match(r"^五行分布[:：]", lead_stripped):
+            body = re.sub(r"^五行分布[:：]\s*", "", lead_stripped).strip()
+            softened.append(
+                _pick_non_repeat(
+                    [
+                        f"五行这边大概是：{body}",
+                        f"五行落下来差不多是：{body}",
+                        f"如果把五行摊开来瞧，大概是：{body}",
+                        f"五行这一盘轻轻一看，大概是：{body}",
+                    ],
+                    f"{seed_text}|wuxing|{body}",
+                )
+            )
             pending_advice_intro = False
             continue
-        if re.match(r"^(建议|行动建议)[:：]?\s*$", line):
-            softened.append("你现在可以先这样做：")
+        if re.match(r"^(建议|行动建议|可执行建议)[:：]?\s*$", lead_stripped):
+            softened.append(
+                _pick_non_repeat(
+                    [
+                        "你现在可以先这样动一动：",
+                        "要是想马上上手，可以先做这几步：",
+                        "本鼠鼠给你收成几个顺手动作：",
+                        "先别急着全做完，挑这几件开始就行：",
+                    ],
+                    f"{seed_text}|advice_intro",
+                )
+            )
             pending_advice_intro = True
             continue
         if pending_advice_intro and re.match(r"^\d+\.\s*", line):
