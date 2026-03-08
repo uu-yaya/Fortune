@@ -589,6 +589,14 @@ def case_love_profile_routes() -> dict[str, Any]:
             question_type="default",
             session_id="love-zhengyuan",
         )
+        _, payload_b2 = server.route_fortune_pipeline(
+            "我的正缘",
+            _complete_profile(),
+            time_anchor=server.build_time_anchor(),
+            flags=_full_flags(),
+            question_type="default",
+            session_id="love-zhengyuan-plain",
+        )
         _, payload_c = server.route_fortune_pipeline(
             "我什么时候适合结婚",
             _complete_profile(),
@@ -597,9 +605,10 @@ def case_love_profile_routes() -> dict[str, Any]:
             question_type="default",
             session_id="love-jiehun",
         )
-    assert called == ["yinyuan", "zhengyuan", "jiehun"], called
+    assert called == ["yinyuan", "zhengyuan", "zhengyuan", "jiehun"], called
     assert str((payload_a or {}).get("provider_id") or "") == "yuanfenju_yinyuan", payload_a
     assert str((payload_b or {}).get("provider_id") or "") == "yuanfenju_zhengyuan", payload_b
+    assert str((payload_b2 or {}).get("provider_id") or "") == "yuanfenju_zhengyuan", payload_b2
     assert str((payload_c or {}).get("provider_id") or "") == "yuanfenju_jiehun", payload_c
     return {"called": called}
 

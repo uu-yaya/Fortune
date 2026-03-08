@@ -670,7 +670,7 @@ function ensureImagePreviewModal() {
 }
 
 function openImagePreview(url, altText = '预览图片') {
-    const safeUrl = safeHttpUrl(url);
+    const safeUrl = safeHttpUrl(url) || safeDataImageUrl(url);
     if (!safeUrl) return;
     const modal = ensureImagePreviewModal();
     const img = modal.querySelector('.media-preview-image');

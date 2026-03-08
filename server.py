@@ -3520,7 +3520,16 @@ def _is_daily_window_query(query: str) -> bool:
 
 
 def _is_partner_profile_query(query: str) -> bool:
-    return bool(re.search(r"(正缘|另一半|配偶|对象).*(画像|特征|长相|样子|什么样)", str(query or "")))
+    q = str(query or "").strip()
+    if not q:
+        return False
+    if re.search(r"(正缘|另一半|配偶|对象).*(画像|特征|长相|样子|什么样)", q):
+        return True
+    if not re.search(r"(正缘|另一半|配偶|对象)", q):
+        return False
+    if re.search(r"(什么时候|何时|几岁|哪年|哪一年|多大|婚期|结婚|成婚|趋势|走向|专题|发展)", q):
+        return False
+    return True
 
 
 def _is_love_trend_query(query: str) -> bool:
@@ -4432,6 +4441,10 @@ def _render_jiehun_prediction_reply(payload: dict) -> str:
 def _build_fortune_chat_extra(payload: dict | None = None) -> dict:
     meta = payload if isinstance(payload, dict) else {}
     portrait = str(meta.get("partner_portrait_image") or "").strip()
+    if portrait.startswith("data:image/image/jpeg;base64,"):
+        portrait = portrait.replace("data:image/image/jpeg;base64,", "data:image/jpeg;base64,", 1)
+    elif portrait.startswith("data:image/image/png;base64,"):
+        portrait = portrait.replace("data:image/image/png;base64,", "data:image/png;base64,", 1)
     if portrait.startswith("data:image/"):
         return {
             "partner_portrait_image": portrait,
@@ -5930,7 +5943,6 @@ async def chat(request: Request, payload: ChatRequest):
             return {
                 "session_id": session_id,
                 "output": out,
-                "extra": _build_fortune_chat_extra(fortune_payload),
             }
         dream_reply, dream_meta = route_dream_pipeline(query)
         if dream_reply is not None:
@@ -6063,6 +6075,7 @@ async def chat(request: Request, payload: ChatRequest):
             return {
                 "session_id": session_id,
                 "output": out,
+                "extra": _build_fortune_chat_extra(fortune_payload),
             }
         time_sensitive = is_time_sensitive_query(query)
         if time_sensitive:
