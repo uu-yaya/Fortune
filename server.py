@@ -1843,6 +1843,73 @@ def _should_show_window_text(query: str, window_label: str, question_type: str =
     return False
 
 
+def _natural_window_line(query: str, window_text: str, window_label: str, question_type: str = "default") -> str:
+    q = str(query or "")
+    text = str(window_text or "").strip()
+    label = str(window_label or "").strip()
+    qtype = str(question_type or "default")
+    seed_text = f"{q}|{text}|{label}|{qtype}"
+    if not text:
+        return ""
+    if label == "today_only":
+        if re.search(r"(抽.*签|签文|签)", q):
+            return _pick_non_repeat(
+                [
+                    f"这支签我就先按{text}这一天来读呀。",
+                    f"这回签意先落在{text}这一天，比较贴你现在的气口，呜啦。",
+                    f"我先把这支签落到{text}这一天来看，会更准一点点呀。",
+                    f"这支签先照着{text}这一天来拆，本鼠鼠再陪你往下捋。",
+                ],
+                seed_text,
+            )
+        return _pick_non_repeat(
+            [
+                f"这回我就按{text}这一天来看呀。",
+                f"我先把目光落在{text}这一天哦，软软看一眼。",
+                f"这次先照着{text}这一天来判断，会更贴你当下的节奏呀。",
+                f"我先按{text}这个时间点来拆，免得看偏啦，呜啦。",
+            ],
+            seed_text,
+        )
+    if label in {"near_days", "two_days", "this_week", "next_week"}:
+        if qtype in {"trend", "colloquial"}:
+            return _pick_non_repeat(
+                [
+                    f"这几天我先按{text}这段时间来看呀。",
+                    f"我先把眼前这段气口收在{text}里，咱们慢慢拆，呜啦。",
+                    f"这回我先照着{text}这段时间来感应，会更贴近一点哦。",
+                    f"我先把这几天的范围落在{text}，这样本鼠鼠不容易看跑偏。",
+                ],
+                seed_text,
+            )
+        return _pick_non_repeat(
+            [
+                f"我先按{text}这段时间来判断呀。",
+                f"这件事我先照着{text}这段时间来推一推，软软看。",
+                f"我先把判断范围收在{text}这段时间里，会稳一点呀。",
+            ],
+            seed_text,
+        )
+    if re.search(r"(今年|本年|明年|后年|去年|前年|年度|全年|上半年|下半年)", q):
+        return _pick_non_repeat(
+            [
+                f"这回我就按{text}这段时间来看呀。",
+                f"我先把目光放在{text}这段时运里，慢慢陪你捋，呜啦。",
+                f"这次就沿着{text}这段时间来拆，会更稳当一点哦。",
+                f"我先顺着{text}这段运势走向来看，不着急哈，本鼠鼠在。",
+            ],
+            seed_text,
+        )
+    return _pick_non_repeat(
+        [
+            f"我先按{text}这个时间点来看呀。",
+            f"这回我先把时间落在{text}这个点上来看。",
+            f"我先顺着{text}这个时间点来拆，比较贴边呀。",
+        ],
+        seed_text,
+    )
+
+
 def _expected_year_from_query(query: str, time_anchor: dict) -> int | None:
     q = str(query or "")
     try:
@@ -1887,13 +1954,21 @@ def _build_time_safe_fallback(query: str, time_anchor: dict, window_meta: dict |
     utc_offset = str(time_anchor.get("utc_offset") or "")
     near_days = time_anchor.get("near_days") or []
     q = str(query or "")
+    if isinstance(window_meta, dict):
+        window_text = str(window_meta.get("window_text") or "").strip()
+        window_label = str(window_meta.get("label") or "").strip()
+        if window_text and _should_show_window_text(q, window_label, question_type="colloquial"):
+            return (
+                f"呀哈～我先把时间轻轻对齐一下：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。\n"
+                f"{_natural_window_line(q, window_text, window_label, question_type='colloquial')}"
+            )
     if NEAR_DAYS_QUERY_PATTERN.search(q) and near_days:
         window_text = "、".join(
-            [f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get("date_cn")]
+            [f"{d.get('date_cn')}（{d.get('weekday_cn')}）" for d in near_days if d.get('date_cn')]
         )
         return (
-            f"呀哈～我先把时间对齐：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。\n"
-            f"你问的“近几天”按这个窗口计算：{window_text}。"
+            f"呀哈～我先把时间轻轻对齐一下：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。\n"
+            f"这几天我先按{window_text}这段时间陪你慢慢看。"
         )
     return f"呀哈～先把时间对齐：现在是{now_cn}，{weekday_cn}（{tz_name}，{utc_offset}）。"
 
@@ -4611,7 +4686,9 @@ def _generate_fortune_reply_with_model(
         and window_text not in out
         and _should_show_window_text(q, window_label, question_type=str(question_type or "default"))
     ):
-        out = f"时间上先对齐：{window_text}。\n{out}"
+        natural_window_line = _natural_window_line(q, window_text, window_label, question_type=str(question_type or "default"))
+        if natural_window_line:
+            out = f"{natural_window_line}\n{out}"
     if window_text and not _should_show_window_text(q, window_label, question_type=str(question_type or "default")):
         lines = [ln for ln in out.splitlines() if ln.strip()]
         filtered: list[str] = []
@@ -4802,7 +4879,7 @@ def _render_user_fortune_reply_v2_legacy(
         window_text = str(window_meta.get("window_text") or "").strip()
         window_label = str(window_meta.get("label") or "").strip()
         if window_text and _should_show_window_text(query, window_label, question_type=question_type):
-            lines.append(f"时间窗口：{window_text}。")
+            lines.append(_natural_window_line(query, window_text, window_label, question_type=question_type))
 
     signal_line = _signal_for_topic(payload, topic)
     if signal_line:
@@ -4950,7 +5027,7 @@ def render_user_fortune_reply_v2(
         window_text = str(window_meta.get("window_text") or "").strip()
         window_label = str(window_meta.get("label") or "").strip()
         if window_text and _should_show_window_text(query, window_label, question_type=question_type):
-            window_line = f"时间窗口：{window_text}。"
+            window_line = _natural_window_line(query, window_text, window_label, question_type=question_type)
     signal_line = _signal_for_topic(payload, topic)
     basis = _basis_line(payload)
     advice = advice_for_sign
