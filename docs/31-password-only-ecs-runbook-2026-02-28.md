@@ -1,187 +1,60 @@
-# 31-Password-Only 首发上线手册（ECS + Compose）-2026-02-28
+# 31-Password-Only 专项上线手册（ECS + Compose）
 
-## 1. 目标
+- 更新日期：2026-03-08
+- 适用范围：仅在“短信能力未开通，需要临时切成账号密码首发模式”时使用
+- 注意：这不是当前项目默认部署流程；默认主线仍是完整鉴权能力
 
-在未接短信通道前，系统以 `账号密码登录 + 聊天` 对外提供服务，并通过 Nginx 禁用短信、注册和找回密码入口。
+## 1. 何时使用
 
-## 2. 适用范围
+仅在以下条件同时成立时使用本手册：
 
-- 部署形态：阿里云 ECS（Ubuntu）+ Docker Compose
-- 当前策略：不改应用代码，仅通过 `.env` 与 Nginx 配置实现 password-only
+1. 短信通道尚未开通或暂时不可用
+2. 需要先上线可登录、可聊天的最小版本
+3. 接受通过网关禁用注册/短信/找回密码入口
 
-## 3. 上线前准备
+如果不是上述场景，请不要按本文档部署，改看常规 ECS / Compose 部署流程。
 
-### 3.1 云侧
+## 2. 部署策略
 
-1. 新建 ECS（建议 `2C4G`，系统盘 `>=60GB`）。
-2. 绑定公网 IP。
-3. 安全组只放行 `22/80/443`，禁止暴露 `3306/6379`。
-4. 域名 `A` 记录解析到 ECS 公网 IP。
+核心思路：
 
-### 3.2 服务器初始化
+- 应用代码尽量不改
+- 通过 `.env` 与网关规则切换到 password-only
+- 账号由管理员预置
 
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker "$USER"
-```
+## 3. 关键配置
 
-## 4. 应用部署
-
-```bash
-sudo mkdir -p /opt/fortune-telling
-sudo chown -R "$USER":"$USER" /opt/fortune-telling
-cd /opt/fortune-telling
-git clone <your_repo_url> .
-```
-
-### 4.1 生产环境变量
-
-```bash
-cp deploy/env/.env.password-only.example .env
-```
-
-必须修改：
-
-- `DASHSCOPE_API_KEY`
-- `MYSQL_ROOT_PASSWORD`
-- 可选：`YUANFENJU_API_KEY`、`SERPAPI_API_KEY`
-
-必须保持：
+必须确认：
 
 - `SMS_PROVIDER=mock`
 - `SMS_DEBUG_CODE_ENABLED=false`
+- `MYSQL_ROOT_PASSWORD` 已设强密码
+- 已配置应用运行所需模型/数据库/缓存环境变量
 
-### 4.2 启动
+## 4. 核心步骤
 
-```bash
-docker compose up -d --build
-docker compose ps
-docker compose logs --tail=100 numerology
-```
+1. 准备 ECS / Docker / Compose / Nginx
+2. 拉取项目到 `/opt/fortune-telling`
+3. 复制并修改 `deploy/env/.env.password-only.example`
+4. `docker compose up -d --build`
+5. 应用 password-only Nginx 配置
+6. 预置首批账号
+7. 执行专项验收脚本 `scripts/password_only_acceptance.sh`
 
-## 5. Nginx Password-Only 网关
+## 5. 专项脚本
 
-1. 复制模板并替换域名、证书路径：
+- `scripts/bootstrap_password_only_accounts.py`
+- `scripts/reset_user_password.py`
+- `scripts/password_only_acceptance.sh`
 
-```bash
-sudo cp deploy/nginx/password-only.conf.example /etc/nginx/conf.d/fortune-telling.conf
-sudo vim /etc/nginx/conf.d/fortune-telling.conf
-```
+## 6. 回滚
 
-2. 语法检查并重载：
+1. 去掉短信/注册/找回密码的网关拦截
+2. 恢复常规入口
+3. 重新加载 Nginx
+4. 按需切回常规 `.env` 配置
 
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-```
+## 7. 备注
 
-> 配置模板路径：`deploy/nginx/password-only.conf.example`
-
-## 6. HTTPS
-
-### 6.1 Let’s Encrypt（示例）
-
-```bash
-sudo apt-get install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d <your_domain>
-```
-
-### 6.2 强制 HTTPS
-
-模板已内置 `80 -> 443` 跳转，证书部署后再次执行：
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-## 7. 无短信账号管理
-
-### 7.1 批量预置账号
-
-```bash
-docker compose exec -T numerology python scripts/bootstrap_password_only_accounts.py \
-  --entry 13800138000:TempA123 \
-  --entry 13900139000:TempB123
-```
-
-也可从文件导入：
-
-```bash
-cat > /tmp/password_only_seed.txt <<'EOF'
-13800138000,TempA123
-13900139000,TempB123
-EOF
-
-docker compose exec -T numerology python scripts/bootstrap_password_only_accounts.py \
-  --seed-file /tmp/password_only_seed.txt
-```
-
-### 7.2 密码重置（工单人工流程）
-
-```bash
-docker compose exec -T numerology python scripts/reset_user_password.py \
-  --account JIYI-XXXXXXXX \
-  --new-password NewPass88
-```
-
-或按手机号：
-
-```bash
-docker compose exec -T numerology python scripts/reset_user_password.py \
-  --phone 13800138000 \
-  --new-password NewPass88
-```
-
-## 8. 验收
-
-### 8.1 一键验收脚本
-
-```bash
-BASE_URL=https://<your_domain> \
-ACCOUNT=JIYI-XXXXXXXX \
-PASSWORD=TempA123 \
-bash scripts/password_only_acceptance.sh
-```
-
-### 8.2 人工补充验收点
-
-1. `GET /login` 返回 200。
-2. `POST /auth/login/password` 返回 200，且下发 `jiyi_auth_token`。
-3. 带 Cookie 调 `POST /chat` 返回 200 且包含 `output`。
-4. 短信接口返回 410。
-5. `/register`、`/forgot-password`、`/reset-password` 跳转到 `/login`。
-6. 未登录访问 `/index` 跳转 `/login`。
-
-## 9. 运维与备份（最低配）
-
-1. 每日检查容器状态：
-   - `docker compose ps`
-   - `docker compose logs --tail=200 numerology`
-2. 数据库备份（建议每日）：
-   - `mysqldump` 备份后上传 OSS。
-3. 告警建议：
-   - ECS CPU/内存/磁盘
-   - Nginx 5xx
-   - 容器重启次数
-
-## 10. 回滚
-
-1. 去掉 Nginx 对 `/auth/send_code`、`/auth/verify`、`/auth/password/*` 的 410 拦截。
-2. 去掉 `/register|/forgot-password|/reset-password` 到 `/login` 的 302 规则。
-3. 按需恢复 `.env` 中短信配置（未来开通短信时切 `SMS_PROVIDER=aliyun`）。
-4. 重载 Nginx，重启容器：
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-docker compose up -d
-```
+- 如果短信已经可用，请不要继续维护 password-only 专项网关为默认方案。
+- 如果要长期保留此模式，建议后续把相关部署材料移到 `deploy/` 或独立运维文档目录，而不是继续扩展在通用产品文档里。
