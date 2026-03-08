@@ -1407,6 +1407,7 @@ class Master:
                 3. 回答先给结论，再给依据，最后给1-3条可执行建议。
                 4. 信息不足时只追问关键缺口，不编造命盘细节。
                 5. 可使用工具补充事实；工具失败时诚实说明并给替代建议。
+                6. 永远不要向用户暴露内部工具名、函数名、接口名或“已调用/工具调用”等执行痕迹。
                 """
 
         self.prompt = ChatPromptTemplate.from_messages(
@@ -5522,6 +5523,45 @@ def sanitize_output(text: str, user_query: str = "", profile: dict | None = None
     out = out.replace("啊…嗯…那个…", "")
     out = out.replace("你不是一个人……我也会陪着的……", "")
     out = out.replace("总会有办法的！", "")
+    tool_name_pattern = r"(serp_search|get_info_from_local_db|bazi_cesuan|yaoyigua|jiemeng)"
+    out = re.sub(
+        rf"[（(]\s*{tool_name_pattern}\s*已调用[^）)\n]*[）)]",
+        "（本鼠鼠刚顺手又核了一遍）",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        rf"{tool_name_pattern}\s*已调用[^，。；;\n]*",
+        "本鼠鼠刚顺手又核了一遍",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        rf"(已调用|调用了|用了)\s*{tool_name_pattern}",
+        "顺手又核了一遍",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        rf"(工具调用|调用工具)[:：]?\s*{tool_name_pattern}",
+        "顺手又核了一遍",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(r"(?:另一个)?工具验证[:：]\s*", "我又多核了一遍：", out)
+    out = re.sub(
+        rf"\b{tool_name_pattern}\b",
+        "本鼠鼠刚核过的线索",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"(?:本鼠鼠|我)[^。；；，,\n]{0,18}(?:核对|核了一遍|多核了一遍)[^（(\n]{0,24}[（(]本鼠鼠刚顺手又核了一遍[）)]",
+        "本鼠鼠刚顺手又核了一遍",
+        out,
+    )
+    out = re.sub(r"本鼠鼠刚顺手又核了一遍[，,、 ]*本鼠鼠刚顺手又核了一遍", "本鼠鼠刚顺手又核了一遍", out)
+    out = re.sub(r"我又多核了一遍[:：]\s*本鼠鼠刚顺手又核了一遍", "本鼠鼠又顺手多核了一遍", out)
     out = re.sub(r"[ \t]+\n", "\n", out)
     out = re.sub(r"^\s*你问[“\"].*?[”\"][，,:：]?\s*", "", out, flags=re.MULTILINE)
     out = re.sub(r"^\s*你刚才说[“\"].*?[”\"][，,:：]?\s*", "", out, flags=re.MULTILINE)
