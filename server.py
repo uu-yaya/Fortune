@@ -2319,11 +2319,37 @@ def _is_asking_own_name(query: str) -> bool:
     )
 
 
+def _is_asking_own_birthdate(query: str) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    return bool(
+        re.search(
+            r"(生日|出生日期|哪天出生)",
+            q,
+        )
+    )
+
+
+def _is_asking_own_birthtime(query: str) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    return bool(
+        re.search(
+            r"(出生时间|出生时段|出生时辰|时辰)",
+            q,
+        )
+    )
+
+
 def _is_identity_fact_query(query: str) -> bool:
     q = str(query or "").strip()
     if not q:
         return False
     if _is_asking_own_name(q):
+        return True
+    if _is_asking_own_birthdate(q) or _is_asking_own_birthtime(q):
         return True
     return bool(re.search(r"(你记得我吗|你记得我是谁吗|我是谁你还记得吗)", q))
 
@@ -3963,6 +3989,70 @@ def _birth_info_placeholder(seed_text: str) -> str:
     )
 
 
+def _format_birthtime_natural(value: str) -> str:
+    raw = str(value or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", raw)
+    if not m:
+        return raw
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if 0 <= hh < 5:
+        period = "凌晨"
+    elif 5 <= hh < 8:
+        period = "清晨"
+    elif 8 <= hh < 12:
+        period = "早上"
+    elif hh == 12:
+        period = "中午"
+    elif 13 <= hh < 18:
+        period = "下午"
+    else:
+        period = "晚上"
+    if mm == 0:
+        return f"{period}{hh}点"
+    return f"{period}{hh}点{mm}分"
+
+
+def _build_identity_fact_reply(query: str, profile: dict | None = None) -> str:
+    q = str(query or "").strip()
+    p = profile or {}
+    address = _pick_address_name(p, user_query=q)
+    if _is_asking_own_name(q):
+        name = str(p.get("preferred_name") or "").strip() or str(p.get("name") or "").strip()
+        if name:
+            return f"{address}叫{name}呀。"
+        return "本鼠鼠这边还没记住你的名字。你告诉我一次，我就接着记。"
+    ask_birthdate = _is_asking_own_birthdate(q)
+    ask_birthtime = _is_asking_own_birthtime(q)
+    birthdate = str(p.get("birthdate") or "").strip()
+    birthtime = str(p.get("birthtime") or "").strip()
+    if ask_birthdate or ask_birthtime:
+        date_cn = _iso_to_cn(birthdate, short=False) if birthdate else ""
+        time_cn = _format_birthtime_natural(birthtime) if birthtime else ""
+        if ask_birthdate and ask_birthtime:
+            if date_cn and time_cn:
+                return f"{address}的生日是{date_cn}，出生时段落在{time_cn}。"
+            if date_cn:
+                return f"{address}的生日是{date_cn}。出生时段这边我还没记全。"
+            if time_cn:
+                return f"{address}出生在{time_cn}，但生日这边我还没记全。"
+            return "本鼠鼠这边还没把你的生日和出生时段记完整。你补给我，我就接着记。"
+        if ask_birthdate:
+            if date_cn:
+                return f"{address}的生日是{date_cn}呀。"
+            return "本鼠鼠这边还没把你的生日记下来。你告诉我一次，我就接着记。"
+        if ask_birthtime:
+            if time_cn:
+                return f"{address}出生在{time_cn}。"
+            return "本鼠鼠这边还没把你的出生时段记下来。你告诉我一次，我就接着记。"
+    if re.search(r"(你记得我吗|你记得我是谁吗|我是谁你还记得吗)", q):
+        name = str(p.get("preferred_name") or "").strip() or str(p.get("name") or "").strip()
+        if name:
+            return f"当然记得，你是{name}。"
+        return "本鼠鼠记得你来过，不过名字这边我还没记全。"
+    return ""
+
+
 def strip_profile_echo(text: str, profile: dict | None = None, user_query: str = "") -> str:
     out = str(text or "").strip()
     if not out:
@@ -4106,6 +4196,9 @@ def sanitize_output(text: str, user_query: str = "", profile: dict | None = None
     out = re.sub(r"\n{3,}", "\n\n", out)
 
     if _is_identity_fact_query(user_query):
+        fact_reply = _build_identity_fact_reply(user_query, profile=profile)
+        if fact_reply:
+            return fact_reply.strip()
         out = strip_profile_echo(out.strip(), profile=profile, user_query=user_query)
         out = re.sub(r"(19|20)\d{2}年\d{1,2}月\d{1,2}日", "你的生日", out)
         out = re.sub(r"(清晨|凌晨|早上|上午|中午|下午|晚上)\s*\d{1,2}[:：点]\d{0,2}", "你的出生时段", out)
