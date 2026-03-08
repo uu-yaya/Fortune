@@ -1910,6 +1910,60 @@ def _natural_window_line(query: str, window_text: str, window_label: str, questi
     )
 
 
+def _soften_fortune_section_headings(text: str) -> str:
+    out = str(text or "").strip()
+    if not out:
+        return out
+    lines = out.splitlines()
+    softened: list[str] = []
+    pending_advice_intro = False
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            if softened and softened[-1] != "":
+                softened.append("")
+            continue
+        if re.match(r"^参考置信度[:：]", line):
+            continue
+        if re.match(r"^结论[:：]", line):
+            body = re.sub(r"^结论[:：]\s*", "", line).strip()
+            softened.append(f"先跟你说重点，{body}")
+            pending_advice_intro = False
+            continue
+        if re.match(r"^(依据|命理依据)[:：]", line):
+            body = re.sub(r"^(依据|命理依据)[:：]\s*", "", line).strip()
+            softened.append(f"我会这么看，是因为{body}")
+            pending_advice_intro = False
+            continue
+        if re.match(r"^命理信号[:：]", line):
+            body = re.sub(r"^命理信号[:：]\s*", "", line).strip()
+            softened.append(f"盘面里更明显的一笔是：{body}")
+            pending_advice_intro = False
+            continue
+        if re.match(r"^工具验证[:：]", line):
+            body = re.sub(r"^工具验证[:：]\s*", "", line).strip()
+            softened.append(f"我又顺手交叉看了一眼：{body}")
+            pending_advice_intro = False
+            continue
+        if re.match(r"^五行分布[:：]", line):
+            body = re.sub(r"^五行分布[:：]\s*", "", line).strip()
+            softened.append(f"五行这边大概是：{body}")
+            pending_advice_intro = False
+            continue
+        if re.match(r"^(建议|行动建议)[:：]?\s*$", line):
+            softened.append("你现在可以先这样做：")
+            pending_advice_intro = True
+            continue
+        if pending_advice_intro and re.match(r"^\d+\.\s*", line):
+            softened.append(line)
+            continue
+        pending_advice_intro = False
+        softened.append(line)
+    while softened and softened[-1] == "":
+        softened.pop()
+    return "\n".join(softened).strip()
+
+
 def _expected_year_from_query(query: str, time_anchor: dict) -> int | None:
     q = str(query or "")
     try:
@@ -4700,6 +4754,7 @@ def _generate_fortune_reply_with_model(
             filtered.append(line)
         if filtered:
             out = "\n".join(filtered).strip()
+    out = _soften_fortune_section_headings(out)
     long_horizon_labels = {
         "this_month",
         "next_30_days",
@@ -4841,7 +4896,7 @@ def _render_fortune_with_blueprint(
     if advice_lines:
         lines.append("建议：")
         lines.extend(advice_lines)
-    return "\n".join(lines)
+    return _soften_fortune_section_headings("\n".join(lines))
 
 
 def _render_user_fortune_reply_v2_legacy(
@@ -4894,7 +4949,7 @@ def _render_user_fortune_reply_v2_legacy(
             lines.append(f"{idx}. {tip}")
     payload["blueprint_id"] = "legacy_v2"
     payload["_render_blueprint_id"] = "legacy_v2"
-    return "\n".join(lines)
+    return _soften_fortune_section_headings("\n".join(lines))
 
 
 def _first_sentence(text: str) -> str:
@@ -5102,7 +5157,7 @@ def render_structured_fortune_reply(payload: dict, topic: str) -> str:
     for idx, tip in enumerate(advice, start=1):
         lines.append(f"{idx}. {tip}")
     lines.append(f"参考置信度：{confidence}%")
-    return "\n".join(lines)
+    return _soften_fortune_section_headings("\n".join(lines))
 
 
 def _format_divination_reply(raw) -> str:
