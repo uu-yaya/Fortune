@@ -211,10 +211,21 @@ def case_general_topic_shift_note() -> dict[str, Any]:
 
 
 def case_dream_keyword_cleanup() -> dict[str, Any]:
+    class _FakeLLM:
+        def __init__(self, outputs: list[str]):
+            self.outputs = list(outputs)
+
+        def invoke(self, _prompt):
+            if not self.outputs:
+                return ""
+            return self.outputs.pop(0)
+
     direct = mytools._extract_dream_keyword_local("梦见蛇是什么意思")
-    with_parents = mytools._extract_dream_keyword_local("给我解梦，我梦到了爸爸妈妈")
-    with_leading_and = mytools._extract_dream_keyword_local("梦见和檀健次进行人类繁殖活动")
-    last_night = mytools._extract_dream_keyword_local("昨晚梦到了前男友结婚")
+    with_parents = mytools._extract_dream_keyword("给我解梦，我梦到了爸爸妈妈", llm=_FakeLLM(["父母"]))
+    with_leading_and = mytools._extract_dream_keyword("我梦到了和檀健次进行人类交配活动，给我解梦", llm=_FakeLLM(["性爱"]))
+    last_night = mytools._extract_dream_keyword("昨晚梦到了前男友结婚", llm=_FakeLLM(["结婚"]))
+    amusement_park = mytools._extract_dream_keyword("我梦到了去游乐园，给我解梦", llm=_FakeLLM(["游乐园"]))
+    fallback_local = mytools._extract_dream_keyword("梦见蛇是什么意思", llm=_FakeLLM([""]))
     normalized_label = mytools._normalize_zhougong_keyword("关键词：蛇", fallback_query="梦见蛇是什么意思")
     normalized_aimessage = mytools._normalize_zhougong_keyword(
         "content='蛇' additional_kwargs={} response_metadata={}",
@@ -224,6 +235,8 @@ def case_dream_keyword_cleanup() -> dict[str, Any]:
     assert with_parents == "父母", with_parents
     assert with_leading_and == "性爱", with_leading_and
     assert last_night == "结婚", last_night
+    assert amusement_park == "游乐园", amusement_park
+    assert fallback_local == "蛇", fallback_local
     assert normalized_label == "蛇", normalized_label
     assert normalized_aimessage == "蛇", normalized_aimessage
     return {
@@ -231,6 +244,8 @@ def case_dream_keyword_cleanup() -> dict[str, Any]:
         "with_parents": with_parents,
         "with_leading_and": with_leading_and,
         "last_night": last_night,
+        "amusement_park": amusement_park,
+        "fallback_local": fallback_local,
         "normalized_label": normalized_label,
         "normalized_aimessage": normalized_aimessage,
     }

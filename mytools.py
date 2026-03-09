@@ -1888,7 +1888,7 @@ def _extract_dream_keyword_local(query: str) -> str:
         return ""
     normalized = text
     normalized = re.sub(r"^(?:请|麻烦|拜托)?(?:帮我|给我)?解梦[，,:：\s]*", "", normalized)
-    normalized = re.sub(r"^(?:请|麻烦|拜托)?(?:帮我|给我)?(?:看下|看看)?梦境?[，,:：\s]*", "", normalized)
+    normalized = re.sub(r"^(?:请|麻烦|拜托)?(?:帮我|给我)?(?:看下|看看)?(?:梦境|梦境内容)[，,:：\s]*", "", normalized)
     normalized = re.sub(r"^(?:昨晚|昨天|夜里|半夜|刚刚|最近|前几天|这两天|今天)?\s*", "", normalized)
     normalized = re.sub(r"[“”\"'`‘’]", "", normalized).strip()
 
@@ -1897,32 +1897,16 @@ def _extract_dream_keyword_local(query: str) -> str:
         normalized,
     )
     candidate = str(match.group(1) or "").strip() if match else normalized
+    candidate = re.sub(r"^(?:梦见|梦到|梦到了|梦见了|做梦梦到|做梦梦见|做梦梦到了|做梦梦见了)", "", candidate).strip()
+    if re.match(r"^(?:我?(?:又)?(?:做梦)?梦见|我?(?:又)?(?:做梦)?梦到|梦见|梦到)", normalized):
+        candidate = re.sub(r"^(?:见|到)", "", candidate).strip()
     candidate = re.sub(r"^(?:我|自己|我们|有人|一个人|一个|一只|一条|一头|一群|好多|很多|一堆)\s*", "", candidate).strip()
     candidate = re.sub(r"^(?:和|跟|与)\s*", "", candidate).strip()
+    candidate = re.sub(r"^(?:去|到|回|逛|进|出|跑去|来到)\s*", "", candidate).strip()
     candidate = re.sub(r"(?:是什么意思|什么预兆|预示着什么|意味着什么|怎么回事|好不好|代表什么)$", "", candidate).strip()
     candidate = re.sub(r"[，。！？；;：:\s]+", "", candidate)
     if not candidate:
         return ""
-
-    semantic_patterns = [
-        (r"(爸爸妈妈|爸妈|父母)", "父母"),
-        (r"(爷爷奶奶|祖父母)", "祖父母"),
-        (r"(怀孕|生孩子|分娩)", "怀孕"),
-        (r"(结婚|婚礼|成亲|嫁娶)", "结婚"),
-        (r"(吵架|争吵|打架|冲突)", "吵架"),
-        (r"(亲嘴|接吻|亲吻)", "接吻"),
-        (r"(做爱|性爱|上床|发生关系|性行为|人类繁殖活动)", "性爱"),
-        (r"(蛇|蟒蛇|毒蛇)", "蛇"),
-        (r"(狗|小狗|大狗)", "狗"),
-        (r"(猫|小猫)", "猫"),
-        (r"(牙齿|掉牙|掉牙齿)", "掉牙"),
-        (r"(水|大水|洪水|海水)", "水"),
-        (r"(火|着火|火灾)", "火"),
-        (r"(死了|死亡|去世)", "死亡"),
-    ]
-    for pattern, keyword in semantic_patterns:
-        if re.search(pattern, candidate):
-            return keyword
 
     pieces = [piece for piece in re.split(r"(?:然后|后来|结果|突然|忽然|正在|在|被|把|又|还|并且|而且|的时候|之后)", candidate) if piece]
     normalized_pieces: list[str] = []
@@ -1940,6 +1924,36 @@ def _extract_dream_keyword_local(query: str) -> str:
     if re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9]{1,8}", compact):
         return compact
     return ""
+
+
+def _extract_dream_keyword_with_model(query: str, *, llm=None) -> str:
+    text = str(query or "").strip()
+    if not text:
+        return ""
+    model = llm or get_lc_ali_model_client(streaming=False)
+    prompt = PromptTemplate.from_template(
+        "你是周公解梦查询词提取器。"
+        "请从用户梦境描述中提取1个最适合查询解梦接口的中文关键词或短词。"
+        "优先提取核心意象、场景或事件，不要复述整句，不要解释，不要标点，不要引号，不超过4个汉字。"
+        "如果梦里是人物关系，优先抽象成关系词；如果梦里是事件，优先抽象成事件词；如果梦里是地点场景，优先抽象成场景词。"
+        "示例：梦到爸爸妈妈 -> 父母；梦到去游乐园 -> 游乐园；梦到和前任结婚 -> 结婚；梦到和某人发生性行为 -> 性爱。"
+        "用户输入：{topic}"
+    )
+    prompt_value = prompt.invoke({"topic": text})
+    return _normalize_zhougong_keyword(model.invoke(prompt_value), fallback_query=text)
+
+
+def _extract_dream_keyword(query: str, *, llm=None) -> str:
+    text = str(query or "").strip()
+    if not text:
+        return ""
+    try:
+        keyword = _extract_dream_keyword_with_model(text, llm=llm)
+        if keyword:
+            return keyword
+    except Exception:
+        pass
+    return _extract_dream_keyword_local(text)
 
 
 def _normalize_zhougong_keyword(raw_keyword, *, fallback_query: str = "") -> str:
@@ -1970,15 +1984,7 @@ def jiemeng(query: str):
     """只有用户想要解梦的时候才会使用这个工具,需要输入用户梦境的内容，如果缺少用户梦境的内容则不可用。"""
     api_key = YUANFENJU_API_KEY
     url = f"https://api.yuanfenju.com/index.php/v1/Gongju/zhougong"
-    keyword = _extract_dream_keyword_local(query)
-    if not keyword:
-        LLM = get_lc_ali_model_client(streaming=False)
-        prompt = PromptTemplate.from_template(
-            "你是解梦关键词提取器。请从梦境描述中提取最适合查询周公解梦接口的1个中文关键词。"
-            "只返回关键词本身，不要解释，不要标点，不要引号。内容为:{topic}"
-        )
-        prompt_value = prompt.invoke({"topic": query})
-        keyword = _normalize_zhougong_keyword(LLM.invoke(prompt_value), fallback_query=query)
+    keyword = _extract_dream_keyword(query)
     logger.info(f"提取的关键词: {keyword}")
     if not keyword:
         return {"errcode": 1, "errmsg": "梦境关键词提取失败", "data": {}}
