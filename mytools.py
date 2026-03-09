@@ -1886,20 +1886,59 @@ def _extract_dream_keyword_local(query: str) -> str:
     text = str(query or "").strip()
     if not text:
         return ""
-    normalized = re.sub(r"^请帮我解梦[，,:：\s]*", "", text)
+    normalized = text
+    normalized = re.sub(r"^(?:请|麻烦|拜托)?(?:帮我|给我)?解梦[，,:：\s]*", "", normalized)
+    normalized = re.sub(r"^(?:请|麻烦|拜托)?(?:帮我|给我)?(?:看下|看看)?梦境?[，,:：\s]*", "", normalized)
+    normalized = re.sub(r"^(?:昨晚|昨天|夜里|半夜|刚刚|最近|前几天|这两天|今天)?\s*", "", normalized)
+    normalized = re.sub(r"[“”\"'`‘’]", "", normalized).strip()
+
     match = re.search(
-        r"(?:梦见|梦到|做梦梦到|做梦见到)(.+?)(?:是啥意思|是什么意思|什么预兆|预示着什么|意味着什么|怎么回事|好不好|代表什么|呢|吗|[，。！？?]|$)",
+        r"(?:我?(?:又)?(?:做梦)?梦见了?|我?(?:又)?(?:做梦)?梦到了?|梦到了?|梦见了?|做梦梦到了?|做梦梦见了?|梦里)(.+?)(?:是啥意思|是什么意思|什么预兆|预示着什么|意味着什么|怎么回事|好不好|代表什么|给我解梦|帮我解梦|呢|吗|[，。！？?]|$)",
         normalized,
     )
-    candidate = str(match.group(1) or "").strip() if match else ""
+    candidate = str(match.group(1) or "").strip() if match else normalized
+    candidate = re.sub(r"^(?:我|自己|我们|有人|一个人|一个|一只|一条|一头|一群|好多|很多|一堆)\s*", "", candidate).strip()
+    candidate = re.sub(r"^(?:和|跟|与)\s*", "", candidate).strip()
+    candidate = re.sub(r"(?:是什么意思|什么预兆|预示着什么|意味着什么|怎么回事|好不好|代表什么)$", "", candidate).strip()
+    candidate = re.sub(r"[，。！？；;：:\s]+", "", candidate)
     if not candidate:
         return ""
-    candidate = re.sub(r"^(我|自己|一只|一条|一个|好多|很多|一群)", "", candidate).strip()
-    candidate = re.split(r"(在|和|跟|被|把|又|然后|正在|突然|忽然|的时候|之后)", candidate, maxsplit=1)[0].strip()
-    candidate = re.sub(r"[“”\"'`‘’\s]+", "", candidate)
-    candidate = re.sub(r"(是什么意思|什么预兆|预示着什么|意味着什么|怎么回事|好不好|代表什么)$", "", candidate)
-    if re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9]{1,8}", candidate):
-        return candidate
+
+    semantic_patterns = [
+        (r"(爸爸妈妈|爸妈|父母)", "父母"),
+        (r"(爷爷奶奶|祖父母)", "祖父母"),
+        (r"(怀孕|生孩子|分娩)", "怀孕"),
+        (r"(结婚|婚礼|成亲|嫁娶)", "结婚"),
+        (r"(吵架|争吵|打架|冲突)", "吵架"),
+        (r"(亲嘴|接吻|亲吻)", "接吻"),
+        (r"(做爱|性爱|上床|发生关系|性行为|人类繁殖活动)", "性爱"),
+        (r"(蛇|蟒蛇|毒蛇)", "蛇"),
+        (r"(狗|小狗|大狗)", "狗"),
+        (r"(猫|小猫)", "猫"),
+        (r"(牙齿|掉牙|掉牙齿)", "掉牙"),
+        (r"(水|大水|洪水|海水)", "水"),
+        (r"(火|着火|火灾)", "火"),
+        (r"(死了|死亡|去世)", "死亡"),
+    ]
+    for pattern, keyword in semantic_patterns:
+        if re.search(pattern, candidate):
+            return keyword
+
+    pieces = [piece for piece in re.split(r"(?:然后|后来|结果|突然|忽然|正在|在|被|把|又|还|并且|而且|的时候|之后)", candidate) if piece]
+    normalized_pieces: list[str] = []
+    for piece in pieces:
+        clean = re.sub(r"[^A-Za-z0-9\u4e00-\u9fa5]", "", piece).strip()
+        clean = re.sub(r"^(?:和|跟|与)", "", clean).strip()
+        if clean:
+            normalized_pieces.append(clean)
+
+    for piece in normalized_pieces:
+        if re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9]{1,8}", piece):
+            return piece
+
+    compact = re.sub(r"[^A-Za-z0-9\u4e00-\u9fa5]", "", candidate).strip()
+    if re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9]{1,8}", compact):
+        return compact
     return ""
 
 

@@ -182,18 +182,55 @@ def case_general_profile_context_trimmed() -> dict[str, Any]:
     return {"general_context": general_context, "fortune_context": fortune_context}
 
 
+def case_general_topic_shift_note() -> dict[str, Any]:
+    class _Msg:
+        def __init__(self, type_: str, content: str):
+            self.type = type_
+            self.content = content
+
+    class _History:
+        def __init__(self, messages):
+            self.messages = messages
+
+    shifted = _History([
+        _Msg("human", "我今天适合吃什么"),
+        _Msg("ai", "你今天想吃暖暖的还是清爽的呀？"),
+    ])
+    note = server.build_general_topic_shift_note("我最近工作压力很大，怎么缓一缓", shifted)
+    assert "明显换了话题" in note, note
+    assert "上一轮用户问题是：我今天适合吃什么" in note, note
+    assert "旧话题只当弱参考" in note, note
+
+    continued = _History([
+        _Msg("human", "我今天适合吃什么"),
+        _Msg("ai", "你今天想吃暖暖的还是清爽的呀？"),
+    ])
+    same_topic_note = server.build_general_topic_shift_note("我想吃点清爽的，有什么推荐", continued)
+    assert same_topic_note == "", same_topic_note
+    return {"shift_note": note}
+
+
 def case_dream_keyword_cleanup() -> dict[str, Any]:
     direct = mytools._extract_dream_keyword_local("梦见蛇是什么意思")
+    with_parents = mytools._extract_dream_keyword_local("给我解梦，我梦到了爸爸妈妈")
+    with_leading_and = mytools._extract_dream_keyword_local("梦见和檀健次进行人类繁殖活动")
+    last_night = mytools._extract_dream_keyword_local("昨晚梦到了前男友结婚")
     normalized_label = mytools._normalize_zhougong_keyword("关键词：蛇", fallback_query="梦见蛇是什么意思")
     normalized_aimessage = mytools._normalize_zhougong_keyword(
         "content='蛇' additional_kwargs={} response_metadata={}",
         fallback_query="梦见蛇是什么意思",
     )
     assert direct == "蛇", direct
+    assert with_parents == "父母", with_parents
+    assert with_leading_and == "性爱", with_leading_and
+    assert last_night == "结婚", last_night
     assert normalized_label == "蛇", normalized_label
     assert normalized_aimessage == "蛇", normalized_aimessage
     return {
         "direct": direct,
+        "with_parents": with_parents,
+        "with_leading_and": with_leading_and,
+        "last_night": last_night,
         "normalized_label": normalized_label,
         "normalized_aimessage": normalized_aimessage,
     }
@@ -857,6 +894,7 @@ def main() -> int:
         ("PROV-002", "命理 quota 立即打开 breaker", case_fortune_quota_opens_breaker),
         ("PROV-003", "命理 invalid_response 仍输出结构化回退", case_fortune_invalid_response_fallback),
         ("PROV-004", "普通问答上下文不再注入命理资料", case_general_profile_context_trimmed),
+        ("PROV-004A", "general 换话题时会降权旧历史", case_general_topic_shift_note),
         ("PROV-009", "今日运势命中 Bazi/yunshi", case_bazi_daily_route_hit),
         ("PROV-010", "年度运势命中 Bazi/weilai", case_bazi_future_route_hit),
         ("PROV-011", "财运对比命中多次 caiyunfenxi", case_wealth_compare_route_hit),

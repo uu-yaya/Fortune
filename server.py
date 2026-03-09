@@ -2905,6 +2905,60 @@ def build_ellipsis_context_note(query: str, chat_message_history) -> str:
     return f"用户本轮可能是省略问法；上一轮主题：{recent_user}。先按该主题理解后作答。"
 
 
+GENERAL_TOPIC_BUCKET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("food", re.compile(r"(吃|喝|口味|外卖|早餐|午餐|晚餐|夜宵|饭|面|粥|汤|奶茶|咖啡|清爽|暖暖|热的|凉的|辣的|甜的|咸的|酸的)")),
+    ("emotion", re.compile(r"(开心|难过|焦虑|压力|委屈|崩溃|情绪|心情|低落|烦|内耗|治愈|能量|状态)")),
+    ("health", re.compile(r"(睡眠|失眠|胃|肠胃|头疼|头痛|身体|不舒服|疲惫|累|休息|运动|减肥|养生|深呼吸)")),
+    ("work", re.compile(r"(工作|上班|同事|老板|开会|职场|任务|项目|面试|offer|学习|考试|复习|论文|作业)")),
+    ("love", re.compile(r"(恋爱|感情|对象|前任|暧昧|喜欢的人|分手|复合|表白|相亲|婚姻)")),
+    ("plan", re.compile(r"(安排|计划|优先|先做|下一步|开始|怎么办|怎么做|怎么弄|小目标|值得优先处理)")),
+]
+
+
+def _general_topic_bucket(text: str) -> str:
+    q = str(text or "").strip()
+    if not q:
+        return ""
+    for bucket, pattern in GENERAL_TOPIC_BUCKET_PATTERNS:
+        if pattern.search(q):
+            return bucket
+    return "other"
+
+
+def build_general_topic_shift_note(query: str, chat_message_history) -> str:
+    q = str(query or "").strip()
+    if not q:
+        return ""
+    if len(q) <= 8:
+        return ""
+    current_bucket = _general_topic_bucket(q)
+    if current_bucket in {"", "other"}:
+        return ""
+
+    recent_user = ""
+    try:
+        for msg in reversed(getattr(chat_message_history, "messages", []) or []):
+            role = str(getattr(msg, "type", "")).lower()
+            content = str(getattr(msg, "content", "")).strip()
+            if not content:
+                continue
+            if role in {"human", "user"} and content != q:
+                recent_user = content
+                break
+    except Exception:
+        recent_user = ""
+
+    if not recent_user:
+        return ""
+    previous_bucket = _general_topic_bucket(recent_user)
+    if previous_bucket in {"", "other"} or previous_bucket == current_bucket:
+        return ""
+    return (
+        f"用户这一轮明显换了话题。上一轮用户问题是：{recent_user}。"
+        f"当前问题应按新话题优先回答，旧话题只当弱参考，不要沿着上一轮继续展开。"
+    )
+
+
 BAZI_FORTUNE_QUERY_PATTERN = re.compile(
     r"(算命|八字|流年|运势|桃花|姻缘|婚缘|婚运|结婚|婚期|成婚|正缘|另一半|配偶|感情运|财运|事业运|学业运|贵人运|命盘|命理|紫微|测算|提运|气场|顺不顺|更顺)"
 )
@@ -6091,16 +6145,15 @@ async def chat(request: Request, payload: ChatRequest):
                 f"{time_anchor.get('today_cn')}，{time_anchor.get('weekday_cn')}（{time_anchor.get('tz_name')}，{time_anchor.get('utc_offset')}）。"
                 f"若涉及“近几天”，默认窗口：{window_text}。不要沿用历史轮次中的旧日期。"
             )
-        elif domain_intent == "general" and question_type != "identity_fact":
-            _metric_incr("general_history_isolation_total")
-            isolated_id = f"{session_id}:general:{uuid.uuid4().hex[:8]}"
-            agent_history = RedisChatMessageHistory(url=REDIS_URL, session_id=isolated_id, ttl=120)
-            context_note = build_ellipsis_context_note(query, chat_message_history)
         else:
             agent_history = chat_message_history
             context_note = build_ellipsis_context_note(query, chat_message_history)
         style_instruction = build_style_instruction(query, emotion_level, session_id)
         if domain_intent in {"general", "time"} and question_type != "identity_fact":
+            if domain_intent == "general" and not context_note:
+                shift_note = build_general_topic_shift_note(query, chat_message_history)
+                if shift_note:
+                    context_note = shift_note
             general_guardrail = "这是通用问答，不要扩展成八字、星座、生肖、流年或出生资料分析。直接回答用户问题即可。"
             context_note = f"{context_note}\n{general_guardrail}".strip() if context_note else general_guardrail
         profile_context = build_profile_context(
